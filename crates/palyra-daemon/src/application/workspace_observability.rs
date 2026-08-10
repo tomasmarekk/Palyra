@@ -2087,7 +2087,7 @@ mod tests {
     use super::{
         artifact_matches_query, build_line_diff_preview, build_preflight_checkpoint_files,
         infer_content_type, resolve_workspace_restore_target, summarize_workspace_content,
-        WorkspaceArtifactRecord, WorkspaceArtifactVersion,
+        WorkspaceArtifactRecord, WorkspaceArtifactVersion, MAX_DIFF_INPUT_LINES,
     };
     use palyra_common::workspace_patch::WorkspacePatchFileAttestation;
     use sha2::{Digest, Sha256};

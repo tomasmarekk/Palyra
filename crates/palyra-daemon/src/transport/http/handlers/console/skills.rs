@@ -1314,6 +1314,9 @@ fn normalize_generated_skill_identifier(raw: &str, field: &str) -> Result<String
     Ok(normalized)
 }
 
+// HTTP handler helpers return `Response` directly so callers preserve the
+// structured status body through `?`.
+#[allow(clippy::result_large_err)]
 fn normalize_generated_skill_version(raw: &str) -> Result<String, Response> {
     let normalized = raw.trim();
     let mut parts = normalized.split('.');

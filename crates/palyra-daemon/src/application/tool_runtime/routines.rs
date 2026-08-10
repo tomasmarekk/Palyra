@@ -3260,9 +3260,10 @@ mod tests {
         CronRunStatus, CronScheduleType,
     };
     use crate::routines::{
-        RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode,
-        RoutineExecutionConfig, RoutineExecutionPosture, RoutineMetadataRecord, RoutineRunMode,
-        RoutineRunOutcomeKind, RoutineSilentPolicy, RoutineTriggerKind,
+        routine_approval_policy_with_auto_enable_guard, RoutineApprovalMode, RoutineApprovalPolicy,
+        RoutineDeliveryConfig, RoutineDeliveryMode, RoutineExecutionConfig,
+        RoutineExecutionPosture, RoutineMetadataRecord, RoutineRunMode, RoutineRunOutcomeKind,
+        RoutineSilentPolicy, RoutineTriggerKind,
     };
     use chrono::{Datelike, TimeZone, Timelike};
     use serde_json::{json, Value};

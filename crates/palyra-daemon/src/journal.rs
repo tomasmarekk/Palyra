@@ -35568,8 +35568,9 @@ mod tests {
     use super::{
         acquire_session_write_lease_tx, build_fts_query, build_memory_fts_queries, current_unix_ms,
         encode_vector_blob, memory_query_embedding_cache_scope, memory_tag_query_terms,
-        query_embedding_cache_key, release_session_write_lease_tx,
-        session_search_source_refs_projection, session_search_window_source_ref, sha256_hex,
+        normalize_orchestrator_session_text, query_embedding_cache_key,
+        release_session_write_lease_tx, session_search_source_refs_projection,
+        session_search_terms, session_search_window_source_ref, sha256_hex,
         workspace_query_embedding_cache_scope, AgentPlanCreateRequest, AgentPlanListFilter,
         AgentPlanUpdateRequest, ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope,
         ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest,
@@ -35628,7 +35629,8 @@ mod tests {
         MIGRATIONS, MIN_VECTOR_ONLY_COSINE_SIMILARITY, NETWORKED_WORKER_DISPATCH_CLAIM_MAX_ENTRIES,
         NETWORKED_WORKER_DISPATCH_TERMINAL_EVIDENCE_MAX_ENTRIES,
         NETWORKED_WORKER_EXPIRY_MAX_ENTRIES, NETWORKED_WORKER_FLEET_MAX_ENTRIES,
-        RECALL_ARTIFACT_KIND_PREVIEW, RECALL_ARTIFACT_KIND_SESSION_SEARCH,
+        ORCHESTRATOR_SESSION_PREVIEW_LEN, RECALL_ARTIFACT_KIND_PREVIEW,
+        RECALL_ARTIFACT_KIND_SESSION_SEARCH, SESSION_SEARCH_MAX_TERMS,
         SESSION_SEARCH_UX_SOURCE_REFS_EVENT_COMPLETED, SESSION_SEARCH_V2_SCHEMA_VERSION,
     };
 

@@ -3891,7 +3891,7 @@ mod tests {
 
     use super::{
         apply_prompt_cache_session_metadata, assemble_segments,
-        build_advisor_context_evidence_pack, build_prompt_composition_report,
+        build_advisor_context_evidence_pack, build_prompt_composition_report, cache_scope_hash,
         context_assembly_diagnostics_payload, context_inspector_snapshot,
         context_prompt_cache_session_metadata, diff_context_inspector_snapshots,
         render_agent_plan_context_block, resolve_provider_context_budget,

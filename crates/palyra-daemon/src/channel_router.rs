@@ -1277,13 +1277,13 @@ impl ChannelRouter {
                 }
                 DirectMessagePolicy::Allow => {}
                 DirectMessagePolicy::Pairing => {
-                    let Some(sender) = normalized_sender.as_deref() else {
+                    if normalized_sender.is_none() {
                         return Err(RouteRejection {
                             reason: PairingConsumeReason::SenderMissing.as_str().to_owned(),
                             quarantined: false,
                             route_target: None,
                         });
-                    };
+                    }
                     if !message.sender_verified {
                         return Err(RouteRejection {
                             reason: "sender_unverified_for_dm_pairing".to_owned(),

@@ -1896,7 +1896,7 @@ async fn apply_before_enable_routine_approval(
 ) -> Result<Option<Value>, Response> {
     require_routines_automation_enabled_for_write(state, true)?;
     let next_run_at_unix_ms = cron::next_run_at_for_enabled_state(
-        &job,
+        job,
         true,
         crate::gateway::current_unix_ms_status().map_err(runtime_status_response)?,
     )
@@ -1923,10 +1923,10 @@ async fn apply_before_first_run_routine_approval(
     job: &CronJobRecord,
 ) -> Result<Option<Value>, Response> {
     if !job.enabled {
-        return routine_approval_apply_outcome(state, "routine_disabled", &job);
+        return routine_approval_apply_outcome(state, "routine_disabled", job);
     }
     if job.next_run_at_unix_ms.is_some() {
-        return routine_approval_apply_outcome(state, "already_scheduled", &job);
+        return routine_approval_apply_outcome(state, "already_scheduled", job);
     }
     require_routines_automation_enabled_for_write(state, true)?;
     let updated = state
@@ -3382,14 +3382,14 @@ mod tests {
     use super::{
         approval_mode_is_explicit_override, approval_policy_for_requested_schedule,
         compare_optional_matchers, is_in_quiet_hours, normalize_channel,
-        output_delivered_for_outcome, parse_delivery, parse_execution_config,
-        parse_optional_schedule_timezone_mode, parse_quiet_hours, parse_routine_approval_subject,
-        parse_timezone_mode, routine_approval_details_json, routine_approval_matches_definition,
-        routine_approval_policy_hash, routine_approval_subject_id,
-        routine_automation_flag_permits_enabled_write, routine_cooldown_deadline_is_after,
-        routine_matches_trigger, routine_output_fields_from_session,
-        routine_output_text_from_tape_events, routine_run_allows_output_preview,
-        routine_troubleshooting_recommended_action,
+        normalize_routine_output_text, output_delivered_for_outcome, parse_delivery,
+        parse_execution_config, parse_optional_schedule_timezone_mode, parse_quiet_hours,
+        parse_routine_approval_subject, parse_timezone_mode, routine_approval_details_json,
+        routine_approval_matches_definition, routine_approval_policy_hash,
+        routine_approval_subject_id, routine_automation_flag_permits_enabled_write,
+        routine_cooldown_deadline_is_after, routine_matches_trigger,
+        routine_output_fields_from_session, routine_output_text_from_tape_events,
+        routine_run_allows_output_preview, routine_troubleshooting_recommended_action,
     };
     use crate::cron::CronTimezoneMode;
     use crate::journal::{

@@ -12039,7 +12039,7 @@ fn process_runner_directory_is_link(metadata: &fs::Metadata) -> bool {
         use std::os::windows::fs::MetadataExt as _;
 
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     false
@@ -12835,7 +12835,7 @@ fn reserve_output_budget(remaining_budget: &AtomicUsize, requested_bytes: usize)
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
-        ffi::OsString,
+        ffi::{OsStr, OsString},
         fs, io,
         path::{Path, PathBuf},
         process::{Command, Stdio},
@@ -12866,15 +12866,16 @@ mod tests {
         command_option_consumes_non_path_value, cpu_rlimit_seconds_from_usage_micros,
         host_access_roots, is_host_allowlisted, maybe_emit_process_progress,
         process_completion_notification_projection, process_failure_message,
-        process_output_diagnostic_summary, process_runner_command_with_args_message,
-        process_runtime_request_projection, process_success_output_json,
-        process_watch_events_projection, redacted_process_output_preview,
-        redacted_process_output_text, resolve_host_executable_path_with_roots,
-        resolve_host_working_directory, resolve_host_working_directory_with_roots,
-        resolve_scoped_path, resolve_working_directory, rewrite_arguments_to_scoped_paths,
-        rewrite_host_access_process_args, rewrite_host_virtual_workspace_args,
-        run_constrained_process, run_constrained_process_with_fault_injection,
-        same_path_case_aware, tier_c_plan_inner_path_index, validate_allowed_executable,
+        process_failure_output_json, process_output_diagnostic_summary, process_progress_tail,
+        process_runner_command_with_args_message, process_runtime_request_projection,
+        process_success_output_json, process_watch_events_projection,
+        redacted_process_output_preview, redacted_process_output_text,
+        resolve_host_executable_path_with_roots, resolve_host_working_directory,
+        resolve_host_working_directory_with_roots, resolve_scoped_path, resolve_working_directory,
+        rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
+        rewrite_host_virtual_workspace_args, run_constrained_process,
+        run_constrained_process_with_fault_injection, same_path_case_aware,
+        tier_c_plan_inner_path_index, validate_allowed_executable,
         validate_argument_workspace_scope, validate_cmd_invocation_shape,
         validate_host_argument_scope, validate_host_argument_scope_with_roots,
         validate_host_interpreter_argument_guardrails,
@@ -20289,7 +20290,7 @@ api key: qwerty
             workspace_root.as_path(),
             "python",
             args.as_slice(),
-            &[workspace_root.clone()],
+            std::slice::from_ref(&workspace_root),
         )
         .expect_err("Python module eval commands must stay blocked in host-access mode");
         assert_eq!(host_error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);

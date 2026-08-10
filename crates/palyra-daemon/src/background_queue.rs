@@ -4126,7 +4126,7 @@ mod tests {
             OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskRecord,
             OrchestratorBackgroundTaskUpdateRequest, OrchestratorBackgroundTaskWorkerUpdateRequest,
             OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot,
-            OrchestratorSessionUpsertRequest,
+            OrchestratorSessionUpsertRequest, ORCHESTRATOR_BACKGROUND_TASK_LIST_LIMIT_MAX,
         },
         model_provider::{
             AudioTranscriptionRequest, AudioTranscriptionResponse, ModelProvider, ProviderError,

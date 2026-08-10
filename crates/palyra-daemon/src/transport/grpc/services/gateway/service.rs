@@ -301,15 +301,19 @@ fn channel_turn_ambient_context_enabled(
         && !input.requested_broadcast
 }
 
+struct ChannelBotLoopActor<'a> {
+    connector: &'a str,
+    gateway_principal: &'a str,
+    gateway_device_id: &'a str,
+}
+
 fn channel_bot_loop_decision(
     state: &GatewayRuntimeState,
     input: &ChannelInboundMessage,
     envelope: &ChannelTurnEnvelope,
     command_parse_outcome: &ChannelCommandParseOutcome,
     bot: ChannelTurnBotFacts,
-    actor_connector: &str,
-    actor_gateway_principal: &str,
-    actor_gateway_device_id: &str,
+    actor: ChannelBotLoopActor<'_>,
 ) -> BotLoopDecision {
     if !channel_bot_loop_guard_eligible(bot) {
         return BotLoopDecision::bypassed("channel.bot_loop.bypassed.sender_not_verified_bot");
@@ -324,9 +328,9 @@ fn channel_bot_loop_decision(
     else {
         return BotLoopDecision::bypassed("channel.bot_loop.bypassed.missing_sender_identity");
     };
-    let receiver_id = format!("gateway:{actor_gateway_principal}:{actor_gateway_device_id}");
+    let receiver_id = format!("gateway:{}:{}", actor.gateway_principal, actor.gateway_device_id);
     let Some(key) = BotPairKey::new(
-        actor_connector,
+        actor.connector,
         input.channel.as_str(),
         input.conversation_id.clone(),
         input.adapter_thread_id.clone(),
@@ -1417,9 +1421,11 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     &channel_turn_envelope,
                     &command_parse_outcome,
                     channel_turn_bot_facts,
-                    actor_connector.as_str(),
-                    actor_gateway_principal.as_str(),
-                    actor_gateway_device_id.as_str(),
+                    ChannelBotLoopActor {
+                        connector: actor_connector.as_str(),
+                        gateway_principal: actor_gateway_principal.as_str(),
+                        gateway_device_id: actor_gateway_device_id.as_str(),
+                    },
                 );
                 let channel_turn_admission_input = build_channel_turn_admission_input(
                     &input,

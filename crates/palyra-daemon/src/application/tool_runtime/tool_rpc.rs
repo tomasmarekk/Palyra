@@ -938,7 +938,7 @@ fn read_file_rpc_request(path: &Path) -> Result<(Vec<u8>, fs::Metadata), String>
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     #[cfg(windows)]
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let mut file = options
+    let file = options
         .open(path)
         .map_err(|error| format!("request must be an unlinked regular file: {error}"))?;
     let metadata =

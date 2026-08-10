@@ -2035,7 +2035,7 @@ mod tests {
     #[test]
     fn incident_store_evicts_resolved_records_and_matching_index_entries() {
         let state = SelfHealingState::new();
-        state.observe_incident(RuntimeIncidentObservation {
+        let _ = state.observe_incident(RuntimeIncidentObservation {
             domain: IncidentDomain::Watchdog,
             severity: IncidentSeverity::Low,
             summary: "resolved fixture".to_owned(),
@@ -2045,7 +2045,7 @@ mod tests {
         });
         state.resolve_incident(IncidentDomain::Watchdog, "resolved", "resolved");
         for index in 0..INCIDENT_RECORD_LIMIT {
-            state.observe_incident(RuntimeIncidentObservation {
+            let _ = state.observe_incident(RuntimeIncidentObservation {
                 domain: IncidentDomain::Approval,
                 severity: IncidentSeverity::Low,
                 summary: "open fixture".to_owned(),

@@ -6,6 +6,7 @@
 use super::*;
 use getrandom::fill as fill_random_bytes;
 use reqwest::Url;
+use std::collections::VecDeque;
 
 /// Upper bound for canvas state/schema versions: they persist in SQLite
 /// INTEGER (i64) columns, so `u64` values above `i64::MAX` cannot round-trip.

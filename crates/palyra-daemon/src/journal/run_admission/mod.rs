@@ -1373,7 +1373,15 @@ fn resolve_orchestrator_session_tx(
         (Some(session), Some(_)) | (Some(session), None) | (None, Some(session)) => Some(session),
         (None, None) if requested_id.is_none() && requested_key.is_none() => requested_label
             .as_deref()
-            .map(|value| load_orchestrator_session_by_label(connection, value))
+            .map(|value| {
+                load_orchestrator_session_by_label(
+                    connection,
+                    value,
+                    request.caller_principal.as_str(),
+                    request.caller_device_id.as_str(),
+                    request.caller_channel.as_deref(),
+                )
+            })
             .transpose()?
             .flatten(),
         (None, None) => None,

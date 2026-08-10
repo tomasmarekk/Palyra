@@ -6969,8 +6969,8 @@ mod tests {
     };
     use palyra_common::runtime_preview::RuntimePreviewMode;
     use palyra_common::workspace_patch::{
-        apply_workspace_patch, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
-        WorkspacePatchRequest,
+        apply_workspace_patch, compute_patch_sha256, redact_patch_preview, WorkspacePatchLimits,
+        WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
     };
     use palyra_vault::{
         BackendPreference as VaultBackendPreference, Vault, VaultConfig, VaultScope,
@@ -7004,8 +7004,9 @@ mod tests {
         docker_process_run_plan, parse_execution_backend_preference, plan_stuck_tool_job_recovery,
         prepare_docker_run_plan, resolve_execution_backend, resolve_execution_backend_for_request,
         sha256_hex, validate_docker_process_input, validate_execution_backend_selection,
-        CanonicalSshWorkerTransport, ContainerBackendProfile, ContainerCleanupAttestation,
-        ContainerEnvBinding, ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
+        validate_remote_workspace_patch_bundle, CanonicalSshWorkerTransport,
+        ContainerBackendProfile, ContainerCleanupAttestation, ContainerEnvBinding,
+        ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
         ContainerResourceLimits, ContainerRuntimeKind, DockerBackendCapabilityReport, DockerEngine,
         DockerEngineError, DockerEngineFuture, DockerResourceUsage, DockerRunPlan, DockerRunReport,
         DockerRunner, ExecutionBackend, ExecutionBackendHealthStatus, ExecutionBackendPreference,

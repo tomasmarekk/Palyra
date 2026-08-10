@@ -97,6 +97,7 @@ impl DiscordOnboardingVaultRollback {
                 }),
             Self::RestorePrevious(secret) => vault
                 .put_secret(&parsed_ref.scope, parsed_ref.key.as_str(), secret.as_ref())
+                .map(|_| ())
                 .map_err(|error| {
                     format!("failed to restore discord onboarding token in vault: {error}")
                 }),

@@ -1638,8 +1638,7 @@ fn workspace_patch_tool_execution_outcome(
 mod tests {
     use super::{
         normalize_workspace_patch_header_paths, normalize_workspace_patch_input_json,
-        patch_operation_paths, patch_should_use_active_root,
-        reject_env_prefixed_workspace_patch_paths,
+        patch_should_use_active_root, reject_env_prefixed_workspace_patch_paths,
         resolve_missing_workspace_root_after_patch_validation, resolve_workspace_root_override,
         serialize_workspace_patch_success, workspace_patch_checkpoint_root_mapping,
         workspace_patch_error_outcome, workspace_patch_planning_request,
@@ -1650,8 +1649,8 @@ mod tests {
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use palyra_common::workspace_patch::{
         apply_workspace_patch, apply_workspace_patch_with_canonical_root_constraints,
-        WorkspacePatchError, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
-        WorkspacePatchRequest,
+        normalized_workspace_patch_operation_paths, WorkspacePatchError, WorkspacePatchLimits,
+        WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
     };
     use serde_json::{json, Value};
 

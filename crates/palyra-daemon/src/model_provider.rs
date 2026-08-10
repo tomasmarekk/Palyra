@@ -7285,13 +7285,14 @@ mod tests {
         ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
         ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
         ProviderOutputContentPart, ProviderProbeAdmission, ProviderRawProviderRefs,
-        ProviderRegistryEntryConfig, ProviderRequest, ProviderRetryability, ProviderServiceTier,
-        ProviderStreamAccumulator, ProviderStreamEvent, ProviderTurnOutput, ProviderUsage,
-        QaProviderAttestationContext, RegistryBackedModelProvider, ANTHROPIC_OAUTH_BETA_HEADER,
-        ANTHROPIC_OAUTH_USER_AGENT, FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID,
-        FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID, FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID,
-        OPENAI_AUDIO_SPEECH_MODEL, OPENAI_RETRYABLE_STATUS_CODES,
-        QA_PROVIDER_FIXTURE_MATERIALIZATION, QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
+        ProviderReasoningEffort, ProviderRegistryEntryConfig, ProviderRequest,
+        ProviderRetryability, ProviderServiceTier, ProviderStreamAccumulator, ProviderStreamEvent,
+        ProviderTurnOutput, ProviderUsage, QaProviderAttestationContext,
+        RegistryBackedModelProvider, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT,
+        FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID, FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID,
+        FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID, OPENAI_AUDIO_SPEECH_MODEL,
+        OPENAI_RETRYABLE_STATUS_CODES, QA_PROVIDER_FIXTURE_MATERIALIZATION,
+        QA_PROVIDER_RECORD_REPLAY_MATERIALIZATION,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use palyra_auth::{AuthCredentialType, CredentialAttemptBinding, CredentialSelectionReport};
