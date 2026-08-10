@@ -1698,7 +1698,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                             "type":"object",
                             "additionalProperties":{"type":"string"},
                             "maxProperties":32,
-                            "description":"Optional environment variables for this child process, for inert fixture and local app settings such as PALYRA_E2E_HOME. Values are applied without shell syntax, after the sandbox base environment, and URL/host-shaped values are included in egress preflight. Runtime/path/loader/network-routing/credential-discovery keys such as PATH, HOME, HTTPS_PROXY, npm_config_registry, PIP_INDEX_URL, AWS_SHARED_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, KUBECONFIG, PALYRA_CONFIG, LD_PRELOAD, and DYLD_LIBRARY_PATH are rejected."
+                            "description":"Optional environment variables for this child process, for inert fixture and local app settings such as PALYRA_E2E_HOME. Values are applied without shell syntax, after the sandbox base environment, and URL/host-shaped values are included in egress preflight. Runtime/path/loader/network-routing/credential-discovery keys such as PATH, HOME, HTTPS_PROXY, npm_config_registry, PIP_INDEX_URL, AWS_SHARED_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, KUBECONFIG, PALYRA_CONFIG, and all LD_* or DYLD_* loader controls are rejected."
                         }),
                     ),
                     (

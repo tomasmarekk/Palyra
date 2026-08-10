@@ -5792,10 +5792,6 @@ fn process_env_key_is_reserved(key: &str) -> bool {
             | "XDG_CONFIG_HOME"
             | "XDG_CACHE_HOME"
             | "XDG_DATA_HOME"
-            | "LD_PRELOAD"
-            | "LD_LIBRARY_PATH"
-            | "DYLD_INSERT_LIBRARIES"
-            | "DYLD_LIBRARY_PATH"
             | "HTTP_PROXY"
             | "HTTPS_PROXY"
             | "ALL_PROXY"
@@ -5827,7 +5823,9 @@ fn process_env_key_is_reserved(key: &str) -> bool {
     ) {
         return true;
     }
-    key.ends_with("_PROXY")
+    key.starts_with("LD_")
+        || key.starts_with("DYLD_")
+        || key.ends_with("_PROXY")
         || key.starts_with("NPM_CONFIG_")
         || key.starts_with("YARN_")
         || key.starts_with("PIP_")
@@ -14852,9 +14850,16 @@ mod tests {
         env.insert("PALYRA_E2E_HOME".to_owned(), "/tmp/palyra-e2e-home".to_owned());
         validate_process_env_overrides(&env).expect("fixture env keys should be accepted");
 
-        for reserved_key in
-            ["PATH", "HTTPS_PROXY", "HOME", "AWS_SHARED_CREDENTIALS_FILE", "npm_config_registry"]
-        {
+        for reserved_key in [
+            "PATH",
+            "HTTPS_PROXY",
+            "HOME",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "npm_config_registry",
+            "LD_AUDIT",
+            "ld_debug_output",
+            "DYLD_FRAMEWORK_PATH",
+        ] {
             let mut env = BTreeMap::new();
             env.insert(reserved_key.to_owned(), "https://blocked.example".to_owned());
             let error = validate_process_env_overrides(&env)
