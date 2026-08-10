@@ -770,7 +770,10 @@ fn mcp_server_table(args: &McpRegistryMutateArgs) -> Result<toml::Value> {
         }
         McpTransportArg::Http | McpTransportArg::Sse => {
             let url = args.url.as_deref().expect("HTTP/SSE URL validated as present");
-            table.insert("url".to_owned(), toml::Value::String(url.to_owned()));
+            table.insert(
+                "url".to_owned(),
+                toml::Value::String(normalize_mcp_endpoint_url(url, "--url")?),
+            );
         }
     }
     table.insert(
@@ -845,6 +848,15 @@ fn validate_mcp_registry_document(document: &toml::Value) -> Result<()> {
         if !namespaces.insert(namespace.clone()) {
             anyhow::bail!("{namespace_source} duplicates `{namespace}`");
         }
+
+        if matches!(table.get("transport").and_then(toml::Value::as_str), Some("http" | "sse")) {
+            let url_source = format!("{source}.url");
+            let url = table
+                .get("url")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| anyhow!("{url_source} is required"))?;
+            normalize_mcp_endpoint_url(url, url_source.as_str())?;
+        }
     }
     Ok(())
 }
@@ -860,9 +872,10 @@ fn validate_mcp_transport_args(args: &McpRegistryMutateArgs) -> Result<()> {
             }
         }
         McpTransportArg::Http | McpTransportArg::Sse => {
-            if args.url.as_deref().is_none_or(|value| value.trim().is_empty()) {
+            let Some(url) = args.url.as_deref().filter(|value| !value.trim().is_empty()) else {
                 anyhow::bail!("--url is required when --transport {}", args.transport.as_str());
-            }
+            };
+            normalize_mcp_endpoint_url(url, "--url")?;
             if args.command.is_some() || !args.args.is_empty() || !args.env_vault_refs.is_empty() {
                 anyhow::bail!(
                     "--command, --arg, and --env-vault-ref are only valid when --transport stdio"
@@ -915,6 +928,24 @@ fn validate_mcp_transport_args(args: &McpRegistryMutateArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn normalize_mcp_endpoint_url(value: &str, source: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(value.trim())
+        .with_context(|| format!("{source} must be a valid URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("{source} must use http or https scheme");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{source} must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{source} must not embed credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{source} must not include query or fragment");
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 fn canonicalize_mcp_registry_section(document: &mut toml::Value) -> Result<()> {
@@ -2931,6 +2962,32 @@ mod tests {
         args.namespace = Some("palyra.memory".to_owned());
         let error = mcp_server_table(&args).expect_err("reserved namespace should be rejected");
         assert!(error.to_string().contains("reserved namespace"));
+    }
+
+    #[test]
+    fn mcp_registry_rejects_credential_bearing_urls_before_persist() {
+        let mut args = stdio_registry_args();
+        args.transport = McpTransportArg::Http;
+        args.command = None;
+        args.args.clear();
+        args.env_vault_refs.clear();
+        args.url = Some("https://operator:secret@example.com/mcp".to_owned());
+        let error =
+            mcp_server_table(&args).expect_err("credential-bearing MCP URL should be rejected");
+        assert!(error.to_string().contains("must not embed credentials"));
+
+        args.url = Some("https://example.com/mcp/".to_owned());
+        let mut server = mcp_server_table(&args).expect("safe MCP URL should encode");
+        assert_eq!(toml_table_string(&server, "url"), Some("https://example.com/mcp"));
+        server.as_table_mut().expect("server should be a table").insert(
+            "url".to_owned(),
+            toml::Value::String("https://operator:secret@example.com/mcp".to_owned()),
+        );
+        let mut document = toml::Value::Table(toml::map::Map::new());
+        mcp_servers_array_mut(&mut document).expect("mcp section should be created").push(server);
+        let error = validate_mcp_registry_document(&document)
+            .expect_err("persist validation must reject credential-bearing MCP URLs");
+        assert!(error.to_string().contains("must not embed credentials"));
     }
 
     #[test]
