@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,8 @@ pub enum ManagedWorktreeError {
     NotFound { worktree_id: String },
     #[error("managed worktree id is empty")]
     EmptyWorktreeId,
+    #[error("managed worktree paths must be absolute and traversal-free")]
+    InvalidPath,
     #[error("managed worktree path is inside source repository")]
     WorktreeInsideSourceRepo,
     #[error("managed worktree branch slug is empty")]
@@ -137,7 +139,7 @@ impl ManagedWorktreeRegistry {
         if self.records.contains_key(worktree_id.as_str()) {
             return Err(ManagedWorktreeError::Duplicate { worktree_id });
         }
-        if path_is_within(request.worktree_path.as_path(), request.source_repo.as_path()) {
+        if path_is_within(request.worktree_path.as_path(), request.source_repo.as_path())? {
             return Err(ManagedWorktreeError::WorktreeInsideSourceRepo);
         }
         let branch = managed_branch_name(request.branch_slug.as_str())?;
@@ -309,22 +311,42 @@ fn non_empty(value: String, error: ManagedWorktreeError) -> Result<String, Manag
     }
 }
 
-fn path_is_within(child: &Path, parent: &Path) -> bool {
-    normalized_components(child).starts_with(normalized_components(parent).as_slice())
+fn path_is_within(child: &Path, parent: &Path) -> Result<bool, ManagedWorktreeError> {
+    let child = normalized_absolute_components(child).ok_or(ManagedWorktreeError::InvalidPath)?;
+    let parent = normalized_absolute_components(parent).ok_or(ManagedWorktreeError::InvalidPath)?;
+    Ok(child.starts_with(parent.as_slice()))
 }
 
-fn normalized_components(path: &Path) -> Vec<String> {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
-            Component::Prefix(prefix) => {
-                Some(prefix.as_os_str().to_string_lossy().to_ascii_lowercase())
-            }
-            Component::RootDir => Some("/".to_owned()),
-            Component::CurDir => None,
-            Component::ParentDir => Some("..".to_owned()),
-        })
-        .collect()
+fn normalized_absolute_components(path: &Path) -> Option<Vec<String>> {
+    let normalized = path.to_str()?.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    let has_drive_root =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
+    let has_unc_root = normalized.starts_with("//");
+    if !path.is_absolute() && !has_drive_root && !has_unc_root {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    components.push(if has_drive_root {
+        format!("drive:{}", (bytes[0] as char).to_ascii_lowercase())
+    } else if has_unc_root {
+        "unc".to_owned()
+    } else {
+        "root".to_owned()
+    });
+    for (index, component) in normalized.split('/').enumerate() {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            _ if has_drive_root && index == 0 => {}
+            component => components.push(component.to_ascii_lowercase()),
+        }
+    }
+    if has_unc_root && components.len() < 3 {
+        return None;
+    }
+    Some(components)
 }
 
 fn normalize_workspace_path(path: &str) -> Option<String> {
@@ -364,6 +386,26 @@ mod tests {
             .expect_err("source-contained worktree should be rejected");
 
         assert_eq!(error, ManagedWorktreeError::WorktreeInsideSourceRepo);
+    }
+
+    #[test]
+    fn create_rejects_parent_directory_path_bypass() {
+        let mut registry = ManagedWorktreeRegistry::default();
+        let error = registry
+            .create(create_request("wt-1", "C:/tmp/../repo/palyra/worktree"))
+            .expect_err("parent-directory components must be rejected before attachment");
+
+        assert_eq!(error, ManagedWorktreeError::InvalidPath);
+    }
+
+    #[test]
+    fn create_rejects_relative_paths() {
+        let mut registry = ManagedWorktreeRegistry::default();
+        let error = registry
+            .create(create_request("wt-1", "repo/worktrees/wt-1"))
+            .expect_err("relative worktree paths must be rejected before attachment");
+
+        assert_eq!(error, ManagedWorktreeError::InvalidPath);
     }
 
     #[test]
