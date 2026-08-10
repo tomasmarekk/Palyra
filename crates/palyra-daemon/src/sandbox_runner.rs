@@ -19853,12 +19853,11 @@ mod tests {
     }
 
     #[test]
-    fn process_failure_message_omits_long_stderr_tail() {
+    fn process_failure_message_omits_secret_suffix_when_marker_precedes_tail() {
         let stdout = StreamCapture { bytes: Vec::new(), truncated: false, read_error: None };
-        let mut stderr = b"Downloading crate progress line\n".repeat(260);
-        stderr.extend_from_slice(
-            b"error[E0425]: cannot find value `missing_symbol` in this scope\naccess_token=tail-secret\n",
-        );
+        let mut stderr = b"access_token=".to_vec();
+        stderr.extend_from_slice("s".repeat(8 * 1024).as_bytes());
+        stderr.extend_from_slice(b"-unique-secret-suffix\n");
         let stderr = StreamCapture { bytes: stderr, truncated: false, read_error: None };
 
         let message =
@@ -19868,9 +19867,8 @@ mod tests {
         assert!(message.contains("child output omitted from error"), "{message}");
         assert!(!message.contains("stderr_preview="), "{message}");
         assert!(!message.contains("stderr_tail="), "{message}");
-        assert!(!message.contains("error[E0425]"), "{message}");
-        assert!(!message.contains("missing_symbol"), "{message}");
-        assert!(!message.contains("tail-secret"), "{message}");
+        assert!(!message.contains("access_token"), "{message}");
+        assert!(!message.contains("unique-secret-suffix"), "{message}");
     }
 
     #[test]
