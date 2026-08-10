@@ -35129,10 +35129,20 @@ fn redact_value(value: &mut Value, key_context: Option<&str>) -> bool {
 }
 
 fn redact_free_text_for_persistence(raw: &str) -> String {
-    if looks_like_secret(raw) {
+    let terminal_safe = raw
+        .chars()
+        .map(|character| {
+            if character.is_control() && !matches!(character, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if looks_like_secret(terminal_safe.as_str()) {
         return REDACTED_MARKER.to_owned();
     }
-    let marker_redacted = redact_secret_like_markers(raw);
+    let marker_redacted = redact_secret_like_markers(terminal_safe.as_str());
     let url_redacted =
         palyra_common::redaction::redact_url_segments_in_text(marker_redacted.as_str());
     let auth_redacted = palyra_common::redaction::redact_auth_error(url_redacted.as_str());
@@ -52512,6 +52522,18 @@ mod tests {
             !preview.contains("super-secret") && !preview.contains("abc123"),
             "raw secret-like values must not leak into previews: {preview}"
         );
+    }
+
+    #[test]
+    fn orchestrator_session_text_neutralizes_terminal_controls() {
+        let normalized = normalize_orchestrator_session_text(
+            "safe\x1b]52;c;clipboard\x07\x1b[2J visible",
+            ORCHESTRATOR_SESSION_PREVIEW_LEN,
+        )
+        .expect("safe text should remain");
+
+        assert!(!normalized.chars().any(char::is_control), "{normalized:?}");
+        assert!(!normalized.contains('\u{1b}'), "{normalized:?}");
     }
 
     #[test]

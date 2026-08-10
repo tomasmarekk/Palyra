@@ -104,18 +104,21 @@ pub(crate) async fn run_sessions_async(
                     include_archived
                 );
                 for session in &response.sessions {
-                    println!(
-                        "session title={} source={} preview={} key={} label={} updated_at_unix_ms={} last_run_state={} last_run_id={} archived_at_unix_ms={}",
-                        session_title_for_output(session),
-                        empty_to_none(session.title_source.as_str()),
-                        empty_to_none(session.preview.as_str()),
-                        redacted_text_or_none(!session.session_key.trim().is_empty()),
-                        redacted_text_or_none(!session.session_label.trim().is_empty()),
-                        session.updated_at_unix_ms,
-                        empty_to_none(session.last_run_state.as_str()),
-                        redacted_canonical_id_text(&session.last_run_id),
-                        optional_unix_ms_text(session.archived_at_unix_ms)
-                    );
+                    output::print_text_line(
+                        format!(
+                            "session title={} source={} preview={} key={} label={} updated_at_unix_ms={} last_run_state={} last_run_id={} archived_at_unix_ms={}",
+                            session_title_for_output(session),
+                            empty_to_none(session.title_source.as_str()),
+                            empty_to_none(session.preview.as_str()),
+                            redacted_text_or_none(!session.session_key.trim().is_empty()),
+                            redacted_text_or_none(!session.session_label.trim().is_empty()),
+                            session.updated_at_unix_ms,
+                            empty_to_none(session.last_run_state.as_str()),
+                            redacted_canonical_id_text(&session.last_run_id),
+                            optional_unix_ms_text(session.archived_at_unix_ms)
+                        )
+                        .as_str(),
+                    )?;
                 }
             }
         }
@@ -194,21 +197,27 @@ pub(crate) async fn run_sessions_async(
                     );
                 }
             } else {
-                println!(
-                    "sessions.history count={} include_archived={} query={}",
-                    response.sessions.len(),
-                    include_archived,
-                    normalize_optional_text(query).unwrap_or_else(|| "none".to_owned())
-                );
+                output::print_text_line(
+                    format!(
+                        "sessions.history count={} include_archived={} query={}",
+                        response.sessions.len(),
+                        include_archived,
+                        normalize_optional_text(query).unwrap_or_else(|| "none".to_owned())
+                    )
+                    .as_str(),
+                )?;
                 for session in &response.sessions {
-                    println!(
-                        "session title={} source={} archived={} pending_approvals={} preview={}",
-                        session.title,
-                        session.title_source,
-                        session.archived,
-                        session.pending_approvals,
-                        session.preview.as_deref().unwrap_or("none")
-                    );
+                    output::print_text_line(
+                        format!(
+                            "session title={} source={} archived={} pending_approvals={} preview={}",
+                            session.title,
+                            session.title_source,
+                            session.archived,
+                            session.pending_approvals,
+                            session.preview.as_deref().unwrap_or("none")
+                        )
+                        .as_str(),
+                    )?;
                 }
             }
         }
@@ -224,19 +233,22 @@ pub(crate) async fn run_sessions_async(
                     }))?
                 );
             } else {
-                println!(
-                    "sessions.show title={} source={} preview={} key={} label={} created_at_unix_ms={} updated_at_unix_ms={} last_run_state={} last_run_id={} archived_at_unix_ms={}",
-                    session_title_for_output(&session),
-                    empty_to_none(session.title_source.as_str()),
-                    empty_to_none(session.preview.as_str()),
-                    redacted_text_or_none(!session.session_key.trim().is_empty()),
-                    redacted_text_or_none(!session.session_label.trim().is_empty()),
-                    session.created_at_unix_ms,
-                    session.updated_at_unix_ms,
-                    empty_to_none(session.last_run_state.as_str()),
-                    redacted_canonical_id_text(&session.last_run_id),
-                    optional_unix_ms_text(session.archived_at_unix_ms)
-                );
+                output::print_text_line(
+                    format!(
+                        "sessions.show title={} source={} preview={} key={} label={} created_at_unix_ms={} updated_at_unix_ms={} last_run_state={} last_run_id={} archived_at_unix_ms={}",
+                        session_title_for_output(&session),
+                        empty_to_none(session.title_source.as_str()),
+                        empty_to_none(session.preview.as_str()),
+                        redacted_text_or_none(!session.session_key.trim().is_empty()),
+                        redacted_text_or_none(!session.session_label.trim().is_empty()),
+                        session.created_at_unix_ms,
+                        session.updated_at_unix_ms,
+                        empty_to_none(session.last_run_state.as_str()),
+                        redacted_canonical_id_text(&session.last_run_id),
+                        optional_unix_ms_text(session.archived_at_unix_ms)
+                    )
+                    .as_str(),
+                )?;
             }
         }
         SessionsCommand::Status { session_id, session_key, json: _ } => {
@@ -287,17 +299,20 @@ pub(crate) async fn run_sessions_async(
                     }))?
                 );
             } else {
-                println!(
-                    "sessions.resolve title={} source={} preview={} key={} label={} created={} reset_applied={} archived_at_unix_ms={}",
-                    session_title_for_output(&session),
-                    empty_to_none(session.title_source.as_str()),
-                    empty_to_none(session.preview.as_str()),
-                    redacted_text_or_none(!session.session_key.trim().is_empty()),
-                    redacted_text_or_none(!session.session_label.trim().is_empty()),
-                    response.created,
-                    response.reset_applied,
-                    optional_unix_ms_text(session.archived_at_unix_ms)
-                );
+                output::print_text_line(
+                    format!(
+                        "sessions.resolve title={} source={} preview={} key={} label={} created={} reset_applied={} archived_at_unix_ms={}",
+                        session_title_for_output(&session),
+                        empty_to_none(session.title_source.as_str()),
+                        empty_to_none(session.preview.as_str()),
+                        redacted_text_or_none(!session.session_key.trim().is_empty()),
+                        redacted_text_or_none(!session.session_label.trim().is_empty()),
+                        response.created,
+                        response.reset_applied,
+                        optional_unix_ms_text(session.archived_at_unix_ms)
+                    )
+                    .as_str(),
+                )?;
             }
         }
         SessionsCommand::Rename { session_id, session_key, session_label, json: _ } => {
