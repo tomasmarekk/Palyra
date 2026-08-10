@@ -1087,8 +1087,7 @@ fn normalize_document(
                 let parsed_absolute = parsed.is_absolute();
                 let candidate =
                     if parsed_absolute { parsed } else { canonical_agent_dir.join(parsed) };
-                let canonical_workspace =
-                    ensure_canonical_dir(candidate.as_path(), "workspace_root")?;
+                let canonical_workspace = ensure_canonical_workspace_dir(candidate.as_path())?;
                 if !parsed_absolute
                     && !canonical_workspace.starts_with(canonical_agent_dir.as_path())
                 {
@@ -1369,7 +1368,7 @@ fn resolve_workspace_roots(
         } else {
             agent_dir.join(parsed)
         };
-        let canonical = ensure_canonical_dir(candidate.as_path(), "workspace_root")?;
+        let canonical = ensure_canonical_workspace_dir(candidate.as_path())?;
         // Containment is checked after canonicalization so a symlink inside
         // the agent dir cannot smuggle a relative root outside it (pinned by
         // create_agent_rejects_workspace_symlink_escape).
@@ -1424,6 +1423,17 @@ fn ensure_canonical_dir(path: &Path, field: &'static str) -> Result<PathBuf, Age
         .map_err(|source| AgentRegistryError::WriteRegistry { path: path.to_path_buf(), source })?;
     fs::canonicalize(path).map_err(|source| AgentRegistryError::InvalidPath {
         field,
+        message: format!("failed to canonicalize path '{}': {source}", path.display()),
+    })
+}
+
+// Workspaces may be pre-existing operator-owned checkouts. Creating a missing path is
+// intentional, but registry hardening must not rewrite permissions on an existing workspace.
+fn ensure_canonical_workspace_dir(path: &Path) -> Result<PathBuf, AgentRegistryError> {
+    fs::create_dir_all(path)
+        .map_err(|source| AgentRegistryError::WriteRegistry { path: path.to_path_buf(), source })?;
+    fs::canonicalize(path).map_err(|source| AgentRegistryError::InvalidPath {
+        field: "workspace_root",
         message: format!("failed to canonicalize path '{}': {source}", path.display()),
     })
 }
@@ -1629,6 +1639,43 @@ mod tests {
             AgentRegistry::open(identity_root.as_path()).expect("registry should reopen");
         let page = reopened.list_agents(None, Some(10)).expect("list should succeed");
         assert_eq!(page.agents[0].workspace_roots, vec![canonical_workspace]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_agent_preserves_existing_workspace_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().expect("tempdir should be created");
+        let identity_root = temp.path().join("state").join("identity");
+        let registry =
+            AgentRegistry::open(identity_root.as_path()).expect("registry should initialize");
+        let workspace = temp.path().join("shared-checkout");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should be created");
+        fs::set_permissions(workspace.as_path(), fs::Permissions::from_mode(0o755))
+            .expect("workspace permissions should be configured");
+
+        registry
+            .create_agent(AgentCreateRequest {
+                agent_id: "shared".to_owned(),
+                display_name: "Shared".to_owned(),
+                agent_dir: None,
+                workspace_roots: vec![workspace.to_string_lossy().into_owned()],
+                default_model_profile: None,
+                execution_backend_preference: None,
+                default_tool_allowlist: Vec::new(),
+                default_skill_allowlist: Vec::new(),
+                set_default: true,
+                allow_absolute_paths: true,
+            })
+            .expect("agent should accept the shared workspace");
+
+        let mode = fs::metadata(workspace.as_path())
+            .expect("workspace metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
     }
 
     #[test]
