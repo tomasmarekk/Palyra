@@ -11819,7 +11819,13 @@ impl JournalStore {
             (None, None) => {
                 if requested_session_id.is_none() && requested_session_key.is_none() {
                     if let Some(session_label) = requested_session_label.as_deref() {
-                        load_orchestrator_session_by_label(&guard, session_label)?
+                        load_orchestrator_session_by_label(
+                            &guard,
+                            session_label,
+                            request.principal.as_str(),
+                            request.device_id.as_str(),
+                            request.channel.as_deref(),
+                        )?
                     } else {
                         None
                     }
@@ -30143,6 +30149,9 @@ fn load_orchestrator_session_by_key(
 fn load_orchestrator_session_by_label(
     connection: &Connection,
     session_label: &str,
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
 ) -> Result<Option<OrchestratorSessionRecord>, JournalError> {
     let mut statement = connection.prepare(
         r#"
@@ -30173,13 +30182,22 @@ fn load_orchestrator_session_by_label(
                 branch_origin_run_ulid
             FROM orchestrator_sessions
             WHERE session_label = ?1
+              AND principal = ?2
+              AND device_id = ?3
+              AND (
+                    channel = ?4
+                    OR (channel IS NULL AND ?4 IS NULL)
+              )
               AND archived_at_unix_ms IS NULL
             ORDER BY updated_at_unix_ms DESC
             LIMIT 1
         "#,
     )?;
     statement
-        .query_row(params![session_label], map_orchestrator_session_row)
+        .query_row(
+            params![session_label, principal, device_id, channel],
+            map_orchestrator_session_row,
+        )
         .optional()
         .map_err(Into::into)
 }
@@ -37330,6 +37348,58 @@ mod tests {
                 .is_none(),
             "reset-session must not retain stale project focus paths"
         );
+    }
+
+    #[test]
+    fn session_label_resolution_is_scoped_to_identity() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_label = "Shared operator label";
+        let device_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let sessions = [
+            ("01ARZ3NDEKTSV4RRFFQ69G5SL1", "user:ops", device_id, None, 1_i64),
+            ("01ARZ3NDEKTSV4RRFFQ69G5SL2", "user:ops", device_id, Some("cli"), 2_i64),
+            ("01ARZ3NDEKTSV4RRFFQ69G5SL3", "user:ops", "01ARZ3NDEKTSV4RRFFQ69G5FAZ", None, 3_i64),
+            ("01ARZ3NDEKTSV4RRFFQ69G5SL4", "user:other", device_id, None, 4_i64),
+        ];
+
+        for (session_id, principal, session_device_id, channel, updated_at_unix_ms) in sessions {
+            store
+                .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                    session_id: session_id.to_owned(),
+                    session_key: session_id.to_owned(),
+                    session_label: Some(session_label.to_owned()),
+                    principal: principal.to_owned(),
+                    device_id: session_device_id.to_owned(),
+                    channel: channel.map(str::to_owned),
+                })
+                .expect("test session should be upserted");
+            store
+                .connection
+                .lock()
+                .expect("journal lock should not be poisoned")
+                .execute(
+                    "UPDATE orchestrator_sessions SET updated_at_unix_ms = ?2 WHERE session_ulid = ?1",
+                    params![session_id, updated_at_unix_ms],
+                )
+                .expect("test session timestamp should be updated");
+        }
+
+        let resolved = store
+            .resolve_orchestrator_session(&OrchestratorSessionResolveRequest {
+                session_id: None,
+                session_key: None,
+                session_label: Some(session_label.to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: device_id.to_owned(),
+                channel: None,
+                require_existing: true,
+                reset_session: false,
+            })
+            .expect("label lookup should resolve only within the caller identity");
+
+        assert_eq!(resolved.session.session_id, "01ARZ3NDEKTSV4RRFFQ69G5SL1");
     }
 
     #[test]
