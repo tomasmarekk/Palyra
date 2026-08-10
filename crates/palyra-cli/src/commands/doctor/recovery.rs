@@ -478,11 +478,7 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
     let diagnostics = build_doctor_report(checks.as_slice())?;
     let tools = build_doctor_tools_report(&environment);
     let unified = build_unified_doctor_report(&diagnostics, &tools, &environment)?;
-    let repair_plans = if request.rollback_run.is_some() {
-        Vec::new()
-    } else {
-        evaluate_repair_plans(&environment)?
-    };
+    let repair_plans = repair_plans_for_request(request, || evaluate_repair_plans(&environment))?;
     let registry =
         build_doctor_registry_report(&diagnostics, &tools, repair_plans.as_slice(), request);
     let mut recovery = DoctorRecoveryReport {
@@ -546,6 +542,20 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
         registry,
         recovery,
     })
+}
+
+/// Keeps ordinary diagnostics available when optional repair-only state is malformed.
+fn repair_plans_for_request(
+    request: &DoctorCommandRequest,
+    evaluate: impl FnOnce() -> Result<Vec<DoctorRepairPlan>>,
+) -> Result<Vec<DoctorRepairPlan>> {
+    if request.rollback_run.is_some() {
+        return Ok(Vec::new());
+    }
+    if request.repair {
+        return evaluate();
+    }
+    Ok(evaluate().unwrap_or_default())
 }
 
 fn resolve_doctor_environment() -> Result<DoctorEnvironment> {
@@ -3814,6 +3824,42 @@ fn sanitize_file_component(value: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn doctor_request(repair: bool) -> DoctorCommandRequest {
+        DoctorCommandRequest {
+            strict: false,
+            json: true,
+            lint: false,
+            deep: false,
+            severity_min: None,
+            repair,
+            dry_run: true,
+            force: false,
+            only: Vec::new(),
+            skip: Vec::new(),
+            rollback_run: None,
+        }
+    }
+
+    #[test]
+    fn plain_diagnostics_ignore_repair_only_state_errors() {
+        let plans = repair_plans_for_request(&doctor_request(false), || {
+            anyhow::bail!("invalid optional repair state")
+        })
+        .expect("plain diagnostics should remain available");
+
+        assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn explicit_repair_propagates_repair_state_errors() {
+        let error = repair_plans_for_request(&doctor_request(true), || {
+            anyhow::bail!("invalid optional repair state")
+        })
+        .expect_err("explicit repair should fail before mutating malformed state");
+
+        assert!(error.to_string().contains("invalid optional repair state"));
+    }
 
     #[test]
     fn normalize_node_runtime_adds_version_and_expires_entries() {
