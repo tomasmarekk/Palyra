@@ -234,6 +234,7 @@ fn route_plan(input: &ChannelInboundMessage) -> ChannelRoutePlan {
         binding_expires_at_unix_ms: None,
         binding_reason: None,
         sender_identity: input.sender_handle.clone(),
+        message_route_authorized: true,
         is_broadcast: false,
         response_prefix: None,
         auto_ack_text: None,

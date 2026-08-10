@@ -371,6 +371,7 @@ pub(crate) async fn handle_routed_route_message(
         Some(plan.channel.as_str()),
         None,
         None,
+        plan.message_route_authorized,
     ) {
         runtime_state.record_denied();
         runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
@@ -1597,6 +1598,7 @@ pub(crate) async fn handle_routed_route_message(
         Some(plan.channel.as_str()),
         Some(session_id.as_str()),
         Some(run_id.as_str()),
+        plan.message_route_authorized,
     ) {
         runtime_state.record_denied();
         runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);

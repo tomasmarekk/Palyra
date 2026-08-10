@@ -370,6 +370,9 @@ pub struct RoutePlan {
     pub binding_expires_at_unix_ms: Option<i64>,
     pub binding_reason: Option<String>,
     pub sender_identity: Option<String>,
+    /// Host-only authorization result; never serialized as reusable route authority.
+    #[serde(skip)]
+    pub message_route_authorized: bool,
     pub is_broadcast: bool,
     pub response_prefix: Option<String>,
     pub auto_ack_text: Option<String>,
@@ -479,6 +482,7 @@ struct RouteCandidate {
     channel: String,
     rule: ChannelRoutingRule,
     sender_identity: Option<String>,
+    message_route_authorized: bool,
     route_key: String,
     session_key: String,
     session_label: Option<String>,
@@ -1067,6 +1071,7 @@ impl ChannelRouter {
                 binding_expires_at_unix_ms: None,
                 binding_reason: None,
                 sender_identity: candidate.sender_identity,
+                message_route_authorized: candidate.message_route_authorized,
                 is_broadcast: message.requested_broadcast,
                 response_prefix: candidate
                     .rule
@@ -1215,6 +1220,11 @@ impl ChannelRouter {
         let sender_allowlisted = normalized_sender
             .as_deref()
             .is_some_and(|sender| self.sender_is_allowlisted(&rule, sender));
+        let sender_paired = message.is_direct_message
+            && matches!(rule.direct_message_policy, DirectMessagePolicy::Pairing)
+            && normalized_sender
+                .as_deref()
+                .is_some_and(|sender| self.is_sender_paired(channel, sender));
         // The allowlist is enforced strictly unless it is empty (nothing to
         // enforce) or the message is a DM under the pairing policy, where
         // the pairing grant -- not the allowlist -- authenticates the
@@ -1281,7 +1291,7 @@ impl ChannelRouter {
                             route_target: None,
                         });
                     }
-                    if !sender_allowlisted && !self.is_sender_paired(channel, sender) {
+                    if !sender_allowlisted && !sender_paired {
                         return Err(RouteRejection {
                             reason: "direct_message_pairing_required".to_owned(),
                             quarantined: false,
@@ -1343,6 +1353,7 @@ impl ChannelRouter {
             channel: channel.to_owned(),
             rule,
             sender_identity,
+            message_route_authorized: sender_allowlisted || sender_paired,
             route_key,
             session_key,
             session_label: normalize_non_empty(
@@ -1878,6 +1889,23 @@ mod tests {
         assert_eq!(routed.plan.route_key, "channel:slack:conversation:C01TEAM");
         assert_eq!(routed.plan.session_key, "channel:slack:conversation:C01TEAM");
         assert_eq!(routed.plan.response_prefix.as_deref(), Some("[bot] "));
+        assert!(
+            !routed.plan.message_route_authorized,
+            "a mention match alone must not authorize external message delivery"
+        );
+        routed.lease.release();
+    }
+
+    #[test]
+    fn explicit_sender_allowlist_authorizes_message_delivery() {
+        let mut config = baseline_config();
+        config.channels[0].allow_from = vec!["U123".to_owned()];
+        let router = ChannelRouter::new(config);
+        let outcome = router.begin_route(&inbound("hello @palyra"));
+        let RouteOutcome::Routed(routed) = outcome else {
+            panic!("allowlisted sender should route");
+        };
+        assert!(routed.plan.message_route_authorized);
         routed.lease.release();
     }
 
@@ -2340,10 +2368,11 @@ mod tests {
         let mut message = inbound("dm hello after pairing");
         message.is_direct_message = true;
         let outcome = router.begin_route(&message);
-        assert!(
-            matches!(outcome, RouteOutcome::Routed(_)),
-            "paired sender should pass DM policy checks"
-        );
+        let RouteOutcome::Routed(routed) = outcome else {
+            panic!("paired sender should pass DM policy checks");
+        };
+        assert!(routed.plan.message_route_authorized);
+        routed.lease.release();
     }
 
     #[test]

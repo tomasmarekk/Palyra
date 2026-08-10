@@ -46,6 +46,8 @@ pub struct PolicyRequestContext {
     pub skill_id: Option<String>,
     /// Capabilities requested for this call; matched against sensitive capability names.
     pub capabilities: Vec<String>,
+    /// Host-owned proof that the channel router explicitly authorized this message delivery.
+    pub message_route_authorized: bool,
 }
 
 /// Allowlists and approval flags applied during policy evaluation.
@@ -124,6 +126,8 @@ pub struct PolicyExplanation {
     pub is_tool_execute_principal_allowed: bool,
     /// Whether the channel passed the `tool.execute` channel gate.
     pub is_tool_execute_channel_allowed: bool,
+    /// Whether the host channel router explicitly authorized this message delivery.
+    pub is_message_route_authorized: bool,
     /// Normalized tool name resolved from context or resource, if any.
     pub requested_tool: Option<String>,
     /// Normalized skill identifier resolved from context or resource, if any.
@@ -229,12 +233,20 @@ when {
     context.action == "vault.list"
 };
 
-@id("allow_message_router_actions")
+@id("allow_authorized_message_delivery_actions")
 permit(principal, action, resource)
 when {
-    context.action == "message.reply" ||
-    context.action == "message.broadcast" ||
-    context.action == "channel.send" ||
+    context.is_message_route_authorized &&
+    (
+        context.action == "message.reply" ||
+        context.action == "message.broadcast" ||
+        context.action == "channel.send"
+    )
+};
+
+@id("allow_channel_message_and_command_actions")
+permit(principal, action, resource)
+when {
     context.action == "channel.message.read" ||
     context.action == "channel.message.search" ||
     context.action == "channel.message.edit" ||
@@ -278,6 +290,8 @@ const TOOL_EXECUTE_PRINCIPAL_DENY_REASON: &str =
     "tool execution denied by default: principal is not allowlisted for tool.execute";
 const TOOL_EXECUTE_CHANNEL_DENY_REASON: &str =
     "tool execution denied by default: channel is not allowlisted for tool.execute";
+const MESSAGE_ROUTE_DENY_REASON: &str =
+    "message delivery denied by default: channel sender is not explicitly authorized";
 const BASELINE_DENY_REASON: &str = "deny-by-default baseline policy";
 
 /// Evaluates `request` against the default configuration, failing closed.
@@ -385,6 +399,7 @@ pub fn evaluate_with_context(
             "is_allowlisted_skill": is_allowlisted_skill,
             "is_tool_execute_principal_allowed": is_tool_execute_principal_allowed,
             "is_tool_execute_channel_allowed": is_tool_execute_channel_allowed,
+            "is_message_route_authorized": normalized_request_context.message_route_authorized,
             "allow_sensitive_tools": config.allow_sensitive_tools,
         }),
         None,
@@ -418,6 +433,7 @@ pub fn evaluate_with_context(
         is_allowlisted_skill,
         is_tool_execute_principal_allowed,
         is_tool_execute_channel_allowed,
+        normalized_request_context.message_route_authorized,
         config.allow_sensitive_tools,
         diagnostics_errors.as_slice(),
     );
@@ -439,6 +455,7 @@ pub fn evaluate_with_context(
             is_allowlisted_skill,
             is_tool_execute_principal_allowed,
             is_tool_execute_channel_allowed,
+            is_message_route_authorized: normalized_request_context.message_route_authorized,
             requested_tool,
             requested_skill,
             request_capabilities,
@@ -574,6 +591,7 @@ fn decision_reason(
     is_allowlisted_skill: bool,
     is_tool_execute_principal_allowed: bool,
     is_tool_execute_channel_allowed: bool,
+    is_message_route_authorized: bool,
     allow_sensitive_tools: bool,
     diagnostics_errors: &[String],
 ) -> String {
@@ -632,6 +650,9 @@ fn decision_reason(
     if normalized_action == "skill.execute" && !is_allowlisted_skill {
         return SKILL_POLICY_DENY_REASON.to_owned();
     }
+    if is_message_delivery_action(normalized_action) && !is_message_route_authorized {
+        return MESSAGE_ROUTE_DENY_REASON.to_owned();
+    }
 
     BASELINE_DENY_REASON.to_owned()
 }
@@ -654,6 +675,9 @@ fn policy_reason_code(reason: &str) -> &'static str {
     }
     if reason == SKILL_POLICY_DENY_REASON {
         return "skill.execute.skill_not_allowlisted";
+    }
+    if reason == MESSAGE_ROUTE_DENY_REASON {
+        return "message.delivery.sender_not_authorized";
     }
     if reason == BASELINE_DENY_REASON {
         return "policy.baseline_deny";
@@ -739,6 +763,7 @@ struct NormalizedPolicyRequestContext {
     tool_name: Option<String>,
     skill_id: Option<String>,
     capabilities: Vec<String>,
+    message_route_authorized: bool,
 }
 
 fn normalize_request_context(
@@ -768,6 +793,7 @@ fn normalize_request_context(
         tool_name: normalize_context_identifier(request_context.tool_name.as_deref(), true),
         skill_id: normalize_context_identifier(request_context.skill_id.as_deref(), true),
         capabilities,
+        message_route_authorized: request_context.message_route_authorized,
     }
 }
 
@@ -867,6 +893,10 @@ fn is_tool_execute_channel_allowed(
         return false;
     };
     allowlisted_channels.iter().any(|allowlisted| allowlisted.eq_ignore_ascii_case(channel))
+}
+
+fn is_message_delivery_action(normalized_action: &str) -> bool {
+    matches!(normalized_action, "message.reply" | "message.broadcast" | "channel.send")
 }
 
 fn requested_tool_name(normalized_action: &str, resource: &str) -> Option<String> {
@@ -971,8 +1001,9 @@ mod tests {
     use super::{
         evaluate, evaluate_with_config, evaluate_with_context, PolicyDecision,
         PolicyEvaluationConfig, PolicyRequest, PolicyRequestContext, BASELINE_DENY_REASON,
-        POLICY_DENY_REASON, SENSITIVE_DENY_REASON, SKILL_POLICY_DENY_REASON,
-        TOOL_EXECUTE_CHANNEL_DENY_REASON, TOOL_EXECUTE_PRINCIPAL_DENY_REASON,
+        MESSAGE_ROUTE_DENY_REASON, POLICY_DENY_REASON, SENSITIVE_DENY_REASON,
+        SKILL_POLICY_DENY_REASON, TOOL_EXECUTE_CHANNEL_DENY_REASON,
+        TOOL_EXECUTE_PRINCIPAL_DENY_REASON,
     };
 
     #[test]
@@ -1163,21 +1194,35 @@ mod tests {
     }
 
     #[test]
-    fn message_router_actions_are_explicitly_allowed() {
+    fn message_router_actions_require_host_route_authorization() {
         let request = PolicyRequest {
             principal: "user:ops".to_owned(),
             action: "message.reply".to_owned(),
             resource: "channel:slack".to_owned(),
         };
 
-        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+        let denied = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
             .expect("well-formed request evaluates without engine error");
+        assert_eq!(
+            denied.decision,
+            PolicyDecision::DenyByDefault { reason: MESSAGE_ROUTE_DENY_REASON.to_owned() }
+        );
 
-        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        let allowed = evaluate_with_context(
+            &request,
+            &PolicyRequestContext {
+                message_route_authorized: true,
+                ..PolicyRequestContext::default()
+            },
+            &PolicyEvaluationConfig::default(),
+        )
+        .expect("well-formed request evaluates without engine error");
+        assert_eq!(allowed.decision, PolicyDecision::Allow);
         assert!(
-            evaluation.explanation.reason.contains("message router action allowed"),
+            allowed.explanation.reason.contains("message router action allowed"),
             "message action allow reason should reflect dedicated message policy"
         );
+        assert!(allowed.explanation.is_message_route_authorized);
     }
 
     #[test]
@@ -1221,17 +1266,30 @@ mod tests {
     }
 
     #[test]
-    fn channel_send_action_is_explicitly_allowed() {
+    fn channel_send_requires_host_route_authorization() {
         let request = PolicyRequest {
             principal: "user:ops".to_owned(),
             action: "channel.send".to_owned(),
             resource: "channel:slack".to_owned(),
         };
 
-        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+        let denied = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
             .expect("well-formed request evaluates without engine error");
+        assert_eq!(
+            denied.decision,
+            PolicyDecision::DenyByDefault { reason: MESSAGE_ROUTE_DENY_REASON.to_owned() }
+        );
 
-        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        let allowed = evaluate_with_context(
+            &request,
+            &PolicyRequestContext {
+                message_route_authorized: true,
+                ..PolicyRequestContext::default()
+            },
+            &PolicyEvaluationConfig::default(),
+        )
+        .expect("well-formed request evaluates without engine error");
+        assert_eq!(allowed.decision, PolicyDecision::Allow);
     }
 
     #[test]

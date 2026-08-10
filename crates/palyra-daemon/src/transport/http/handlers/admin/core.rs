@@ -1209,6 +1209,7 @@ pub(crate) async fn admin_policy_explain_handler(
             .as_deref()
             .map(crate::tool_protocol::tool_policy_capability_names)
             .unwrap_or_default(),
+        message_route_authorized: false,
     };
     let evaluation_config = PolicyEvaluationConfig {
         allowlisted_tools: state.runtime.config.tool_call.allowed_tools.clone(),

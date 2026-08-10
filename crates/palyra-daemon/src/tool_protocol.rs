@@ -400,6 +400,7 @@ pub fn decide_tool_call(
         tool_name: Some(tool_name.to_ascii_lowercase()),
         skill_id: request_context.skill_id.clone(),
         capabilities: tool_policy_capability_names(tool_name),
+        message_route_authorized: false,
     };
     let policy_allowlisted_tools =
         allowlisted_tools_with_compat_aliases(config.allowed_tools.as_slice());

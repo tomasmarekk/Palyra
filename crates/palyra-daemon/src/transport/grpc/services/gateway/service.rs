@@ -1521,6 +1521,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             Some(input.channel.as_str()),
                             None,
                             None,
+                            false,
                         ) {
                             Ok(()) => build_channel_command_response(
                                 &invocation,

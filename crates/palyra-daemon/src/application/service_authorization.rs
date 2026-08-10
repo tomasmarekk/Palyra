@@ -52,10 +52,10 @@ pub(crate) fn authorize_cron_action(
     authorize_policy_action(principal, action, resource, "cron")
 }
 
-/// Authorizes message routing with the channel forwarded as policy context.
+/// Authorizes message routing with host-owned route admission and correlation context.
 ///
-/// The session and run identifiers are accepted for call-site symmetry but
-/// are not part of the policy request today.
+/// `message_route_authorized` must come from the channel router's explicit sender allowlist
+/// or pairing decision, never from request-controlled input.
 ///
 /// # Errors
 /// Returns `Status::permission_denied` when policy denies the action and
@@ -66,8 +66,9 @@ pub(crate) fn authorize_message_action(
     action: &str,
     resource: &str,
     channel: Option<&str>,
-    _session_id: Option<&str>,
-    _run_id: Option<&str>,
+    session_id: Option<&str>,
+    run_id: Option<&str>,
+    message_route_authorized: bool,
 ) -> Result<(), Status> {
     let evaluation = evaluate_with_context(
         &PolicyRequest {
@@ -77,6 +78,9 @@ pub(crate) fn authorize_message_action(
         },
         &PolicyRequestContext {
             channel: channel.map(str::to_owned),
+            session_id: session_id.map(str::to_owned),
+            run_id: run_id.map(str::to_owned),
+            message_route_authorized,
             ..PolicyRequestContext::default()
         },
         &PolicyEvaluationConfig::default(),
