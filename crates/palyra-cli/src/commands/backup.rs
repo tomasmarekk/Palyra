@@ -429,7 +429,12 @@ fn add_directory_to_zip(
             let file_type = child
                 .file_type()
                 .with_context(|| format!("failed to inspect backup entry {}", path.display()))?;
-            if should_skip_state_backup_entry(path.as_path(), archive_prefix, &file_type) {
+            if should_skip_state_backup_entry(
+                path.as_path(),
+                source_root.as_path(),
+                archive_prefix,
+                &file_type,
+            ) {
                 continue;
             }
             // Symlinks are rejected outright (not followed) so a planted link
@@ -476,6 +481,7 @@ fn add_directory_to_zip(
 // the archive.
 fn should_skip_state_backup_entry(
     path: &Path,
+    source_root: &Path,
     archive_prefix: &str,
     file_type: &fs::FileType,
 ) -> bool {
@@ -484,6 +490,11 @@ fn should_skip_state_backup_entry(
     }
     if file_type.is_symlink() && is_managed_skill_current_link(path) {
         return true;
+    }
+    if !file_type.is_file()
+        || path.strip_prefix(source_root).ok().and_then(Path::parent) != Some(Path::new("vault"))
+    {
+        return false;
     }
     let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
@@ -790,7 +801,11 @@ mod tests {
         let source_root = temp.path().join("state");
         let vault_root = source_root.join("vault");
         fs::create_dir_all(vault_root.as_path())?;
+        let plugin_root = source_root.join("plugins").join("example");
+        fs::create_dir_all(plugin_root.as_path())?;
         fs::write(source_root.join("runtime.json").as_path(), b"stable")?;
+        fs::write(source_root.join(VAULT_METADATA_LOCK_FILE).as_path(), b"application data")?;
+        fs::write(plugin_root.join("metadata.tmp.snapshot").as_path(), b"plugin data")?;
         fs::write(vault_root.join(VAULT_METADATA_LOCK_FILE).as_path(), b"pid=1")?;
         fs::write(vault_root.join("metadata.tmp.01ABC").as_path(), b"temporary")?;
 
@@ -809,8 +824,19 @@ mod tests {
             &mut entries,
         )?;
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].archive_path, "state/runtime.json");
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries.iter().any(|entry| entry.archive_path == "state/metadata.lock"),
+            "non-vault metadata file should be archived"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.archive_path == "state/plugins/example/metadata.tmp.snapshot"),
+            "nested application metadata file should be archived"
+        );
+        assert!(entries.iter().any(|entry| entry.archive_path == "state/runtime.json"));
+        assert!(entries.iter().all(|entry| !entry.archive_path.starts_with("state/vault/")));
         Ok(())
     }
 
