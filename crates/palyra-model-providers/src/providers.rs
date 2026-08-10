@@ -23,7 +23,6 @@ pub use anthropic::{
     anthropic_compatible_uses_anthropic_oauth_headers, anthropic_compatible_uses_bearer_auth,
     messages_payload as anthropic_messages_payload,
 };
-pub use minimax::{coerce_raw_tool_call_markup, RawToolCallMarkupExtraction};
 pub use openai::{
     chat_completions_payload as openai_chat_completions_payload,
     responses_payload as openai_responses_payload,

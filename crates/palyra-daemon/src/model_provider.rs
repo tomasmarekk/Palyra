@@ -60,9 +60,9 @@ use adapters::{
 pub(crate) use palyra_model_providers::MAX_TOOL_ARGUMENT_BYTES;
 pub(crate) use palyra_model_providers::{
     anthropic_compatible_uses_anthropic_oauth_headers, anthropic_compatible_uses_bearer_auth,
-    bounded_provider_turn_output_for_persistence, coerce_raw_tool_call_markup,
-    normalize_tool_arguments, normalize_tool_input_value, provider_events_from_output,
-    redact_remote_secret_fragments, sanitize_remote_error,
+    bounded_provider_turn_output_for_persistence, normalize_tool_arguments,
+    normalize_tool_input_value, provider_events_from_output, redact_remote_secret_fragments,
+    sanitize_remote_error,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -5092,28 +5092,7 @@ impl OpenAiCompatibleProvider {
             });
         }
 
-        let mut completion_text = extract_completion_text(choice.message.content);
-        // Some models emit tool calls as inline markup in the text body
-        // instead of the structured tool-call field. Recover those into real
-        // proposals; malformed markup is retryable because a fresh sample
-        // usually produces well-formed output.
-        let coerced_raw_tool_markup = if tool_events.is_empty() {
-            match coerce_raw_tool_call_markup(completion_text.as_str()).map_err(|error| {
-                AttemptError::retryable_invalid_response(
-                    format!("openai-compatible raw tool-call markup is invalid: {error}"),
-                    "openai_compatible_raw_tool_call_markup",
-                )
-            })? {
-                Some(extraction) => {
-                    completion_text = extraction.cleaned_text;
-                    tool_events.extend(extraction.tool_events);
-                    true
-                }
-                None => false,
-            }
-        } else {
-            false
-        };
+        let completion_text = extract_completion_text(choice.message.content);
         // A blank completion with no tool calls would read as a dead turn
         // downstream; substitute a minimal acknowledgement instead.
         let full_text = if completion_text.trim().is_empty() && tool_events.is_empty() {
@@ -5133,11 +5112,7 @@ impl OpenAiCompatibleProvider {
         let output = provider_output_from_text_and_tools(
             full_text,
             tool_events,
-            if coerced_raw_tool_markup {
-                ProviderFinishReason::ToolCalls
-            } else {
-                ProviderFinishReason::from_openai(choice.finish_reason.as_deref())
-            },
+            ProviderFinishReason::from_openai(choice.finish_reason.as_deref()),
             usage,
             ProviderRawProviderRefs {
                 provider_response_id,
@@ -6690,28 +6665,7 @@ impl AnthropicProvider {
             }
         }
 
-        let mut completion_text = completion_fragments.join("\n");
-        // Some models emit tool calls as inline markup in the text body
-        // instead of the structured tool-call field. Recover those into real
-        // proposals; malformed markup is retryable because a fresh sample
-        // usually produces well-formed output.
-        let coerced_raw_tool_markup = if tool_events.is_empty() {
-            match coerce_raw_tool_call_markup(completion_text.as_str()).map_err(|error| {
-                AttemptError::retryable_invalid_response(
-                    format!("anthropic raw tool-call markup is invalid: {error}"),
-                    "anthropic_raw_tool_call_markup",
-                )
-            })? {
-                Some(extraction) => {
-                    completion_text = extraction.cleaned_text;
-                    tool_events.extend(extraction.tool_events);
-                    true
-                }
-                None => false,
-            }
-        } else {
-            false
-        };
+        let completion_text = completion_fragments.join("\n");
         // A blank completion with no tool calls would read as a dead turn
         // downstream; substitute a minimal acknowledgement instead.
         let full_text = if completion_text.trim().is_empty() && tool_events.is_empty() {
@@ -6731,7 +6685,7 @@ impl AnthropicProvider {
         let output = provider_output_from_text_and_tools(
             full_text,
             tool_events,
-            if coerced_raw_tool_markup { ProviderFinishReason::ToolCalls } else { finish_reason },
+            finish_reason,
             usage,
             ProviderRawProviderRefs {
                 provider_response_id,
@@ -11065,131 +11019,78 @@ turns:
         assert!(error.contains("tool arguments exceed"), "error should mention byte limit");
     }
 
-    #[test]
-    fn raw_minimax_tool_call_markup_is_coerced_to_tool_event() {
-        let raw = r#"<minimax:tool_call>
-<invoke name="palyra.fs.apply_patch">
-{"patch":"*** Begin Patch\n*** Add File: app.js\n+console.log('ok');\n*** End Patch\n"}
-</invoke>
-</minimax:tool_call>"#;
-
-        let extraction = super::coerce_raw_tool_call_markup(raw)
-            .expect("raw MiniMax markup should parse")
-            .expect("raw MiniMax markup should be detected");
-
-        assert!(extraction.cleaned_text.is_empty());
-        assert_eq!(extraction.tool_events.len(), 1);
-        match &extraction.tool_events[0] {
-            ProviderEvent::ToolProposal { tool_name, input_json, .. } => {
-                assert_eq!(tool_name, "palyra.fs.apply_patch");
-                let input: serde_json::Value =
-                    serde_json::from_slice(input_json).expect("tool input should stay valid JSON");
-                assert!(
-                    input["patch"].as_str().is_some_and(|patch| patch.contains("*** Add File")),
-                    "{input}"
-                );
-            }
-            other => panic!("expected tool proposal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn raw_tool_call_markup_accepts_complete_invoke_without_outer_close() {
-        let raw = r#"<tool_call>
-<invoke name="palyra.fs.read_file">
-{"path":"app.js"}
-</invoke>"#;
-
-        let extraction = super::coerce_raw_tool_call_markup(raw)
-            .expect("complete invoke should be recoverable without outer close")
-            .expect("raw markup should be detected");
-
-        assert!(extraction.cleaned_text.is_empty());
-        assert_eq!(extraction.tool_events.len(), 1);
-        match &extraction.tool_events[0] {
-            ProviderEvent::ToolProposal { tool_name, input_json, .. } => {
-                assert_eq!(tool_name, "palyra.fs.read_file");
-                let input: serde_json::Value =
-                    serde_json::from_slice(input_json).expect("tool input should stay valid JSON");
-                assert_eq!(input["path"], "app.js");
-            }
-            other => panic!("expected tool proposal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn raw_tool_call_markup_accepts_valid_json_when_invoke_close_is_missing() {
-        let raw = r#"<tool_call><invoke name="palyra.fs.read_file">{"path":"app.js"}</tool_call>"#;
-
-        let extraction = super::coerce_raw_tool_call_markup(raw)
-            .expect("valid raw invocation should be recoverable without closing invoke")
-            .expect("raw markup should be detected");
-
-        assert!(extraction.cleaned_text.is_empty());
-        assert_eq!(extraction.tool_events.len(), 1);
-        match &extraction.tool_events[0] {
-            ProviderEvent::ToolProposal { tool_name, input_json, .. } => {
-                assert_eq!(tool_name, "palyra.fs.read_file");
-                let input: serde_json::Value =
-                    serde_json::from_slice(input_json).expect("tool input should stay valid JSON");
-                assert_eq!(input["path"], "app.js");
-            }
-            other => panic!("expected tool proposal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn raw_tool_call_markup_is_removed_from_surrounding_text() {
-        let raw = r#"I will inspect it.
-<tool_call>
-<invoke name='palyra.fs.read_file'>
-{"path":"app.js"}
-</invoke>
-</tool_call>
-Then I will continue."#;
-
-        let extraction = super::coerce_raw_tool_call_markup(raw)
-            .expect("raw generic markup should parse")
-            .expect("raw generic markup should be detected");
-
-        assert!(!extraction.cleaned_text.contains("<tool_call>"));
-        assert!(extraction.cleaned_text.contains("I will inspect it."));
-        assert!(extraction.cleaned_text.contains("Then I will continue."));
-        assert_eq!(extraction.tool_events.len(), 1);
-    }
-
     #[tokio::test(flavor = "multi_thread")]
-    async fn openai_provider_retries_malformed_raw_tool_call_markup_then_succeeds() {
-        let malformed = serde_json::json!({
+    async fn openai_provider_preserves_raw_tool_markup_as_non_executable_text() {
+        let raw_markup = r#"<tool_call><invoke name="palyra.fs.read_file">{"path":"app.js"}</invoke></tool_call>"#;
+        let body = serde_json::json!({
             "choices": [{
                 "message": {
-                    "content": "<tool_call><invoke>{\"path\":\"app.js\"}"
-                }
-            }]
-        })
-        .to_string();
-        let success = serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": "Recovered after retry."
+                    "content": raw_markup
                 },
                 "finish_reason": "stop"
             }]
         })
         .to_string();
-        let (base_url, request_count, handle) =
-            spawn_scripted_server(vec![(200_u16, malformed), (200_u16, success)]);
+        let (base_url, request_count, handle) = spawn_scripted_server(vec![(200_u16, body)]);
         let provider = build_model_provider(&openai_test_config(base_url))
             .expect("openai provider should build");
 
         let response = provider
             .complete(ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None))
             .await
-            .expect("provider should retry malformed raw markup and return the later response");
+            .expect("provider should return raw markup as ordinary text");
 
-        assert_eq!(response.retry_count, 1);
-        assert_eq!(response.output.full_text, "Recovered after retry.");
-        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+        assert_eq!(response.retry_count, 0);
+        assert_eq!(response.output.full_text, raw_markup);
+        assert_eq!(response.output.finish_reason, ProviderFinishReason::Stop);
+        assert!(
+            response
+                .events
+                .iter()
+                .all(|event| !matches!(event, ProviderEvent::ToolProposal { .. })),
+            "raw assistant text must not create executable tool proposals"
+        );
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_provider_preserves_raw_tool_markup_as_non_executable_text() {
+        let raw_markup = r#"<minimax:tool_call><invoke name="palyra.fs.read_file"><parameter name="path">app.js</parameter></invoke></minimax:tool_call>"#;
+        let body = serde_json::json!({
+            "id": "msg_raw_markup",
+            "model": "claude-3-5-sonnet-latest",
+            "content": [{
+                "type": "text",
+                "text": raw_markup
+            }],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+            }
+        })
+        .to_string();
+        let (base_url, request_count, handle) = spawn_scripted_server(vec![(200_u16, body)]);
+        let provider = build_model_provider(&anthropic_test_config(base_url))
+            .expect("anthropic provider should build");
+
+        let response = provider
+            .complete(ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None))
+            .await
+            .expect("provider should return raw markup as ordinary text");
+
+        assert_eq!(response.retry_count, 0);
+        assert_eq!(response.output.full_text, raw_markup);
+        assert_eq!(response.output.finish_reason, ProviderFinishReason::Stop);
+        assert!(
+            response
+                .events
+                .iter()
+                .all(|event| !matches!(event, ProviderEvent::ToolProposal { .. })),
+            "raw assistant text must not create executable tool proposals"
+        );
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
         handle.join().expect("scripted server thread should exit");
     }
 

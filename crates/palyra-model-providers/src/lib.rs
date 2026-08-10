@@ -88,11 +88,10 @@ pub use provider_compat::{
 };
 pub use providers::{
     anthropic_compatible_uses_anthropic_oauth_headers, anthropic_compatible_uses_bearer_auth,
-    anthropic_messages_payload, coerce_raw_tool_call_markup, is_trusted_xai_oauth_host,
-    normalize_tool_arguments, normalize_tool_input_value, normalize_xai_oauth_endpoint,
-    openai_chat_completions_payload, openai_responses_payload,
-    openai_responses_tool_wire_name_map_from_tools, select_openai_api_preferred_model,
-    OpenAiResponsesPayload, RawToolCallMarkupExtraction, MAX_TOOL_ARGUMENT_BYTES,
+    anthropic_messages_payload, is_trusted_xai_oauth_host, normalize_tool_arguments,
+    normalize_tool_input_value, normalize_xai_oauth_endpoint, openai_chat_completions_payload,
+    openai_responses_payload, openai_responses_tool_wire_name_map_from_tools,
+    select_openai_api_preferred_model, OpenAiResponsesPayload, MAX_TOOL_ARGUMENT_BYTES,
     OPENAI_API_DEFAULT_CHAT_MODEL_ID, XAI_DEFAULT_BASE_URL, XAI_DEFAULT_CHAT_MODEL_ID,
     XAI_GROK_OAUTH_BASE_URL, XAI_OAUTH_CALLBACK_CORS_ORIGIN_ALLOWLIST, XAI_OAUTH_CALLBACK_HOST,
     XAI_OAUTH_CALLBACK_PATH, XAI_OAUTH_CALLBACK_PORT, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_DISCOVERY_URL,
