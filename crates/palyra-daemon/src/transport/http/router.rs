@@ -1549,27 +1549,36 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/console/v1/skills/dynamic-tools/proposals",
-            post(console::dynamic_tools::console_dynamic_tool_proposal_handler).layer(
-                DefaultBodyLimit::max(
+            post(console::dynamic_tools::console_dynamic_tool_proposal_handler)
+                .layer(DefaultBodyLimit::max(
                     console::dynamic_tools::DYNAMIC_TOOL_ARTIFACT_MAX_REQUEST_BODY_BYTES,
-                ),
-            ),
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    console::dynamic_tools::dynamic_tool_console_auth_middleware,
+                )),
         )
         .route(
             "/console/v1/skills/dynamic-tools/build-and-propose",
-            post(console::dynamic_tools::console_dynamic_tool_host_build_handler).layer(
-                DefaultBodyLimit::max(
+            post(console::dynamic_tools::console_dynamic_tool_host_build_handler)
+                .layer(DefaultBodyLimit::max(
                     console::dynamic_tools::DYNAMIC_TOOL_HOST_BUILD_MAX_REQUEST_BODY_BYTES,
-                ),
-            ),
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    console::dynamic_tools::dynamic_tool_console_auth_middleware,
+                )),
         )
         .route(
             "/console/v1/skills/dynamic-tools/activate",
-            post(console::dynamic_tools::console_dynamic_tool_activation_handler).layer(
-                DefaultBodyLimit::max(
+            post(console::dynamic_tools::console_dynamic_tool_activation_handler)
+                .layer(DefaultBodyLimit::max(
                     console::dynamic_tools::DYNAMIC_TOOL_ARTIFACT_MAX_REQUEST_BODY_BYTES,
-                ),
-            ),
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    console::dynamic_tools::dynamic_tool_console_auth_middleware,
+                )),
         )
         .route("/console/v1/skills/install", post(console::skills::console_skills_install_handler))
         .route(
@@ -1866,4 +1875,43 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .merge(console_routes)
         .fallback(get(web_ui::web_ui_entry_handler))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    const ROUTER_SOURCE: &str = include_str!("router.rs");
+    const DYNAMIC_TOOLS_SOURCE: &str = include_str!("handlers/console/dynamic_tools.rs");
+
+    #[test]
+    fn large_dynamic_tool_bodies_require_pre_extraction_auth() {
+        for handler in [
+            "console_dynamic_tool_proposal_handler",
+            "console_dynamic_tool_host_build_handler",
+            "console_dynamic_tool_activation_handler",
+        ] {
+            let marker = format!("post(console::dynamic_tools::{handler})");
+            let route_start =
+                ROUTER_SOURCE.find(marker.as_str()).expect("dynamic-tool route should exist");
+            let route_tail = &ROUTER_SOURCE[route_start..];
+            let route_end = route_tail.find("\n        .route(").unwrap_or(route_tail.len());
+            let route = &route_tail[..route_end];
+            let body_limit =
+                route.find("DefaultBodyLimit::max").expect("large body limit should be explicit");
+            let pre_auth = route
+                .find("dynamic_tool_console_auth_middleware")
+                .expect("large body route should have pre-extraction authorization");
+
+            assert!(body_limit < pre_auth, "authorization layer must wrap the body-limit handler");
+        }
+        assert_eq!(
+            DYNAMIC_TOOLS_SOURCE.matches("Extension(session): Extension<ConsoleSession>").count(),
+            3,
+            "all large-body handlers must consume the middleware-authorized session"
+        );
+        assert_eq!(
+            DYNAMIC_TOOLS_SOURCE.matches("authorize_console_session(").count(),
+            1,
+            "console authorization belongs only in the pre-extraction middleware"
+        );
+    }
 }

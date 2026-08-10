@@ -2,7 +2,12 @@
 
 use std::{ffi::OsString, sync::Arc};
 
-use axum::{extract::State, http::HeaderMap, response::Response, Json};
+use axum::{
+    extract::{Request, State},
+    middleware::Next,
+    response::Response,
+    Extension, Json,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_skills::{
     build_signed_dynamic_tool_artifact, decide_dynamic_tool_activation,
@@ -61,13 +66,26 @@ pub(crate) struct DynamicToolActivationRequest {
     approval_id: String,
 }
 
+/// Authenticates dynamic-tool mutations before their large JSON bodies are read.
+pub(crate) async fn dynamic_tool_console_auth_middleware(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let session = match authorize_console_session(&state, request.headers(), true) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    request.extensions_mut().insert(session);
+    next.run(request).await
+}
+
 /// Records an inert proposal and creates the exact durable host approval.
 pub(crate) async fn console_dynamic_tool_proposal_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<ConsoleSession>,
     Json(payload): Json<DynamicToolProposalRequest>,
 ) -> Result<Json<Value>, Response> {
-    let session = authorize_console_session(&state, &headers, true)?;
     require_rollout(&state)?;
     propose_signed_dynamic_tool(&state, &session, &payload.artifact).await
 }
@@ -75,10 +93,9 @@ pub(crate) async fn console_dynamic_tool_proposal_handler(
 /// Builds an artifact with the configured host signer, then records it as inert.
 pub(crate) async fn console_dynamic_tool_host_build_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<ConsoleSession>,
     Json(payload): Json<DynamicToolHostBuildRequest>,
 ) -> Result<Json<Value>, Response> {
-    let session = authorize_console_session(&state, &headers, true)?;
     // Key material is unreachable while the product rollout is closed.
     require_rollout(&state)?;
     let artifact = build_host_signed_artifact(&state, payload).await?;
@@ -177,10 +194,9 @@ async fn propose_signed_dynamic_tool(
 /// Activates one proposal only after exact approval and runtime conformance.
 pub(crate) async fn console_dynamic_tool_activation_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<ConsoleSession>,
     Json(payload): Json<DynamicToolActivationRequest>,
 ) -> Result<Json<Value>, Response> {
-    let session = authorize_console_session(&state, &headers, true)?;
     require_rollout(&state)?;
     let (trusted_publisher, trusted_public_key_base64, host_policy_sha256) =
         verify_host_policy(&state, &payload.artifact)?;
