@@ -228,63 +228,6 @@ fn navigation_error_may_be_download_abort(error: &str) -> bool {
     normalized.contains("err_aborted") || normalized.contains("net::err_aborted")
 }
 
-/// Extracts (url, file name) from a successful response whose
-/// Content-Disposition marks it as an attachment.
-fn http_attachment_candidate_from_network_entry(
-    entry: &NetworkLogEntryInternal,
-) -> Option<(String, String)> {
-    if !(200..400).contains(&entry.status_code) {
-        return None;
-    }
-    let content_disposition = entry
-        .headers
-        .iter()
-        .find(|header| header.name.eq_ignore_ascii_case("content-disposition"))
-        .map(|header| header.value.as_str())?;
-    if !content_disposition_is_attachment(content_disposition) {
-        return None;
-    }
-    let file_name = content_disposition_attachment_file_name(content_disposition)
-        .unwrap_or_else(|| infer_download_file_name(entry.request_url.as_str()));
-    Some((entry.request_url.clone(), file_name))
-}
-
-/// Re-fetches the most recent attachment-like response from the active tab's
-/// network log and stores it through the download pipeline.
-///
-/// # Errors
-/// Returns `session_not_found` or the download pipeline failure reason.
-async fn capture_latest_http_attachment_from_network_log(
-    runtime: &BrowserRuntimeState,
-    session_id: &str,
-    profile_id: Option<&str>,
-    allow_private_targets: bool,
-    timeout_ms: u64,
-) -> Result<Option<DownloadArtifactRecord>, String> {
-    let candidate = {
-        let sessions = runtime.sessions.lock().await;
-        let Some(session) = sessions.get(session_id) else {
-            return Err("session_not_found".to_owned());
-        };
-        session.active_tab().and_then(|tab| {
-            tab.network_log.iter().rev().find_map(http_attachment_candidate_from_network_entry)
-        })
-    };
-    let Some((source_url, file_name)) = candidate else {
-        return Ok(None);
-    };
-    fetch_http_attachment_download_artifact(
-        runtime,
-        session_id,
-        profile_id,
-        source_url.as_str(),
-        file_name.as_str(),
-        allow_private_targets,
-        timeout_ms,
-    )
-    .await
-}
-
 /// Drains downloads captured by the Chromium engine for the active tab and
 /// stores each through the quarantine pipeline, returning the first record.
 ///
@@ -1514,42 +1457,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }
         };
         // Chromium reports navigations that turn into downloads as aborted
-        // failures. When downloads are allowed, try to recover the artifact
-        // (engine capture first, then a direct HTTP fetch fallback below) and
-        // rewrite the outcome as a successful download instead.
-        let captured_download = if allow_downloads
-            && matches!(self.runtime.engine_mode, BrowserEngineMode::Chromium)
-        {
-            match store_chromium_captured_downloads(
-                self.runtime.as_ref(),
-                session_id.as_str(),
-                if private_profile { None } else { profile_id.as_deref() },
-            )
-            .await
-            {
-                Ok(record) => record,
-                Err(download_error) => {
-                    if navigation_error_may_be_download_abort(outcome.error.as_str()) {
-                        outcome.error =
-                            format!("{}; download capture failed: {download_error}", outcome.error);
-                    }
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        if let Some(record) = captured_download {
-            if !outcome.success && navigation_error_may_be_download_abort(outcome.error.as_str()) {
-                outcome.success = true;
-                outcome.final_url = record.source_url.clone();
-                outcome.status_code = 200;
-                outcome.title.clear();
-                outcome.page_body.clear();
-                outcome.body_bytes = record.size_bytes;
-                outcome.error.clear();
-            }
-        }
+        // failures. Recover only the exact caller-requested URL so unrelated
+        // response or page-side download buffers cannot supply the artifact.
         if !outcome.success
             && allow_downloads
             && navigation_error_may_be_download_abort(outcome.error.as_str())
@@ -1752,6 +1661,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let mut outcome = outcome;
         let mut error = error;
         let mut artifact = None;
+        // The click script rotates the page-side blob capture generation
+        // immediately before activating the selected element, so this drain
+        // cannot return entries produced by earlier or unrelated actions.
         if success
             && context.allow_downloads
             && matches!(self.runtime.engine_mode, BrowserEngineMode::Chromium)
@@ -1795,32 +1707,6 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     }
                     artifact = Some(download_artifact_to_proto(&record));
                 }
-                Err(download_error) => {
-                    success = false;
-                    outcome = "download_failed".to_owned();
-                    error = download_error;
-                }
-            }
-        }
-        if success && context.allow_downloads && artifact.is_none() {
-            match capture_latest_http_attachment_from_network_log(
-                self.runtime.as_ref(),
-                session_id.as_str(),
-                if context.private_profile { None } else { context.profile_id.as_deref() },
-                context.allow_private_targets,
-                timeout_ms,
-            )
-            .await
-            {
-                Ok(Some(record)) => {
-                    if record.quarantined {
-                        outcome = "download_quarantined".to_owned();
-                    } else {
-                        outcome = "download_allowed".to_owned();
-                    }
-                    artifact = Some(download_artifact_to_proto(&record));
-                }
-                Ok(None) => {}
                 Err(download_error) => {
                     success = false;
                     outcome = "download_failed".to_owned();

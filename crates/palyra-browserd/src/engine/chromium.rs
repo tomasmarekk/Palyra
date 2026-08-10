@@ -344,6 +344,7 @@ const CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
   });
   state.network_entries = Array.isArray(state.network_entries) ? state.network_entries : [];
   state.client_download_entries = Array.isArray(state.client_download_entries) ? state.client_download_entries : [];
+  state.client_download_generation = Number(state.client_download_generation || 0);
   state.object_urls = state.object_urls || {};
   state.pending_client_downloads = Number(state.pending_client_downloads || 0);
   const MAX_CLIENT_DOWNLOAD_ENTRIES = 32;
@@ -414,6 +415,7 @@ const CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
         return;
       }
       const fileName = clampDownloadFileName(anchor.getAttribute("download") || "");
+      const captureGeneration = Number(state.client_download_generation || 0);
       state.pending_client_downloads += 1;
       Promise.resolve()
         .then(() => blobToBase64(blob))
@@ -425,6 +427,7 @@ const CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
             content_base64: contentBase64,
             size_bytes: Number(blob.size || 0),
             captured_at_unix_ms: Date.now(),
+            capture_generation: captureGeneration,
             source: String(source || "browser")
           });
           trimClientDownloads();
@@ -724,10 +727,11 @@ const CHROMIUM_DRAIN_CLIENT_DOWNLOADS_SCRIPT: &str = r#"
       source: clampScalar(object.source, 64)
     };
   };
+  const captureGeneration = Number(state.client_download_generation || 0);
   const source = Array.prototype.slice.call(
     state.client_download_entries,
     Math.max(0, state.client_download_entries.length - MAX_CLIENT_DOWNLOAD_ENTRIES)
-  );
+  ).filter((entry) => Number((entry && entry.capture_generation) || 0) === captureGeneration);
   state.client_download_entries.length = 0;
   const entries = [];
   let totalChars = 2;
@@ -5074,6 +5078,17 @@ fn chromium_click_script(selector: &str, allow_downloads: bool) -> Result<String
   }}
   if (typeof element.focus === "function") {{
     try {{ element.focus({{ preventScroll: true }}); }} catch (_) {{ element.focus(); }}
+  }}
+  if (allowDownloads) {{
+    const diagnostics = window.__palyraDiagnostics;
+    if (diagnostics && Array.isArray(diagnostics.client_download_entries)) {{
+      const previousGeneration = Number(diagnostics.client_download_generation || 0);
+      diagnostics.client_download_generation =
+        Number.isSafeInteger(previousGeneration) && previousGeneration >= 0
+          ? previousGeneration + 1
+          : 1;
+      diagnostics.client_download_entries.length = 0;
+    }}
   }}
   let openedWindow = false;
   let restoreWindowOpen = null;

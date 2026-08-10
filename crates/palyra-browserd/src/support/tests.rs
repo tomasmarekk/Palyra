@@ -614,6 +614,70 @@ async fn browser_service_captures_http_attachment_download_artifact() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_ordinary_click_ignores_unrelated_attachment_log_entry() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+    let created = service
+        .create_session(Request::new(browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: true,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        }))
+        .await
+        .expect("create_session should succeed")
+        .into_inner();
+    let session_id = created.session_id.expect("session id should be present");
+
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        let session =
+            sessions.get_mut(session_id.ulid.as_str()).expect("session should exist for seeding");
+        let tab = session.active_tab_mut().expect("active tab should exist");
+        tab.last_url = Some("https://app.example.test/settings".to_owned());
+        tab.last_page_body =
+            r#"<html><body><button id="save">Save settings</button></body></html>"#.to_owned();
+        tab.network_log.push_back(NetworkLogEntryInternal {
+            request_url: "http://127.0.0.1:9/unrelated-secret.csv".to_owned(),
+            status_code: 200,
+            timing_bucket: "lt_100ms".to_owned(),
+            latency_ms: 10,
+            captured_at_unix_ms: 1,
+            headers: vec![NetworkLogHeaderInternal {
+                name: "content-disposition".to_owned(),
+                value: "attachment; filename=\"secret.csv\"".to_owned(),
+            }],
+        });
+    }
+
+    let click = service
+        .click(Request::new(browser_v1::ClickRequest {
+            v: 1,
+            session_id: Some(session_id),
+            selector: "#save".to_owned(),
+            max_retries: 0,
+            timeout_ms: 250,
+            capture_failure_screenshot: false,
+            max_failure_screenshot_bytes: 0,
+        }))
+        .await
+        .expect("ordinary click should execute")
+        .into_inner();
+
+    assert!(click.success, "ordinary click should not fetch a logged attachment: {}", click.error);
+    assert!(click.artifact.is_none(), "unrelated network entries must not become artifacts");
+    assert_eq!(click.action_log.as_ref().map(|entry| entry.outcome.as_str()), Some("clicked"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_redacts_navigation_url_selector_in_action_log() {
     let runtime = simulated_runtime_for_tests();
     let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
@@ -2587,6 +2651,15 @@ async fn browser_service_chromium_captures_blob_download_artifacts() {
     let (url, handle) = spawn_static_http_server_with_request_budget(
         200,
         r#"<html><head><title>Blob Download Fixture</title><script>
+window.addEventListener('DOMContentLoaded', () => {
+  const staleBlob = new Blob(['unrelated,secret\n'], { type: 'text/csv' });
+  const staleUrl = URL.createObjectURL(staleBlob);
+  const staleAnchor = document.createElement('a');
+  staleAnchor.href = staleUrl;
+  staleAnchor.download = 'unrelated-secret.csv';
+  staleAnchor.click();
+  URL.revokeObjectURL(staleUrl);
+});
 function exportCsv(){
   const blob = new Blob(['id,name\n1001,Ada Lovelace\n1002,Grace Hopper\n'], { type: 'text/csv;charset=utf-8' });
   const objectUrl = URL.createObjectURL(blob);
