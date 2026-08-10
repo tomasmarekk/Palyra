@@ -1576,6 +1576,49 @@ fn chromium_private_target_policy_revokes_target_after_navigation_scope() {
     );
 }
 
+#[test]
+fn chromium_private_target_policy_revokes_unconsumed_proxy_grant_with_scope() {
+    let policy = Arc::new(ChromiumPrivateTargetPolicy::new(false));
+    let scoped = policy
+        .scoped_url_allowance("tab-a", "http://127.0.0.1:7143/")
+        .expect("navigation allowance should parse")
+        .expect("private navigation should create scoped allowance");
+    assert!(
+        policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/"),
+        "navigation request should arm its tab-bound proxy allowance"
+    );
+
+    drop(scoped);
+
+    assert!(
+        !policy.allows_host_port("127.0.0.1", 7143),
+        "an unconsumed proxy allowance must not survive its navigation scope"
+    );
+
+    let scoped_a = policy
+        .scoped_url_allowance("tab-a", "http://127.0.0.1:7143/")
+        .expect("first tab allowance should parse")
+        .expect("first private navigation should create scoped allowance");
+    let scoped_b = policy
+        .scoped_url_allowance("tab-b", "http://127.0.0.1:7143/")
+        .expect("second tab allowance should parse")
+        .expect("second private navigation should create scoped allowance");
+    assert!(policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/"));
+    assert!(policy.authorize_tab_request_url("tab-b", "http://127.0.0.1:7143/"));
+
+    drop(scoped_a);
+
+    assert!(
+        policy.allows_host_port("127.0.0.1", 7143),
+        "the second tab's live scope must retain its own proxy allowance"
+    );
+    assert!(
+        !policy.allows_host_port("127.0.0.1", 7143),
+        "the expired tab's proxy allowance must be removed independently"
+    );
+    drop(scoped_b);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn chromium_session_proxy_scoped_private_override_rejects_unrelated_target() {
     let allowed_listener = tokio::net::TcpListener::bind("127.0.0.1:0")

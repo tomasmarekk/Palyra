@@ -1267,9 +1267,21 @@ struct ChromiumPrivateTargetRequestScope {
 }
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct ChromiumPrivateTargetTabScope {
+    tab_target_id: String,
+    target: ChromiumPrivateTargetScope,
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 enum ChromiumPrivateTargetUrlScope {
     Network { scheme: String, host: String, port: u16, path: String, query: Option<String> },
     File(PathBuf),
+}
+
+#[derive(Debug, Default)]
+struct ChromiumPrivateTargetState {
+    scoped_requests: HashMap<ChromiumPrivateTargetRequestScope, usize>,
+    pending_proxy_targets: HashMap<ChromiumPrivateTargetTabScope, usize>,
 }
 
 /// Tracks which private/local targets a session may reach.
@@ -1279,8 +1291,7 @@ enum ChromiumPrivateTargetUrlScope {
 #[derive(Debug)]
 pub(crate) struct ChromiumPrivateTargetPolicy {
     allow_session_private_targets: bool,
-    scoped_requests: std::sync::Mutex<HashMap<ChromiumPrivateTargetRequestScope, usize>>,
-    pending_proxy_targets: std::sync::Mutex<HashMap<ChromiumPrivateTargetScope, usize>>,
+    state: std::sync::Mutex<ChromiumPrivateTargetState>,
 }
 
 /// RAII allowance for one private target; the allowance is released on drop.
@@ -1295,8 +1306,7 @@ impl ChromiumPrivateTargetPolicy {
     pub(crate) fn new(allow_session_private_targets: bool) -> Self {
         Self {
             allow_session_private_targets,
-            scoped_requests: std::sync::Mutex::new(HashMap::new()),
-            pending_proxy_targets: std::sync::Mutex::new(HashMap::new()),
+            state: std::sync::Mutex::new(ChromiumPrivateTargetState::default()),
         }
     }
 
@@ -1342,11 +1352,18 @@ impl ChromiumPrivateTargetPolicy {
         else {
             return false;
         };
-        if !self.allows_request_target_scope(&scope) {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let requested_target = scope.target_scope();
+        if !state.scoped_requests.keys().any(|scoped| {
+            scoped.tab_target_id == scope.tab_target_id && scoped.target_scope() == requested_target
+        }) {
             return false;
         }
-        if let ChromiumPrivateTargetScope::Network { .. } = scope.target_scope() {
-            self.grant_proxy_scope(scope.target_scope());
+        if matches!(requested_target, ChromiumPrivateTargetScope::Network { .. }) {
+            let count = state.pending_proxy_targets.entry(scope.tab_scope()).or_insert(0);
+            *count = count.saturating_add(1);
         }
         true
     }
@@ -1387,29 +1404,24 @@ impl ChromiumPrivateTargetPolicy {
         else {
             return Ok(None);
         };
-        let mut scoped_requests = self
-            .scoped_requests
-            .lock()
-            .map_err(|_| "private-target policy lock was poisoned".to_owned())?;
-        let count = scoped_requests.entry(scope.clone()).or_insert(0);
+        let mut state =
+            self.state.lock().map_err(|_| "private-target policy lock was poisoned".to_owned())?;
+        let count = state.scoped_requests.entry(scope.clone()).or_insert(0);
         *count = count.saturating_add(1);
         Ok(Some(ChromiumScopedPrivateTarget { policy: Arc::clone(self), scope }))
     }
 
     #[cfg(test)]
     fn allows_exact_request_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
-        self.scoped_requests
-            .lock()
-            .map(|scoped_requests| scoped_requests.contains_key(scope))
-            .unwrap_or(false)
+        self.state.lock().map(|state| state.scoped_requests.contains_key(scope)).unwrap_or(false)
     }
 
     fn allows_request_target_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
-        self.scoped_requests
+        self.state
             .lock()
-            .map(|scoped_requests| {
+            .map(|state| {
                 let requested_target = scope.target_scope();
-                scoped_requests.keys().any(|scoped| {
+                state.scoped_requests.keys().any(|scoped| {
                     scoped.tab_target_id == scope.tab_target_id
                         && scoped.target_scope() == requested_target
                 })
@@ -1417,25 +1429,22 @@ impl ChromiumPrivateTargetPolicy {
             .unwrap_or(false)
     }
 
-    fn grant_proxy_scope(&self, scope: ChromiumPrivateTargetScope) {
-        let Ok(mut pending_proxy_targets) = self.pending_proxy_targets.lock() else {
-            return;
-        };
-        let count = pending_proxy_targets.entry(scope).or_insert(0);
-        *count = count.saturating_add(1);
-    }
-
     fn consume_proxy_scope(&self, scope: &ChromiumPrivateTargetScope) -> bool {
-        let Ok(mut pending_proxy_targets) = self.pending_proxy_targets.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        match pending_proxy_targets.get_mut(scope) {
+        let Some(tab_scope) =
+            state.pending_proxy_targets.keys().find(|pending| pending.target == *scope).cloned()
+        else {
+            return false;
+        };
+        match state.pending_proxy_targets.get_mut(&tab_scope) {
             Some(count) if *count > 1 => {
                 *count -= 1;
                 true
             }
             Some(_) => {
-                pending_proxy_targets.remove(scope);
+                state.pending_proxy_targets.remove(&tab_scope);
                 true
             }
             None => false,
@@ -1443,15 +1452,23 @@ impl ChromiumPrivateTargetPolicy {
     }
 
     fn release_scope(&self, scope: &ChromiumPrivateTargetRequestScope) {
-        let Ok(mut scoped_requests) = self.scoped_requests.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return;
         };
-        match scoped_requests.get_mut(scope) {
+        match state.scoped_requests.get_mut(scope) {
             Some(count) if *count > 1 => *count -= 1,
             Some(_) => {
-                scoped_requests.remove(scope);
+                state.scoped_requests.remove(scope);
             }
             None => {}
+        }
+        let tab_scope = scope.tab_scope();
+        let target_still_scoped = state.scoped_requests.keys().any(|active| {
+            active.tab_target_id == tab_scope.tab_target_id
+                && active.target_scope() == tab_scope.target
+        });
+        if !target_still_scoped {
+            state.pending_proxy_targets.remove(&tab_scope);
         }
     }
 }
@@ -1483,6 +1500,13 @@ impl ChromiumPrivateTargetRequestScope {
 
     fn target_scope(&self) -> ChromiumPrivateTargetScope {
         self.url.target_scope()
+    }
+
+    fn tab_scope(&self) -> ChromiumPrivateTargetTabScope {
+        ChromiumPrivateTargetTabScope {
+            tab_target_id: self.tab_target_id.clone(),
+            target: self.target_scope(),
+        }
     }
 }
 
