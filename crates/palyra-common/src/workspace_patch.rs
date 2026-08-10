@@ -1907,7 +1907,7 @@ fn ensure_secret_file_content_does_not_store_redaction_placeholder(
     }
     let text = std::str::from_utf8(bytes)
         .map_err(|_| WorkspacePatchError::InvalidUtf8File { path: path.to_owned() })?;
-    if text.lines().any(env_assignment_stores_redaction_placeholder) {
+    if text.split(['\r', '\n']).any(env_assignment_stores_redaction_placeholder) {
         return Err(WorkspacePatchError::RedactionPlaceholderInSecretFile {
             path: path.to_owned(),
         });
@@ -3003,6 +3003,30 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.join(".env")).expect("seed file should remain"),
             "PRIVATE_BACKEND_TOKEN=original-test-token\nPUBLIC_MODE=old\n"
+        );
+    }
+
+    #[test]
+    fn apply_workspace_patch_rejects_redacted_placeholder_in_cr_only_secret_env_file() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original = "# generated locally\rPRIVATE_BACKEND_TOKEN=[REDACTED]\rPUBLIC_MODE=old\r";
+        fs::write(workspace.join(".env"), original).expect("seed file should exist");
+
+        let patch =
+            "*** Begin Patch\n*** Update File: .env\n@@\n-PUBLIC_MODE=old\n+PUBLIC_MODE=new\n*** End Patch\n";
+        let error = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect_err("lone-CR env files must not bypass redaction-placeholder validation");
+
+        assert!(matches!(error, WorkspacePatchError::RedactionPlaceholderInSecretFile { .. }));
+        assert_eq!(
+            fs::read_to_string(workspace.join(".env")).expect("seed file should remain"),
+            original
         );
     }
 
