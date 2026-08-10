@@ -13,7 +13,10 @@ use palyra_common::{
     runtime_contracts::AgentHookKind, validate_canonical_id, CANONICAL_PROTOCOL_MAJOR,
 };
 use serde_json::json;
-use tokio::{sync::mpsc, time::timeout};
+use tokio::{
+    sync::mpsc,
+    time::{timeout_at, Instant},
+};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{metadata::MetadataMap, Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
@@ -66,17 +69,18 @@ use crate::{
         validate_execution_backend_selection,
     },
     gateway::{
-        agent_binding_message, agent_message, agent_resolution_source_to_proto, canonical_id,
-        cleanup_run_resources, execution_backend_inventory_message, extract_pairing_code_command,
-        finalize_run_failure, non_empty, normalize_agent_identifier, optional_canonical_id,
-        record_agent_journal_event, record_message_router_journal_event, require_supported_version,
+        agent_binding_message, agent_message, agent_resolution_source_to_proto,
+        approval_scope_to_proto, canonical_id, cleanup_run_resources,
+        execution_backend_inventory_message, extract_pairing_code_command, finalize_run_failure,
+        non_empty, normalize_agent_identifier, optional_canonical_id, record_agent_journal_event,
+        record_message_router_journal_event, require_supported_version,
         security_requests_json_mode, session_summary_message, GatewayRuntimeState,
         ListOrchestratorSessionsRequest, RunFailureFinalization, APPROVAL_PROMPT_TIMEOUT_SECONDS,
     },
     journal::{
-        ApprovalCreateRequest, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
-        ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType, JournalAppendRequest,
-        OrchestratorCancelRequest, OrchestratorSessionCleanupRequest,
+        ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
+        ApprovalPromptOption, ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType,
+        JournalAppendRequest, OrchestratorCancelRequest, OrchestratorSessionCleanupRequest,
         OrchestratorSessionResolveRequest,
     },
     node_runtime::NodeRuntimeState,
@@ -88,9 +92,70 @@ use crate::{
 };
 
 const RUN_STREAM_TRAILING_MESSAGE_GRACE: Duration = Duration::from_millis(10);
+const RUN_STREAM_MAX_STALE_TRAILING_APPROVALS: usize = 16;
 
-fn is_stale_trailing_approval_response(message: &common_v1::RunStreamRequest) -> bool {
-    message.input.is_none() && message.tool_approval_response.is_some()
+async fn is_stale_trailing_approval_response(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    expected_session_id: Option<&str>,
+    expected_run_id: Option<&str>,
+    message: &common_v1::RunStreamRequest,
+) -> bool {
+    let (Some(expected_session_id), Some(expected_run_id), Some(response)) =
+        (expected_session_id, expected_run_id, message.tool_approval_response.as_ref())
+    else {
+        return false;
+    };
+    let message_session_id =
+        message.session_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or_default();
+    let message_run_id =
+        message.run_id.as_ref().map(|value| value.ulid.as_str()).unwrap_or_default();
+    let proposal_id =
+        response.proposal_id.as_ref().map(|value| value.ulid.trim()).unwrap_or_default();
+    let approval_id =
+        response.approval_id.as_ref().map(|value| value.ulid.trim()).unwrap_or_default();
+    if message.v != CANONICAL_PROTOCOL_MAJOR
+        || message.input.is_some()
+        || message_session_id != expected_session_id
+        || message_run_id != expected_run_id
+        || proposal_id.is_empty()
+        || approval_id.is_empty()
+        || message.allow_sensitive_tools
+        || !message.session_key.is_empty()
+        || !message.session_label.is_empty()
+        || message.reset_session
+        || !message.require_existing
+        || !message.origin_kind.is_empty()
+        || message.origin_run_id.is_some()
+        || !message.parameter_delta_json.is_empty()
+        || message.queued_input_id.is_some()
+    {
+        return false;
+    }
+
+    let Ok(Some(record)) = runtime_state.approval_record(approval_id.to_owned()).await else {
+        return false;
+    };
+    let approved = match record.decision {
+        Some(ApprovalDecision::Allow) => true,
+        Some(ApprovalDecision::Deny) => false,
+        Some(ApprovalDecision::Timeout | ApprovalDecision::Error) | None => return false,
+    };
+    let expected_reason = record.decision_reason.as_deref().unwrap_or(if approved {
+        "approved_by_console"
+    } else {
+        "denied_by_console"
+    });
+    record.session_id == expected_session_id
+        && record.run_id == expected_run_id
+        && record.principal == request_context.principal
+        && record.device_id == request_context.device_id
+        && record.resolved_at_unix_ms.is_some()
+        && response.approved == approved
+        && response.reason == expected_reason
+        && response.decision_scope
+            == approval_scope_to_proto(record.decision_scope.unwrap_or(ApprovalDecisionScope::Once))
+        && response.decision_scope_ttl_ms == record.decision_scope_ttl_ms.unwrap_or_default()
 }
 
 /// Tonic service adapter for the main Palyra gateway protocol.
@@ -2292,14 +2357,27 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     RunStreamMessageProcessingOutcome::Terminate => return,
                     RunStreamMessageProcessingOutcome::Suspended => return,
                     RunStreamMessageProcessingOutcome::Continue => {
-                        loop {
-                            match timeout(RUN_STREAM_TRAILING_MESSAGE_GRACE, stream.next()).await {
-                                Ok(Some(Ok(message)))
-                                    if is_stale_trailing_approval_response(&message) =>
-                                {
+                        let trailing_deadline = Instant::now() + RUN_STREAM_TRAILING_MESSAGE_GRACE;
+                        for _ in 0..RUN_STREAM_MAX_STALE_TRAILING_APPROVALS {
+                            match timeout_at(trailing_deadline, stream.next()).await {
+                                Ok(Some(Ok(message))) => {
+                                    if !is_stale_trailing_approval_response(
+                                        &state_for_stream,
+                                        &context_for_stream,
+                                        active_session_id.as_deref(),
+                                        active_run_id.as_deref(),
+                                        &message,
+                                    )
+                                    .await
+                                    {
+                                        pending_item = Some(Ok(message));
+                                        break;
+                                    }
                                     // A console decision is persisted before its mirrored stream
                                     // response arrives. If durable resolution won that race, the
-                                    // mirror is stale and must not start another model turn.
+                                    // exact mirror is stale and must not start another model turn.
+                                    // The fixed deadline and count cap prevent a client from
+                                    // extending finalization by continuously supplying mirrors.
                                     debug!(
                                         run_id = active_run_id.as_deref().unwrap_or("unknown"),
                                         "discarded stale trailing tool approval response"

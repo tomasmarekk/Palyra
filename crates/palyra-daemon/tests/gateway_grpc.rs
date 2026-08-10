@@ -8726,7 +8726,7 @@ async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -> Result<()> {
+async fn grpc_run_stream_finalizes_under_stale_external_approval_flood() -> Result<()> {
     let response_body = openai_tool_call_response(
         "custom.noop",
         &serde_json::json!({
@@ -8762,7 +8762,7 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
         .await
         .context("failed to connect gRPC client")?;
 
-    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    let (request_sender, request_receiver) = tokio_mpsc::channel(128);
     request_sender
         .send(sample_run_stream_request_with_ids(
             SESSION_ID,
@@ -8781,6 +8781,8 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
     let mut saw_tool_result = false;
     let mut saw_done = false;
     let mut model_tokens = Vec::new();
+    let stale_flood_stop = Arc::new(AtomicBool::new(false));
+    let mut stale_flood_handle = None;
     loop {
         let next_event = tokio::time::timeout(Duration::from_secs(8), response_stream.next())
             .await
@@ -8822,6 +8824,42 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
                     if response.approved =>
                 {
                     assert_eq!(response.reason, "approved_by_external_console_test");
+                    if stale_flood_handle.is_none() {
+                        let stale_request = common_v1::RunStreamRequest {
+                            v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+                            session_id: Some(common_v1::CanonicalId {
+                                ulid: SESSION_ID.to_owned(),
+                            }),
+                            run_id: Some(common_v1::CanonicalId { ulid: RUN_ID.to_owned() }),
+                            input: None,
+                            allow_sensitive_tools: false,
+                            session_key: String::new(),
+                            session_label: String::new(),
+                            reset_session: false,
+                            require_existing: true,
+                            tool_approval_response: Some(response.clone()),
+                            origin_kind: String::new(),
+                            origin_run_id: None,
+                            parameter_delta_json: Vec::new(),
+                            queued_input_id: None,
+                        };
+                        for _ in 0..64 {
+                            request_sender
+                                .send(stale_request.clone())
+                                .await
+                                .context("failed to queue stale approval response")?;
+                        }
+                        let flood_sender = request_sender.clone();
+                        let flood_stop = Arc::clone(&stale_flood_stop);
+                        stale_flood_handle = Some(tokio::spawn(async move {
+                            while !flood_stop.load(Ordering::Relaxed) {
+                                if flood_sender.send(stale_request.clone()).await.is_err() {
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        }));
+                    }
                     saw_external_approval_response = true;
                 }
                 common_v1::run_stream_event::Body::ToolResult(result) => {
@@ -8849,6 +8887,11 @@ async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -
         }
     }
 
+    stale_flood_stop.store(true, Ordering::Relaxed);
+    if let Some(handle) = stale_flood_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
     assert!(saw_approval_request, "run should emit a pending tool approval request");
     assert!(
         saw_external_approval_response,
