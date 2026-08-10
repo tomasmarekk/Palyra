@@ -37,6 +37,7 @@ use crate::{
 };
 
 const INCIDENT_HISTORY_LIMIT: usize = 128;
+const INCIDENT_RECORD_LIMIT: usize = 1_024;
 const REMEDIATION_HISTORY_LIMIT: usize = 128;
 const HEALING_LOOP_INTERVAL: Duration = Duration::from_secs(15);
 // Escalation thresholds: active work whose heartbeat stalls for 2 minutes is treated as stuck,
@@ -653,6 +654,7 @@ impl SelfHealingState {
         };
         inner.incident_index.insert(index_key, incident_id.clone());
         inner.incidents.insert(incident_id.clone(), record.clone());
+        enforce_incident_record_limit(&mut inner, incident_id.as_str());
         push_incident_history(
             &mut inner.incident_history,
             RuntimeIncidentHistoryEntry {
@@ -1789,6 +1791,46 @@ fn push_incident_history(
     truncate_vec(history, INCIDENT_HISTORY_LIMIT);
 }
 
+/// Retains remediating and recent incidents preferentially while keeping both lookup maps bounded.
+fn enforce_incident_record_limit(inner: &mut SelfHealingStateInner, protected_incident_id: &str) {
+    while inner.incidents.len() > INCIDENT_RECORD_LIMIT {
+        let eviction_id = inner
+            .incidents
+            .iter()
+            .filter(|(incident_id, _)| incident_id.as_str() != protected_incident_id)
+            .min_by(|(left_id, left), (right_id, right)| {
+                incident_eviction_rank(left.state)
+                    .cmp(&incident_eviction_rank(right.state))
+                    .then_with(|| left.updated_at_unix_ms.cmp(&right.updated_at_unix_ms))
+                    .then_with(|| left.created_at_unix_ms.cmp(&right.created_at_unix_ms))
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .map(|(incident_id, _)| incident_id.clone());
+        let Some(eviction_id) = eviction_id else {
+            break;
+        };
+        let Some(evicted) = inner.incidents.remove(eviction_id.as_str()) else {
+            continue;
+        };
+        let index_key = incident_index_key(evicted.domain, evicted.dedupe_key.as_str());
+        if inner
+            .incident_index
+            .get(index_key.as_str())
+            .is_some_and(|indexed_id| indexed_id == &eviction_id)
+        {
+            inner.incident_index.remove(index_key.as_str());
+        }
+    }
+}
+
+const fn incident_eviction_rank(state: IncidentState) -> u8 {
+    match state {
+        IncidentState::Resolved => 0,
+        IncidentState::Open => 1,
+        IncidentState::Remediating => 2,
+    }
+}
+
 fn truncate_vec<T>(entries: &mut Vec<T>, limit: usize) {
     if entries.len() <= limit {
         return;
@@ -1988,6 +2030,41 @@ mod tests {
         assert_eq!(summary.resolved, 1);
         assert!(state.active_incidents(8).is_empty());
         assert_eq!(incident.incident_id, state.recent_incident_history(8)[1].incident_id);
+    }
+
+    #[test]
+    fn incident_store_evicts_resolved_records_and_matching_index_entries() {
+        let state = SelfHealingState::new();
+        state.observe_incident(RuntimeIncidentObservation {
+            domain: IncidentDomain::Watchdog,
+            severity: IncidentSeverity::Low,
+            summary: "resolved fixture".to_owned(),
+            detail: "resolved fixture".to_owned(),
+            dedupe_key: "resolved".to_owned(),
+            remediation: None,
+        });
+        state.resolve_incident(IncidentDomain::Watchdog, "resolved", "resolved");
+        for index in 0..INCIDENT_RECORD_LIMIT {
+            state.observe_incident(RuntimeIncidentObservation {
+                domain: IncidentDomain::Approval,
+                severity: IncidentSeverity::Low,
+                summary: "open fixture".to_owned(),
+                detail: "open fixture".to_owned(),
+                dedupe_key: format!("open:{index}"),
+                remediation: None,
+            });
+        }
+
+        let inner = state.inner.lock().expect("self-healing mutex should remain healthy");
+        assert_eq!(inner.incidents.len(), INCIDENT_RECORD_LIMIT);
+        assert_eq!(inner.incident_index.len(), INCIDENT_RECORD_LIMIT);
+        assert!(!inner
+            .incident_index
+            .contains_key(incident_index_key(IncidentDomain::Watchdog, "resolved").as_str()));
+        assert!(inner
+            .incident_index
+            .values()
+            .all(|incident_id| inner.incidents.contains_key(incident_id)));
     }
 
     #[test]
