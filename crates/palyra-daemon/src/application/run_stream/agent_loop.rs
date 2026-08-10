@@ -2894,7 +2894,7 @@ mod tests {
 
         assert!(controller.observe(attempt.clone()).is_none());
         assert!(controller.observe(attempt.clone()).is_none());
-        let intervention = controller.observe(attempt).expect("third read loop warns");
+        let intervention = controller.observe(attempt.clone()).expect("third read loop warns");
 
         assert!(!intervention.terminate_run);
         assert_eq!(intervention.event_type, TOOL_LOOP_WARNING_EVENT);
@@ -2902,6 +2902,11 @@ mod tests {
         assert_eq!(intervention.signature.normalized_path_scope.as_deref(), Some("src/main.rs"));
         assert_eq!(intervention.signature.canonical_arguments_hash.len(), 64);
         assert!(intervention.guidance.contains("repeated the same read"));
+
+        let blocked = controller.observe(attempt).expect("fourth identical read loop should block");
+        assert!(blocked.terminate_run);
+        assert_eq!(blocked.event_type, TOOL_LOOP_BLOCKED_EVENT);
+        assert_eq!(blocked.reason_code, "tool.loop.read_no_progress");
     }
 
     #[test]
