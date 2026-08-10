@@ -27,6 +27,9 @@ const LEASE_WAIT_POLL_MS: u64 = 25;
 const DEFAULT_RATE_LIMIT_RETRY_AFTER_MS: u64 = 30_000;
 const DEFAULT_TRANSIENT_FAILURE_RETRY_AFTER_MS: u64 = 5_000;
 const DEFAULT_USER_ACTION_RETRY_AFTER_MS: u64 = 30_000;
+// Provider feedback is untrusted; honoring longer hints would let one response
+// make a credential unavailable far beyond the daemon's ordinary retry window.
+pub(crate) const MAX_PROVIDER_CREDENTIAL_RETRY_AFTER_MS: u64 = 5 * 60 * 1_000;
 
 /// Scheduling tier of a lease: foreground (interactive) work preempts background.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -800,7 +803,10 @@ impl ProviderCredentialFeedbackState {
             }
             ProviderCredentialFeedbackKind::Success => None,
         };
-        let retry_after_ms = request.retry_after_ms.or(default_retry_after_ms);
+        let retry_after_ms = request
+            .retry_after_ms
+            .or(default_retry_after_ms)
+            .map(|value| value.min(MAX_PROVIDER_CREDENTIAL_RETRY_AFTER_MS));
         let blocked_until_unix_ms =
             retry_after_ms.map(|value| request.observed_at_unix_ms.saturating_add(value as i64));
         Self {
@@ -986,6 +992,7 @@ mod tests {
         ProviderCredentialFeedbackRequest, ProviderCredentialFeedbackState,
         ProviderLeaseAcquireError, ProviderLeaseAcquireRequest, ProviderLeaseManager,
         ProviderLeasePreviewRequest, DEFAULT_USER_ACTION_RETRY_AFTER_MS,
+        MAX_PROVIDER_CREDENTIAL_RETRY_AFTER_MS,
     };
     use tokio::time::{sleep, Duration};
 
@@ -1366,6 +1373,26 @@ mod tests {
         });
         assert_eq!(ready.state, LeasePreviewState::Ready);
         assert!(manager.snapshot().credential_feedback.is_empty());
+    }
+
+    #[test]
+    fn credential_feedback_caps_provider_retry_after() {
+        let observed_at_unix_ms = 1_730_000_000_000_i64;
+        let feedback =
+            ProviderCredentialFeedbackState::from_request(ProviderCredentialFeedbackRequest {
+                provider_id: "openai".to_owned(),
+                credential_id: "cred-a".to_owned(),
+                kind: ProviderCredentialFeedbackKind::RateLimited,
+                retry_after_ms: Some(u64::MAX),
+                reason: "provider returned an excessive retry-after".to_owned(),
+                observed_at_unix_ms,
+            });
+
+        assert_eq!(feedback.retry_after_ms, Some(MAX_PROVIDER_CREDENTIAL_RETRY_AFTER_MS));
+        assert_eq!(
+            feedback.blocked_until_unix_ms,
+            Some(observed_at_unix_ms.saturating_add(MAX_PROVIDER_CREDENTIAL_RETRY_AFTER_MS as i64))
+        );
     }
 
     #[tokio::test]

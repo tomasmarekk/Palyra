@@ -47,7 +47,8 @@ use serde_json::{json, Value};
 use ulid::Ulid;
 
 use crate::{
-    application::tool_registry::ModelVisibleToolCatalogSnapshot, orchestrator::estimate_token_count,
+    application::tool_registry::ModelVisibleToolCatalogSnapshot,
+    orchestrator::estimate_token_count, provider_leases::MAX_PROVIDER_CREDENTIAL_RETRY_AFTER_MS,
 };
 
 mod adapters;
@@ -4299,8 +4300,15 @@ fn retry_after_ms_from_response(response: &Response) -> Option<u64> {
         .headers()
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|seconds| seconds.saturating_mul(1_000))
+        .and_then(retry_after_ms_from_header_value)
+}
+
+fn retry_after_ms_from_header_value(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| seconds.saturating_mul(1_000).min(MAX_PROVIDER_CREDENTIAL_RETRY_AFTER_MS))
 }
 
 fn classify_http_provider_failure_with_retry_after(
@@ -7289,7 +7297,8 @@ mod tests {
         classify_http_provider_failure, extract_completion_text, normalize_tool_arguments,
         parse_openai_codex_sse_response, provider_attempt_index, provider_seconds_to_millis,
         qa_live_provider_base_url_sha256, qa_live_provider_binding_sha256,
-        qa_provider_binding_sha256, run_provider_failover_self_check, sanitize_remote_error,
+        qa_provider_binding_sha256, retry_after_ms_from_header_value,
+        run_provider_failover_self_check, sanitize_remote_error,
         validate_openai_base_url_network_policy_with_resolver,
         validate_qa_mock_provider_attempt_bounds, AnthropicCompatibleChatAdapter,
         AnthropicProvider, AudioSynthesisRequest, AudioTranscriptionRequest, EmbeddingsRequest,
@@ -9893,6 +9902,16 @@ turns:
         assert!(!captured.body.contains("sk-test-secret"));
         drop(requests);
         handle.join().expect("scripted server thread should exit");
+    }
+
+    #[test]
+    fn provider_retry_after_header_is_capped() {
+        assert_eq!(retry_after_ms_from_header_value("2"), Some(2_000));
+        assert_eq!(
+            retry_after_ms_from_header_value("31536000"),
+            Some(crate::provider_leases::MAX_PROVIDER_CREDENTIAL_RETRY_AFTER_MS)
+        );
+        assert_eq!(retry_after_ms_from_header_value("not-a-delay"), None);
     }
 
     #[tokio::test]
