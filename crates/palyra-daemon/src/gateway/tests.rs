@@ -17192,7 +17192,7 @@ async fn memory_delete_tool_deletes_workspace_document_id_from_search() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn memory_delete_tool_allows_channel_context_for_principal_scoped_memory() {
+async fn memory_delete_tool_rejects_channel_context_for_principal_scoped_memory() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
     let memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FDF";
@@ -17221,20 +17221,19 @@ async fn memory_delete_tool_allows_channel_context_for_principal_scoped_memory()
     )
     .await;
 
+    assert!(!channel_delete.success, "channel-scoped delete must be denied");
     assert!(
-        channel_delete.success,
-        "channel delete should remove same-principal principal memory: {}",
+        channel_delete.error.contains("requires unscoped principal context"),
+        "unexpected error: {}",
         channel_delete.error
     );
-    let channel_payload = parse_tool_output_json(&channel_delete);
-    assert_eq!(channel_payload.get("deleted").and_then(Value::as_bool), Some(true));
     assert!(
         state
             .memory_item(memory_id.to_owned())
             .await
             .expect("memory lookup should succeed")
-            .is_none(),
-        "same-principal channel delete should remove principal memory"
+            .is_some(),
+        "principal-scoped memory must survive a channel-scoped delete"
     );
 }
 

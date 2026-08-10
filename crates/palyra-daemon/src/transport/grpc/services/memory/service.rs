@@ -198,14 +198,13 @@ impl memory_v1::memory_service_server::MemoryService for MemoryServiceImpl {
             "memory.delete",
             format!("memory:{memory_id}").as_str(),
         )?;
-        let mut delete_channel = context.channel;
+        let delete_channel = context.channel;
         if let Some(item) = self.state.memory_item(memory_id.clone()).await? {
             enforce_memory_item_delete_scope(
                 &item,
                 context.principal.as_str(),
                 delete_channel.as_deref(),
             )?;
-            delete_channel = item.channel;
         }
         let deleted =
             self.state.delete_memory_item(memory_id, context.principal, delete_channel).await?;
