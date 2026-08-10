@@ -534,7 +534,7 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
             });
         }
 
-        if let Some(delta) = text_delta(&value) {
+        if let Some(delta) = text_delta(&value, frame.event_name.as_deref()) {
             report.events.push(ProviderStreamEvent::Delta { text: delta.clone() });
             report.canonical_events.push(ProviderCanonicalEvent::ContentDelta { text: delta });
         }
@@ -628,7 +628,14 @@ fn parse_sse_frame(raw_frame: &str, frame_index: usize) -> Result<Option<ParsedS
     }))
 }
 
-fn text_delta(value: &Value) -> Option<String> {
+fn text_delta(value: &Value, event_name: Option<&str>) -> Option<String> {
+    let event_type = value.get("type").and_then(Value::as_str).or(event_name);
+    let tool_arguments_delta = matches!(event_type, Some("response.function_call_arguments.delta"))
+        || (event_type == Some("content_block_delta")
+            && response_tool_arguments_delta(value).is_some());
+    if tool_arguments_delta {
+        return None;
+    }
     value
         .pointer("/choices/0/delta/content")
         .and_then(Value::as_str)
@@ -2121,6 +2128,40 @@ mod tests {
                 finish_reason: ProviderFinishReason::ToolCalls
             })
         ));
+    }
+
+    #[test]
+    fn sse_normalizer_keeps_codex_tool_arguments_out_of_text() {
+        let input = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+            "\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",",
+            "\"name\":\"palyra.echo\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",",
+            "\"output_index\":0,\"delta\":\"{\\\"text\\\":\\\"secret\\\"}\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n",
+        );
+
+        let report = normalize_provider_sse_stream(input, "openai-codex", "gpt-test");
+
+        assert!(!report
+            .events
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::Delta { .. })));
+        assert!(!report
+            .normalized_stream_v2
+            .events
+            .iter()
+            .any(|event| { matches!(event, NormalizedProviderEventV2::TextDelta { .. }) }));
+        assert!(report.canonical_events.iter().any(|event| {
+            matches!(
+                event,
+                ProviderCanonicalEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments_delta
+                } if arguments_delta == "{\"text\":\"secret\"}"
+            )
+        }));
     }
 
     #[test]

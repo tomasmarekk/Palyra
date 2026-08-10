@@ -9160,6 +9160,8 @@ turns:
         let response_body = [
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_01","name":"palyra_echo","arguments":""}}"#,
             "",
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"text\":\"hello\"}"}"#,
+            "",
             r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_01","name":"palyra_echo","arguments":"{\"text\":\"hello\"}"}}"#,
             "",
             r#"data: {"type":"response.completed","response":{"id":"resp_tool","model":"provider-selected-model","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}"#,
@@ -9199,6 +9201,11 @@ turns:
         let input_json: serde_json::Value =
             serde_json::from_slice(proposal.2).expect("tool input should remain valid JSON");
         assert_eq!(input_json["text"], "hello");
+        assert!(response.output.full_text.is_empty());
+        assert!(!response
+            .events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::ModelToken { .. })));
         assert_eq!(request_count.load(Ordering::Relaxed), 1);
         handle.join().expect("scripted server thread should exit");
     }
