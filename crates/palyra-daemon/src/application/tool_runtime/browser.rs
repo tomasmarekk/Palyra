@@ -709,9 +709,10 @@ async fn read_browser_upload_file(
 /// Resolves an upload `file_path` to a canonical path inside the allowed
 /// roots.
 ///
-/// Resolution order: launch-env-prefixed paths expand first, absolute paths
-/// must fall inside workspace or explicit launch env roots, and relative paths
-/// are confined to the first workspace root.
+/// Resolution order: launch-env-prefixed paths expand first, then every
+/// absolute result must fall inside an authorized workspace root. Launch env
+/// values are path aliases, not additional read grants. Relative paths are
+/// confined to the first workspace root.
 /// Uploads intentionally do not fall back to daemon process env because those
 /// variables commonly point at credential files.
 /// Protected OS locations are denied regardless of root membership.
@@ -746,10 +747,9 @@ fn resolve_browser_upload_path(
             canonical.display()
         ));
     }
-    let allowed_roots = browser_upload_allowed_roots(workspace_roots, path_env);
-    if !canonical_file_path_is_inside_workspace_roots(canonical.as_path(), &allowed_roots) {
+    if !canonical_file_path_is_inside_workspace_roots(canonical.as_path(), workspace_roots) {
         return Err(format!(
-            "{BROWSER_UPLOAD_TOOL_NAME} upload file {} is outside agent workspace roots and approved launch environment roots",
+            "{BROWSER_UPLOAD_TOOL_NAME} upload file {} is outside agent workspace roots; launch environment aliases do not grant file access",
             canonical.display()
         ));
     }
@@ -897,24 +897,6 @@ fn resolve_browser_output_path(
         );
     };
     prepare_browser_output_target(tool_name, requested.as_path(), allowed_roots.as_slice())
-}
-
-/// Roots from which browser uploads may read local bytes.
-///
-/// User-owned output roots are intentionally excluded: treating an implicit
-/// home or temp directory as readable would turn browser upload into a broad
-/// host-file exfiltration primitive.
-fn browser_upload_allowed_roots(
-    workspace_roots: &[PathBuf],
-    path_env: &BTreeMap<String, PathBuf>,
-) -> Vec<PathBuf> {
-    let mut roots = workspace_roots.to_vec();
-    for root in path_env.values() {
-        if !roots.iter().any(|existing| existing == root) {
-            roots.push(root.clone());
-        }
-    }
-    roots
 }
 
 /// Union of roots an absolute browser output path may use, deduplicated.
@@ -6690,14 +6672,14 @@ mod tests {
         std::fs::write(upload.as_path(), "sku,qty\nE2E-WIDGET,1\n").expect("upload should exist");
         let canonical_root = os_root.canonicalize().expect("OS root should canonicalize");
         let canonical_upload = upload.canonicalize().expect("upload should canonicalize");
-        let path_env = BTreeMap::from([("PALYRA_E2E_OS_ROOT".to_owned(), canonical_root)]);
+        let path_env = BTreeMap::from([("PALYRA_E2E_OS_ROOT".to_owned(), canonical_root.clone())]);
 
         let resolved = resolve_browser_upload_path(
             "$PALYRA_E2E_OS_ROOT/downloads/upload-input.csv",
-            &[],
+            std::slice::from_ref(&canonical_root),
             &path_env,
         )
-        .expect("env-prefixed upload file should resolve inside launch OS root");
+        .expect("env-prefixed upload file should resolve inside an authorized workspace root");
 
         assert_eq!(resolved, canonical_upload);
     }
@@ -6732,25 +6714,28 @@ mod tests {
     }
 
     #[test]
-    fn browser_upload_path_accepts_absolute_path_inside_launch_env_root() {
+    fn browser_upload_path_rejects_launch_env_root_outside_workspace() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
         let os_root = temp.path().join("os-root");
         let downloads = os_root.join("downloads");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
         std::fs::create_dir_all(downloads.as_path()).expect("downloads should exist");
         let upload = downloads.join("upload-input.csv");
         std::fs::write(upload.as_path(), "sku,qty\nE2E-WIDGET,1\n").expect("upload should exist");
+        let canonical_workspace = workspace.canonicalize().expect("workspace should canonicalize");
         let canonical_root = os_root.canonicalize().expect("OS root should canonicalize");
         let canonical_upload = upload.canonicalize().expect("upload should canonicalize");
         let path_env = BTreeMap::from([("PALYRA_E2E_OS_ROOT".to_owned(), canonical_root)]);
 
-        let resolved = resolve_browser_upload_path(
+        let error = resolve_browser_upload_path(
             canonical_upload.to_string_lossy().as_ref(),
-            &[],
+            std::slice::from_ref(&canonical_workspace),
             &path_env,
         )
-        .expect("absolute upload file should resolve inside launch OS root");
+        .expect_err("request-supplied launch env root must not grant browser upload access");
 
-        assert_eq!(resolved, canonical_upload);
+        assert!(error.contains("launch environment aliases do not grant file access"), "{error}");
     }
 
     #[test]
