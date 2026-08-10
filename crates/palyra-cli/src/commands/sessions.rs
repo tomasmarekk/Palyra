@@ -437,7 +437,9 @@ pub(crate) async fn run_sessions_async(
                         ),
                         "cancel_requested": response.cancel_requested,
                         "reason": redacted_text_json_or_null(response.reason.as_str()),
-                        "cleanup_warning": non_empty_json_string(response.cleanup_warning.as_str()),
+                        "cleanup_warning": redacted_cleanup_warning_json(
+                            response.cleanup_warning.as_str()
+                        ),
                     }))?
                 );
             } else {
@@ -454,7 +456,7 @@ pub(crate) async fn run_sessions_async(
                         redacted_presence_for_output(response.run_id.is_some()),
                         response.cancel_requested,
                         redacted_text_or_none(!response.reason.trim().is_empty()),
-                        response.cleanup_warning
+                        redacted_cleanup_warning_text(response.cleanup_warning.as_str())
                     );
                 }
             }
@@ -1265,13 +1267,12 @@ fn redacted_text_json_or_null(value: &str) -> Value {
     }
 }
 
-fn non_empty_json_string(value: &str) -> Value {
-    let value = value.trim();
-    if value.is_empty() {
-        Value::Null
-    } else {
-        Value::String(value.to_owned())
-    }
+fn redacted_cleanup_warning_json(value: &str) -> Value {
+    redacted_text_json_or_null(value)
+}
+
+fn redacted_cleanup_warning_text(value: &str) -> String {
+    redacted_text_or_none(!value.trim().is_empty())
 }
 
 fn optional_unix_ms_text(value: i64) -> String {
@@ -1699,7 +1700,8 @@ mod render_tests {
 mod tests {
     use super::{
         build_cleanup_session_request, build_resolve_session_request,
-        build_session_retry_agent_run_input, optional_canonical_id_text, session_to_json,
+        build_session_retry_agent_run_input, optional_canonical_id_text,
+        redacted_cleanup_warning_json, redacted_cleanup_warning_text, session_to_json,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
@@ -1823,6 +1825,17 @@ mod tests {
             optional_canonical_id_text(&Some(common_v1::CanonicalId { ulid: " ".to_owned() })),
             "none"
         );
+    }
+
+    #[test]
+    fn cleanup_warning_renderers_reveal_only_presence() {
+        let warning =
+            "pid=4821 ports=4567 start_context=cwd=C:/secret command=tool --token raw-secret";
+
+        assert_eq!(redacted_cleanup_warning_json(warning), serde_json::json!("<redacted>"));
+        assert_eq!(redacted_cleanup_warning_text(warning), "<redacted>");
+        assert_eq!(redacted_cleanup_warning_json("  "), serde_json::Value::Null);
+        assert_eq!(redacted_cleanup_warning_text("  "), "none");
     }
 
     #[test]
