@@ -330,9 +330,9 @@ pub(crate) fn summarize_resume_tape_observations(
 ) -> ResumeTapeSafetySignals {
     let mut signals = ResumeTapeSafetySignals::default();
     let mut proposals = BTreeMap::<String, (String, Vec<u8>)>::new();
-    let mut active_tool_proposal_id = None::<String>;
+    let mut unresolved_tool_waits = BTreeMap::<String, bool>::new();
 
-    for event in events {
+    for (event_index, event) in events.iter().enumerate() {
         let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok();
         if is_transcript_event(event.event_type.as_str()) {
             signals.last_transcript_event_unix_ms = Some(event.created_at_unix_ms);
@@ -377,9 +377,12 @@ pub(crate) fn summarize_resume_tape_observations(
                     .unwrap_or_default();
                 let safe_to_resume = tool_name
                     .is_some_and(|tool_name| tool_wait_is_safe_to_resume(tool_name, input_json));
-                signals.read_only_tool_wait = safe_to_resume;
-                signals.mutating_tool_in_flight = !safe_to_resume;
-                active_tool_proposal_id = proposal_id;
+                let correlation_key =
+                    proposal_id.unwrap_or_else(|| format!("missing-proposal-id-{event_index}"));
+                unresolved_tool_waits
+                    .entry(correlation_key)
+                    .and_modify(|existing| *existing &= safe_to_resume)
+                    .or_insert(safe_to_resume);
             }
             "tool_approval_request" => {
                 signals.pending_approval = true;
@@ -388,13 +391,8 @@ pub(crate) fn summarize_resume_tape_observations(
                 signals.pending_approval = false;
             }
             "tool_result" => {
-                let result_proposal = payload.as_ref().and_then(proposal_id);
-                if active_tool_proposal_id.as_deref().is_none()
-                    || active_tool_proposal_id.as_deref() == result_proposal
-                {
-                    signals.mutating_tool_in_flight = false;
-                    signals.read_only_tool_wait = false;
-                    active_tool_proposal_id = None;
+                if let Some(result_proposal) = payload.as_ref().and_then(proposal_id) {
+                    unresolved_tool_waits.remove(result_proposal);
                 }
             }
             event_type if event_type.contains("workspace_checkpoint") => {
@@ -408,6 +406,10 @@ pub(crate) fn summarize_resume_tape_observations(
         }
     }
 
+    signals.mutating_tool_in_flight =
+        unresolved_tool_waits.values().any(|safe_to_resume| !safe_to_resume);
+    signals.read_only_tool_wait =
+        !unresolved_tool_waits.is_empty() && !signals.mutating_tool_in_flight;
     signals
 }
 
@@ -697,6 +699,64 @@ mod tests {
         ]);
         assert!(read_only.read_only_tool_wait);
         assert!(!read_only.mutating_tool_in_flight);
+    }
+
+    #[test]
+    fn tape_summary_retains_each_unresolved_tool_until_its_result() {
+        let mut events = vec![
+            tape_event(
+                "tool_proposal",
+                1_100,
+                json!({
+                    "tool_proposal": {
+                        "proposal_id": "mutating",
+                        "tool_name": "palyra.fs.apply_patch"
+                    }
+                }),
+            ),
+            tape_event(
+                "tool_proposal",
+                1_200,
+                json!({
+                    "tool_proposal": {
+                        "proposal_id": "read-only",
+                        "tool_name": "palyra.process.status"
+                    }
+                }),
+            ),
+            tape_event(
+                "tool_decision",
+                1_300,
+                json!({"tool_decision": {"proposal_id": "mutating", "kind": "allow"}}),
+            ),
+            tape_event(
+                "tool_decision",
+                1_400,
+                json!({"tool_decision": {"proposal_id": "read-only", "kind": "allow"}}),
+            ),
+        ];
+
+        let mixed = summarize_resume_tape_observations(events.as_slice());
+        assert!(mixed.mutating_tool_in_flight);
+        assert!(!mixed.read_only_tool_wait);
+
+        events.push(tape_event(
+            "tool_result",
+            1_500,
+            json!({"tool_result": {"proposal_id": "read-only"}}),
+        ));
+        let mutating_only = summarize_resume_tape_observations(events.as_slice());
+        assert!(mutating_only.mutating_tool_in_flight);
+        assert!(!mutating_only.read_only_tool_wait);
+
+        events.push(tape_event(
+            "tool_result",
+            1_600,
+            json!({"tool_result": {"proposal_id": "mutating"}}),
+        ));
+        let resolved = summarize_resume_tape_observations(events.as_slice());
+        assert!(!resolved.mutating_tool_in_flight);
+        assert!(!resolved.read_only_tool_wait);
     }
 
     fn base_input() -> ResumeClassifierInput {
