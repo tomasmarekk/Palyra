@@ -1225,8 +1225,12 @@ fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
     if is_scenario_completion_marker_assignment(raw_key, key.as_str(), value) {
         return None;
     }
+    // A vault-shaped value is reference metadata only when the assignment
+    // target explicitly declares that contract; a prefix cannot sanitize an
+    // ordinary API key or password.
     if value.is_empty()
-        || key.ends_with("_ref")
+        || (key.ends_with("_ref") && !key.ends_with("vault_ref"))
+        || (key.ends_with("vault_ref") && is_vault_reference_value(value))
         || is_safe_secret_reference_value(raw_key, key.as_str(), value)
     {
         return None;
@@ -1365,7 +1369,6 @@ fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool
         || is_os_environ_index_reference(reference)
         || is_env_identifier_reference_expression(key, reference)
         || is_safe_standalone_env_identifier_literal(raw_key, key, reference)
-        || is_vault_reference_value(reference)
         || (sensitive_assignment_key_allows_path_reference(key)
             && is_benign_path_reference_value(reference))
         || is_dom_input_value_reference(reference)
@@ -1414,19 +1417,54 @@ fn sensitive_assignment_key_allows_path_reference(key: &str) -> bool {
     COMPACT_PATH_REFERENCE_SUFFIXES.iter().any(|suffix| compact.ends_with(suffix))
 }
 
+/// Mirrors the vault's `<scope>/<key>` grammar without making the safety crate
+/// depend on the storage/cryptography crate.
 fn is_vault_reference_value(value: &str) -> bool {
     let normalized =
         value.trim().trim_end_matches([',', ';']).trim().trim_matches(['"', '\'', '`']).trim();
     let reference = normalized
         .strip_prefix("${vault:")
         .and_then(|rest| rest.strip_suffix('}'))
-        .or_else(|| normalized.strip_prefix("vault:"));
-    let Some(reference) = reference.map(str::trim).filter(|reference| !reference.is_empty()) else {
+        .or_else(|| normalized.strip_prefix("vault://"))
+        .or_else(|| normalized.strip_prefix("vault:"))
+        .unwrap_or(normalized)
+        .trim()
+        .trim_start_matches('/');
+    let Some((scope, key)) = reference.split_once('/') else {
         return false;
     };
-    reference
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
+    if key.is_empty()
+        || key.len() > 128
+        || key.contains('/')
+        || !key.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return false;
+    }
+    vault_reference_scope_is_valid(scope)
+}
+
+fn vault_reference_scope_is_valid(scope: &str) -> bool {
+    if scope.eq_ignore_ascii_case("global") {
+        return true;
+    }
+    let segment = scope.strip_prefix("principal:").or_else(|| scope.strip_prefix("skill:"));
+    if let Some(segment) = segment {
+        return vault_reference_scope_segment_is_valid(segment);
+    }
+    let Some(channel) = scope.strip_prefix("channel:") else {
+        return false;
+    };
+    let Some((name, account_id)) = channel.split_once(':') else {
+        return false;
+    };
+    vault_reference_scope_segment_is_valid(name)
+        && vault_reference_scope_segment_is_valid(account_id)
+}
+
+fn vault_reference_scope_segment_is_valid(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= 256
+        && !segment.chars().any(|ch| matches!(ch, '\0' | '/' | '\\'))
 }
 
 fn is_env_member_reference(value: &str) -> bool {
@@ -2795,9 +2833,9 @@ impl EnumLabel for SafetyAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        inspect_text, merge_scan_results, redact_text_for_export, sanitize_visible_assistant_text,
-        transform_text_for_prompt, ExportRedactionOutcome, SafetyAction, SafetyContentKind,
-        SafetyPhase, SafetySeverity, SafetySourceKind, TrustLabel,
+        inspect_text, is_vault_reference_value, merge_scan_results, redact_text_for_export,
+        sanitize_visible_assistant_text, transform_text_for_prompt, ExportRedactionOutcome,
+        SafetyAction, SafetyContentKind, SafetyPhase, SafetySeverity, SafetySourceKind, TrustLabel,
     };
 
     #[test]
@@ -3576,9 +3614,9 @@ mod tests {
     }
 
     #[test]
-    fn vault_reference_assignment_values_are_not_redacted_as_secret_values() {
-        let source = "PALYRA_E2E_API_KEY=${vault:PALYRA_E2E_API_KEY}\n\
-                      provider_key = \"${vault:PALYRA_E2E_API_KEY}\"\n\
+    fn vault_prefix_does_not_exempt_sensitive_assignment_values() {
+        let source = "API_KEY=${vault:global/verylongrandomsecretvalue}\n\
+                      PASSWORD=vault:global/correcthorsebatterystaple\n\
                       secret_vault_ref = \"global/openai_key\"";
         let outcome = redact_text_for_export(
             source,
@@ -3587,19 +3625,31 @@ mod tests {
             TrustLabel::TrustedLocal,
         );
 
-        assert!(!outcome.redacted);
-        assert_eq!(outcome.redacted_text, source);
-        assert!(outcome.redacted_text.contains("${vault:PALYRA_E2E_API_KEY}"));
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("API_KEY=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("PASSWORD=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("secret_vault_ref = \"global/openai_key\""));
+        assert!(!outcome.redacted_text.contains("verylongrandomsecretvalue"));
+        assert!(!outcome.redacted_text.contains("correcthorsebatterystaple"));
         assert!(outcome
             .scan
             .finding_codes()
             .iter()
             .any(|code| code == "credential_reference.secret_vault_ref"));
-        assert!(!outcome
+        assert!(outcome
             .scan
             .finding_codes()
             .iter()
-            .any(|code| code.starts_with("secret_leak.assignment.")));
+            .any(|code| code == "secret_leak.assignment.api_key"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.password"));
+        assert!(is_vault_reference_value("global/openai_key"));
+        assert!(is_vault_reference_value("${vault:principal:user:ops/api_key}"));
+        assert!(!is_vault_reference_value("vault:correcthorsebatterystaple"));
+        assert!(!is_vault_reference_value("${vault:verylongrandomsecretvalue}"));
     }
 
     #[test]

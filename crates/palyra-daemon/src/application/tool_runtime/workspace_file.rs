@@ -3378,11 +3378,12 @@ mod tests {
     }
 
     #[test]
-    fn read_workspace_file_preserves_vault_reference_assignments() {
+    fn read_workspace_file_redacts_vault_prefixed_secret_assignments() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join(".env.template");
-        let contents = "PALYRA_E2E_API_KEY=${vault:PALYRA_E2E_API_KEY}\n\
-                        PROVIDER_KEY=${vault:providers/local/api_key}\n";
+        let contents = "API_KEY=${vault:global/verylongrandomsecretvalue}\n\
+                        PASSWORD=vault:global/correcthorsebatterystaple\n\
+                        PROVIDER_KEY_VAULT_REF=global/provider_api_key\n";
         fs::write(file_path, contents).expect("workspace file should be written");
         let input = WorkspaceReadFileInput {
             path: ".env.template".to_owned(),
@@ -3396,10 +3397,13 @@ mod tests {
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
             .expect("workspace file should be readable");
 
-        assert!(!output.redacted);
-        assert_eq!(output.text.as_deref(), Some(contents));
-        assert_eq!(output.text_authoritative, None);
-        assert_eq!(output.redaction_notice, None);
+        assert!(output.redacted);
+        let text = output.text.as_deref().expect("redacted text should be returned");
+        assert!(text.contains("API_KEY=[REDACTED_SECRET]"));
+        assert!(text.contains("PASSWORD=[REDACTED_SECRET]"));
+        assert!(text.contains("PROVIDER_KEY_VAULT_REF=global/provider_api_key"));
+        assert!(!text.contains("verylongrandomsecretvalue"));
+        assert!(!text.contains("correcthorsebatterystaple"));
     }
 
     #[test]
