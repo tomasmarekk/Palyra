@@ -415,7 +415,7 @@ pub(crate) fn normalize_url_with_redaction(raw: &str) -> String {
         if parsed.path().is_empty() {
             output.push('/');
         } else {
-            output.push_str(parsed.path());
+            output.push_str(redact_sensitive_url_path(parsed.path()).as_str());
         }
         if let Some(query) = parsed.query() {
             let redacted = redact_query_pairs(query);
@@ -432,14 +432,50 @@ pub(crate) fn normalize_url_with_redaction(raw: &str) -> String {
 fn redact_query_from_raw(raw: &str) -> String {
     let without_fragment = raw.split('#').next().unwrap_or_default();
     let Some((base, query)) = without_fragment.split_once('?') else {
-        return without_fragment.to_owned();
+        return redact_sensitive_url_path(without_fragment);
     };
+    let base = redact_sensitive_url_path(base);
     let redacted = redact_query_pairs(query);
     if redacted.is_empty() {
-        base.to_owned()
+        base
     } else {
         format!("{base}?{redacted}")
     }
+}
+
+fn redact_sensitive_url_path(path: &str) -> String {
+    let mut previous_segment_is_sensitive_marker = false;
+    path.split('/')
+        .map(|segment| {
+            let redact =
+                previous_segment_is_sensitive_marker || looks_like_opaque_snapshot_secret(segment);
+            previous_segment_is_sensitive_marker = is_sensitive_url_path_marker(segment);
+            if redact {
+                "<redacted>"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn is_sensitive_url_path_marker(segment: &str) -> bool {
+    matches!(
+        segment.trim().to_ascii_lowercase().as_str(),
+        "auth"
+            | "invite"
+            | "magic"
+            | "recover"
+            | "recovery"
+            | "reset"
+            | "session"
+            | "signed"
+            | "signature"
+            | "token"
+            | "verify"
+            | "verification"
+    )
 }
 
 /// Rebuilds a query string, redacting values whose key is sensitive or whose content looks
@@ -457,7 +493,9 @@ pub(crate) fn redact_query_pairs(query: &str) -> String {
                 return String::new();
             }
             let value = raw_value_opt.unwrap_or_default();
-            let sanitized = if is_sensitive_query_key(raw_key) || contains_sensitive_material(value)
+            let sanitized = if is_sensitive_query_key(raw_key)
+                || contains_sensitive_material(value)
+                || looks_like_opaque_snapshot_secret(value)
             {
                 "<redacted>".to_owned()
             } else {
@@ -539,7 +577,7 @@ fn sanitize_snapshot_attribute(_tag: &str, attr_name: &str, raw_value: &str) -> 
     if lower == "value" {
         return "<redacted>".to_owned();
     }
-    if contains_sensitive_material(raw_value) {
+    if snapshot_attribute_value_is_sensitive(raw_value) {
         return "<redacted>".to_owned();
     }
     truncate_utf8_bytes(raw_value, 128)
@@ -594,7 +632,11 @@ fn accessibility_role_for_tag(tag: &str, tag_lower: &str) -> Option<String> {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
     {
-        return Some(truncate_utf8_bytes(explicit_role.as_str(), 64));
+        return Some(if snapshot_attribute_value_is_sensitive(explicit_role.as_str()) {
+            "<redacted>".to_owned()
+        } else {
+            truncate_utf8_bytes(explicit_role.as_str(), 64)
+        });
     }
     let tag_name = html_tag_name(tag_lower)?;
     let inferred = match tag_name {
@@ -684,7 +726,7 @@ fn accessibility_name_can_use_inner_text(tag_name: &str) -> bool {
 }
 
 fn accessibility_name_value(value: &str) -> String {
-    if contains_sensitive_material(value) {
+    if snapshot_attribute_value_is_sensitive(value) {
         "<redacted>".to_owned()
     } else {
         truncate_utf8_bytes(value, 128)
@@ -696,12 +738,18 @@ fn accessibility_selector_for_tag(tag: &str) -> String {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
     {
+        if snapshot_attribute_value_is_sensitive(id.as_str()) {
+            return "<redacted>".to_owned();
+        }
         return format!("#{}", truncate_utf8_bytes(id.as_str(), 96));
     }
     if let Some(name) = extract_attr_value_case_insensitive(tag, "name")
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
     {
+        if snapshot_attribute_value_is_sensitive(name.as_str()) {
+            return "<redacted>".to_owned();
+        }
         return format!("[name={}]", truncate_utf8_bytes(name.as_str(), 96));
     }
     if let Some(class) = extract_attr_value_case_insensitive(tag, "class")
@@ -710,10 +758,50 @@ fn accessibility_selector_for_tag(tag: &str) -> String {
     {
         let first_class = class.split_ascii_whitespace().next().unwrap_or_default();
         if !first_class.is_empty() {
+            if snapshot_attribute_value_is_sensitive(first_class) {
+                return "<redacted>".to_owned();
+            }
             return format!(".{}", truncate_utf8_bytes(first_class, 96));
         }
     }
     "-".to_owned()
+}
+
+fn snapshot_attribute_value_is_sensitive(value: &str) -> bool {
+    contains_sensitive_material(value)
+        || value
+            .split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '%' | '='))
+            })
+            .any(looks_like_opaque_snapshot_secret)
+}
+
+fn looks_like_opaque_snapshot_secret(candidate: &str) -> bool {
+    let mut alphanumeric_len = 0usize;
+    let mut has_lower = false;
+    let mut has_upper = false;
+    let mut has_digit = false;
+    let mut all_hex = true;
+    let mut distinct = 0usize;
+    let mut seen_ascii = [false; 128];
+    for byte in candidate.bytes().filter(|byte| byte.is_ascii_alphanumeric()) {
+        alphanumeric_len += 1;
+        has_lower |= byte.is_ascii_lowercase();
+        has_upper |= byte.is_ascii_uppercase();
+        has_digit |= byte.is_ascii_digit();
+        all_hex &= byte.is_ascii_hexdigit();
+        let index = usize::from(byte);
+        if !seen_ascii[index] {
+            seen_ascii[index] = true;
+            distinct += 1;
+        }
+    }
+    if alphanumeric_len < 16 {
+        return false;
+    }
+    let mixed_token = has_lower && has_upper && has_digit;
+    let long_hex = alphanumeric_len >= 24 && all_hex;
+    mixed_token || long_hex || (alphanumeric_len >= 24 && has_lower && has_upper && distinct >= 12)
 }
 
 /// Extracts whitespace-collapsed visible text from HTML (scripts, styles, and comments
@@ -878,8 +966,8 @@ fn collect_opening_tags(html: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_accessibility_tree_snapshot, build_visible_text_snapshot,
-        MAX_ACCESSIBILITY_CANDIDATES,
+        build_accessibility_tree_snapshot, build_dom_snapshot, build_visible_text_snapshot,
+        normalize_url_with_redaction, MAX_ACCESSIBILITY_CANDIDATES,
     };
 
     #[test]
@@ -914,6 +1002,36 @@ mod tests {
         );
         assert!(!accessibility_tree.contains("name=main-title"), "{accessibility_tree}");
         assert!(!accessibility_tree.contains("name=action"), "{accessibility_tree}");
+    }
+
+    #[test]
+    fn snapshots_redact_exact_case_opaque_attribute_values() {
+        let secret = "Qx7Vn2Lm9Pk4Rt8Ws3Yz6Aa1";
+        let html = format!(
+            r#"<a id="{secret}" aria-label="{secret}" href="/reset/{secret}">Reset account</a>"#
+        );
+
+        let (dom_snapshot, dom_truncated) = build_dom_snapshot(html.as_str(), 4096);
+        let (accessibility_tree, accessibility_truncated) =
+            build_accessibility_tree_snapshot(html.as_str(), 4096);
+
+        assert!(!dom_truncated);
+        assert!(!accessibility_truncated);
+        assert!(!dom_snapshot.contains(secret), "{dom_snapshot}");
+        assert!(!accessibility_tree.contains(secret), "{accessibility_tree}");
+        assert!(dom_snapshot.contains("<redacted>"), "{dom_snapshot}");
+        assert!(accessibility_tree.contains("<redacted>"), "{accessibility_tree}");
+    }
+
+    #[test]
+    fn url_redaction_masks_sensitive_and_opaque_path_segments() {
+        let secret = "Qx7Vn2Lm9Pk4Rt8Ws3Yz6Aa1";
+        let redacted = normalize_url_with_redaction(
+            format!("https://example.test/reset/{secret}/done?mode=ok").as_str(),
+        );
+
+        assert!(!redacted.contains(secret), "{redacted}");
+        assert_eq!(redacted, "https://example.test/reset/<redacted>/done?mode=ok");
     }
 
     #[test]
