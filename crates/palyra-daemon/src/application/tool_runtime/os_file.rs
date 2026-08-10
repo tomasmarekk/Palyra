@@ -1,12 +1,12 @@
 //! `palyra.fs.os_file` tool backend: scoped OS-level file operations.
 //!
 //! Unlike the workspace tools, this backend may reach outside the agent
-//! workspace. Local desktop profiles can opt into unrestricted OS paths, while
-//! strict profiles keep the allowlist of workspace roots, user-owned roots
-//! (`USERPROFILE`/`HOME` or configured `PALYRA_OS_FILE_ROOTS`), temp
-//! directories, and run-launch path-env roots. Every requested path must still
-//! be absolute, free of `.`/`..` components, and canonicalized (or resolved
-//! through its nearest existing ancestor for new targets) before I/O.
+//! workspace, but only within the allowlist of workspace roots, user-owned
+//! roots (`USERPROFILE`/`HOME` or configured `PALYRA_OS_FILE_ROOTS`), temp
+//! directories, and run-launch path-env roots. Every requested path must be
+//! absolute, free of `.`/`..` components, canonicalized (or resolved through
+//! its nearest existing ancestor for new targets), and outside protected OS
+//! paths before I/O.
 //! Treat any change to that pipeline as a security change.
 //!
 //! Reads stay model-visible even when the safety scanner finds secrets: the
@@ -37,7 +37,6 @@ use crate::{
         run_launch_context_path_env, workspace_roots_with_run_launch_context_for_agent_source,
     },
     gateway::{GatewayRuntimeState, ToolRuntimeExecutionContext, OS_FILE_TOOL_NAME},
-    sandbox_runner::PathAccessMode,
     tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
 
@@ -105,7 +104,6 @@ enum OsFileOperation {
 /// plus the run-launch env-var-to-path bindings usable as path prefixes.
 #[derive(Debug, Clone)]
 struct OsFilePolicy {
-    path_access_mode: PathAccessMode,
     workspace_roots: Vec<PathBuf>,
     user_os_roots: Vec<PathBuf>,
     path_env: BTreeMap<String, PathBuf>,
@@ -219,12 +217,7 @@ async fn resolve_os_file_policy(
     for root in path_env.values() {
         push_canonical_root(&mut user_os_roots, root.clone());
     }
-    Ok(OsFilePolicy {
-        path_access_mode: runtime_state.config.tool_call.process_runner.path_access_mode,
-        workspace_roots,
-        user_os_roots,
-        path_env,
-    })
+    Ok(OsFilePolicy { workspace_roots, user_os_roots, path_env })
 }
 
 fn execute_os_file_operation(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
@@ -1272,12 +1265,9 @@ fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, PathBuf), String> 
 /// through this before any I/O.
 ///
 /// The deny-list runs first so a protected OS path is rejected even when an
-/// allowed root contains it in strict modes; unrestricted local profiles only
-/// require successful path parsing and canonical resolution before I/O.
+/// allowed root contains it; the path is then accepted only when it resolves
+/// under a workspace root or an approved user-owned root.
 fn ensure_os_path_allowed(policy: &OsFilePolicy, path: &ResolvedOsPath) -> Result<(), String> {
-    if matches!(policy.path_access_mode, PathAccessMode::UnrestrictedOs) {
-        return Ok(());
-    }
     if protected_os_path(path.resolved_path.as_path()) {
         return Err(format!("{OS_FILE_TOOL_NAME} denied protected OS path"));
     }
@@ -1543,7 +1533,6 @@ mod tests {
 
     fn test_policy(root: &Path) -> OsFilePolicy {
         OsFilePolicy {
-            path_access_mode: PathAccessMode::ApprovedRoots,
             workspace_roots: vec![fs::canonicalize(root).expect("root should canonicalize")],
             user_os_roots: vec![fs::canonicalize(root).expect("root should canonicalize")],
             path_env: BTreeMap::new(),
@@ -1763,7 +1752,6 @@ mod tests {
         let source = inbox.join("orders-valid.csv");
         fs::write(source.as_path(), "id,name,total\n1,Ada,42\n").expect("source should exist");
         let policy = OsFilePolicy {
-            path_access_mode: PathAccessMode::ApprovedRoots,
             workspace_roots: vec![fs::canonicalize(workspace.as_path()).expect("workspace root")],
             user_os_roots: vec![fs::canonicalize(os_root.as_path()).expect("os root")],
             path_env: BTreeMap::new(),
@@ -1824,7 +1812,6 @@ mod tests {
             return;
         }
         let policy = OsFilePolicy {
-            path_access_mode: PathAccessMode::ApprovedRoots,
             workspace_roots: vec![fs::canonicalize(workspace.as_path()).expect("workspace root")],
             user_os_roots: vec![fs::canonicalize(os_root.as_path()).expect("os root")],
             path_env: BTreeMap::new(),
@@ -1883,7 +1870,6 @@ mod tests {
         let canonical_os_root =
             fs::canonicalize(os_root.as_path()).expect("os root should canonicalize");
         let policy = OsFilePolicy {
-            path_access_mode: PathAccessMode::ApprovedRoots,
             workspace_roots: vec![fs::canonicalize(tempdir.path()).expect("workspace root")],
             user_os_roots: vec![canonical_os_root.clone()],
             path_env: BTreeMap::from([("PALYRA_E2E_OS_ROOT".to_owned(), canonical_os_root)]),
@@ -1991,7 +1977,6 @@ mod tests {
         let canonical_home =
             fs::canonicalize(e2e_home.as_path()).expect("home should canonicalize");
         let policy = OsFilePolicy {
-            path_access_mode: PathAccessMode::ApprovedRoots,
             workspace_roots: vec![fs::canonicalize(tempdir.path()).expect("root canonicalizes")],
             user_os_roots: vec![canonical_home.clone()],
             path_env: BTreeMap::from([("PALYRA_E2E_HOME".to_owned(), canonical_home)]),
@@ -2169,7 +2154,6 @@ mod tests {
         fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
         fs::create_dir_all(outside.parent().expect("outside parent")).expect("outside parent");
         let policy = OsFilePolicy {
-            path_access_mode: PathAccessMode::ApprovedRoots,
             workspace_roots: vec![fs::canonicalize(workspace).expect("workspace canonical")],
             user_os_roots: vec![
                 fs::canonicalize(allowed_root.path()).expect("allowed root canonical")
@@ -2203,7 +2187,7 @@ mod tests {
     }
 
     #[test]
-    fn os_file_unrestricted_allows_filesystem_root_stat() {
+    fn os_file_rejects_filesystem_root_even_when_root_is_allowlisted() {
         let tempdir = os_file_tempdir();
         let filesystem_root = tempdir
             .path()
@@ -2212,9 +2196,10 @@ mod tests {
             .expect("tempdir should have a filesystem root")
             .to_path_buf();
         let mut policy = test_policy(tempdir.path());
-        policy.path_access_mode = PathAccessMode::UnrestrictedOs;
+        policy.workspace_roots = vec![filesystem_root.clone()];
+        policy.user_os_roots = vec![filesystem_root.clone()];
 
-        let stat = execute_os_file_operation(
+        let error = execute_os_file_operation(
             &policy,
             &OsFileInput {
                 operation: OsFileOperation::Stat,
@@ -2234,9 +2219,9 @@ mod tests {
                 max_matches: None,
             },
         )
-        .expect("unrestricted OS mode should not reject filesystem roots as protected paths");
+        .expect_err("protected filesystem root must remain denied");
 
-        assert_eq!(stat["operation"], "stat");
+        assert!(error.contains("denied protected OS path"), "unexpected error: {error}");
     }
 
     #[test]

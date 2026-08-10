@@ -2697,7 +2697,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
     crate::feature_rollout_maturity::validate_builtin_feature_rollout_maturity_matrix()?;
     if !process_runner_path_access_mode_explicit {
         tool_call.process_runner.path_access_mode =
-            legacy_process_runner_path_access_mode(&tool_call.process_runner, deployment.mode);
+            legacy_process_runner_path_access_mode(&tool_call.process_runner);
     }
     reconcile_tool_call_profiles(&mut tool_call)?;
     // Anchor relative storage paths against the state root only now, after
@@ -5258,31 +5258,18 @@ fn parse_process_runner_tier(raw: &str, source_name: &str) -> Result<SandboxProc
 
 fn parse_process_runner_path_access_mode(raw: &str, source_name: &str) -> Result<PathAccessMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "unrestricted_os" | "unrestricted-os" | "unrestricted" => {
-            Ok(PathAccessMode::UnrestrictedOs)
-        }
+        // Legacy aliases remain loadable, but no longer grant raw host access.
+        "unrestricted_os" | "unrestricted-os" | "unrestricted" => Ok(PathAccessMode::ApprovedRoots),
         "approved_roots" | "approved-roots" | "host_access" | "host-access" => {
             Ok(PathAccessMode::ApprovedRoots)
         }
         "workspace_only" | "workspace-only" | "workspace" => Ok(PathAccessMode::WorkspaceOnly),
-        _ => anyhow::bail!(
-            "{source_name} must be one of: unrestricted_os, approved_roots, workspace_only"
-        ),
+        _ => anyhow::bail!("{source_name} must be one of: approved_roots, workspace_only"),
     }
 }
 
-fn legacy_process_runner_path_access_mode(
-    config: &ProcessRunnerConfig,
-    deployment_mode: DeploymentMode,
-) -> PathAccessMode {
+fn legacy_process_runner_path_access_mode(config: &ProcessRunnerConfig) -> PathAccessMode {
     let host_wildcard = config.allowed_executables.iter().any(|allowed| allowed.trim() == "*");
-    if matches!(deployment_mode, DeploymentMode::LocalDesktop)
-        && matches!(config.tier, SandboxProcessRunnerTier::B)
-        && matches!(config.egress_enforcement_mode, EgressEnforcementMode::None)
-        && host_wildcard
-    {
-        return PathAccessMode::UnrestrictedOs;
-    }
     if matches!(config.tier, SandboxProcessRunnerTier::B)
         && matches!(config.egress_enforcement_mode, EgressEnforcementMode::None)
         && host_wildcard
@@ -8924,8 +8911,8 @@ state_dir = "browserd-state"
                 "unrestricted_os",
                 "tool_call.process_runner.path_access_mode",
             )
-            .expect("unrestricted mode should parse"),
-            PathAccessMode::UnrestrictedOs
+            .expect("legacy unrestricted alias should parse"),
+            PathAccessMode::ApprovedRoots
         );
         assert_eq!(
             parse_process_runner_path_access_mode(
@@ -8946,7 +8933,7 @@ state_dir = "browserd-state"
     }
 
     #[test]
-    fn legacy_local_wildcard_process_runner_defaults_to_unrestricted_os_paths() {
+    fn legacy_wildcard_process_runner_defaults_to_approved_roots() {
         let config = ProcessRunnerConfig {
             enabled: true,
             allowed_executables: vec!["*".to_owned()],
@@ -8955,14 +8942,7 @@ state_dir = "browserd-state"
             ..ProcessRunnerConfig::default()
         };
 
-        assert_eq!(
-            legacy_process_runner_path_access_mode(&config, DeploymentMode::LocalDesktop),
-            PathAccessMode::UnrestrictedOs
-        );
-        assert_eq!(
-            legacy_process_runner_path_access_mode(&config, DeploymentMode::RemoteVps),
-            PathAccessMode::ApprovedRoots
-        );
+        assert_eq!(legacy_process_runner_path_access_mode(&config), PathAccessMode::ApprovedRoots);
     }
 
     #[test]

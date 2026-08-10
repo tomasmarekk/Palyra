@@ -12985,7 +12985,7 @@ async fn start_registered_background_process_for_reconciliation_test(
     tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
     tool_call.process_runner.allowed_executables = vec![command.to_owned()];
     tool_call.process_runner.path_access_mode =
-        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+        crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
     let session_id = Ulid::new().to_string();
@@ -13350,22 +13350,32 @@ async fn target_pid_cannot_select_or_create_local_committed_lease() {
 #[cfg(not(target_os = "macos"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn post_launch_registration_failure_performs_exact_synchronous_cleanup() {
+    let workspace = gateway_tempdir("run-registration-failure-");
     #[cfg(windows)]
-    let executed_marker_dir = gateway_tempdir("run-registration-failure-marker-");
+    let executed_marker = workspace.path().join("registration-failure-executed.marker");
     #[cfg(windows)]
-    let executed_marker = executed_marker_dir.path().join("registration-failure-executed.marker");
+    let marker_script = workspace.path().join("registration-failure.ps1");
     #[cfg(windows)]
-    let marker_command = format!(
-        "New-Item -ItemType File -Force -Path '{}' | Out-Null; Start-Sleep -Seconds 60",
-        executed_marker.to_string_lossy().replace('\'', "''")
+    fs::write(
+        marker_script.as_path(),
+        format!(
+            "New-Item -ItemType File -Force -Path '{}' | Out-Null; Start-Sleep -Seconds 60",
+            executed_marker.to_string_lossy().replace('\'', "''")
+        ),
+    )
+    .expect("registration failure marker script should be written");
+    #[cfg(windows)]
+    let (command, args) = (
+        "powershell.exe",
+        vec![
+            "-NoProfile".to_owned(),
+            "-File".to_owned(),
+            marker_script.to_string_lossy().into_owned(),
+        ],
     );
-    #[cfg(windows)]
-    let (command, args) =
-        ("powershell.exe", vec!["-NoProfile".to_owned(), "-Command".to_owned(), marker_command]);
     #[cfg(not(windows))]
     let (command, args) = ("sleep", vec!["60".to_owned()]);
 
-    let workspace = gateway_tempdir("run-registration-failure-");
     let mut tool_call = default_test_tool_call_config();
     tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
     tool_call.execution_timeout_ms = 180_000;
@@ -13377,7 +13387,7 @@ async fn post_launch_registration_failure_performs_exact_synchronous_cleanup() {
     tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
     tool_call.process_runner.allowed_executables = vec![command.to_owned()];
     tool_call.process_runner.path_access_mode =
-        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+        crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
     let session_id = Ulid::new().to_string();
@@ -13492,7 +13502,7 @@ async fn terminal_cleanup_waits_for_durable_process_publication() {
     tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
     tool_call.process_runner.allowed_executables = vec![command.to_owned()];
     tool_call.process_runner.path_access_mode =
-        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+        crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
     let session_id = Ulid::new().to_string();
@@ -13656,7 +13666,7 @@ async fn registration_and_synchronous_cleanup_failure_transfers_exact_authority_
     tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
     tool_call.process_runner.allowed_executables = vec![command.to_owned()];
     tool_call.process_runner.path_access_mode =
-        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+        crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
     let session_id = Ulid::new().to_string();
@@ -13777,7 +13787,7 @@ async fn failed_run_finalization_cleans_run_owned_process_tracking() {
     tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
     tool_call.process_runner.allowed_executables = vec![command.to_owned()];
     tool_call.process_runner.path_access_mode =
-        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+        crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
     let session_id = Ulid::new().to_string();
@@ -13908,7 +13918,7 @@ async fn durable_process_cleanup_finalization_retries_after_failure() {
     tool_call.process_runner.workspace_root = workspace.path().to_path_buf();
     tool_call.process_runner.allowed_executables = vec![command.to_owned()];
     tool_call.process_runner.path_access_mode =
-        crate::sandbox_runner::PathAccessMode::UnrestrictedOs;
+        crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
     let session_id = Ulid::new().to_string();

@@ -8,8 +8,7 @@
 //! - Tier C delegates isolation planning to the `palyra-sandbox` backend planners
 //!   ([`build_tier_c_command_plan`]) and fails closed when the compiled backend cannot enforce
 //!   the requested network isolation.
-//! - Host path access is explicit: `unrestricted_os` keeps the workspace as a convenience alias
-//!   only, while `approved_roots` keeps the previous user-owned-root guardrail.
+//! - Host path access is explicit and limited to the workspace plus approved user-owned roots.
 //!
 //! Every validation failure here is a deny-by-default security decision. Error message strings
 //! are pinned by tests and critical attack-scenario fixtures; do not reword them casually.
@@ -242,8 +241,6 @@ impl SandboxProcessRunnerTier {
 /// Path validation posture for process-runner host fields and runtime arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathAccessMode {
-    /// Treat workspace paths as convenience aliases and otherwise allow OS paths.
-    UnrestrictedOs,
     /// Allow only the workspace and explicitly approved user-owned OS roots.
     ApprovedRoots,
     /// Confine process paths to the configured workspace root.
@@ -255,7 +252,6 @@ impl PathAccessMode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::UnrestrictedOs => "unrestricted_os",
             Self::ApprovedRoots => "approved_roots",
             Self::WorkspaceOnly => "workspace_only",
         }
@@ -1157,11 +1153,6 @@ pub(crate) fn spawn_sandboxed_managed_stdio_process(
     let host_access_path_env = process_runner_accepts_host_path_fields(policy)
         .then(|| host_access_path_env_for_input(&input));
     let working_directory = match path_access_mode {
-        PathAccessMode::UnrestrictedOs => resolve_unrestricted_working_directory(
-            workspace_root.as_path(),
-            input.cwd.as_deref(),
-            host_access_path_env.as_ref().expect("host path env should be initialized"),
-        )?,
         PathAccessMode::ApprovedRoots => resolve_host_working_directory_with_roots(
             workspace_root.as_path(),
             input.cwd.as_deref(),
@@ -1181,7 +1172,6 @@ pub(crate) fn spawn_sandboxed_managed_stdio_process(
     );
     validate_supported_target_runtime(&process_risk)?;
     match path_access_mode {
-        PathAccessMode::UnrestrictedOs => {}
         PathAccessMode::ApprovedRoots => {
             let roots = host_access_roots.as_ref().expect("host roots should be initialized");
             let path_env =
@@ -3092,11 +3082,6 @@ pub(crate) fn run_constrained_process_with_fault_injection(
     let host_access_path_env = process_runner_accepts_host_path_fields(policy)
         .then(|| host_access_path_env_for_input(&input));
     let working_directory = match path_access_mode {
-        PathAccessMode::UnrestrictedOs => resolve_unrestricted_working_directory(
-            workspace_root.as_path(),
-            input.cwd.as_deref(),
-            host_access_path_env.as_ref().expect("host path env should be initialized"),
-        )?,
         PathAccessMode::ApprovedRoots => resolve_host_working_directory_with_roots(
             workspace_root.as_path(),
             input.cwd.as_deref(),
@@ -3116,7 +3101,6 @@ pub(crate) fn run_constrained_process_with_fault_injection(
     );
     validate_supported_target_runtime(&process_risk)?;
     match path_access_mode {
-        PathAccessMode::UnrestrictedOs => {}
         PathAccessMode::ApprovedRoots => {
             let host_access_roots =
                 host_access_roots.as_ref().expect("host roots should be initialized");
@@ -4075,7 +4059,6 @@ fn execute_builtin_process_command(
         _ => {}
     }
 
-    let path_access_mode = process_runner_effective_path_access_mode(policy);
     let stdout = match command.to_ascii_lowercase().as_str() {
         "pwd" => {
             if !input.args.is_empty() {
@@ -4088,14 +4071,12 @@ fn execute_builtin_process_command(
         }
         "echo" => StreamCapture::from_text(format!("{}\n", input.args.join(" "))),
         "ls" | "dir" => StreamCapture::from_text(builtin_list_directory_stdout(
-            path_access_mode,
             command,
             input.args.as_slice(),
             workspace_root,
             cwd,
         )?),
         "cat" | "type" => builtin_read_files_stdout(
-            path_access_mode,
             command,
             input.args.as_slice(),
             workspace_root,
@@ -4103,7 +4084,6 @@ fn execute_builtin_process_command(
             policy.max_output_bytes,
         )?,
         "mkdir" => StreamCapture::from_text(builtin_make_directory_stdout(
-            path_access_mode,
             command,
             input.args.as_slice(),
             workspace_root,
@@ -5215,7 +5195,6 @@ fn parse_builtin_pid_arg(command: &str, args: &[String]) -> Result<u32, SandboxP
 }
 
 fn builtin_read_files_stdout(
-    path_access_mode: PathAccessMode,
     command: &str,
     args: &[String],
     workspace_root: &Path,
@@ -5261,8 +5240,7 @@ fn builtin_read_files_stdout(
             truncated = true;
             break;
         }
-        let file_path =
-            resolve_builtin_process_path(path_access_mode, workspace_root, cwd, path, true)?;
+        let file_path = resolve_scoped_path(workspace_root, cwd, path, true)?;
         if !file_path.is_file() {
             return Err(SandboxProcessRunError {
                 kind: SandboxProcessRunErrorKind::InvalidInput,
@@ -5308,19 +5286,12 @@ fn builtin_read_files_stdout(
 }
 
 fn builtin_list_directory_stdout(
-    path_access_mode: PathAccessMode,
     command: &str,
     args: &[String],
     workspace_root: &Path,
     cwd: &Path,
 ) -> Result<String, SandboxProcessRunError> {
-    let target = resolve_builtin_list_directory_target(
-        path_access_mode,
-        command,
-        args,
-        workspace_root,
-        cwd,
-    )?;
+    let target = resolve_builtin_list_directory_target(command, args, workspace_root, cwd)?;
     let mut names = Vec::new();
     let mut truncated = false;
     let entries = fs::read_dir(target.as_path()).map_err(|error| SandboxProcessRunError {
@@ -5359,7 +5330,6 @@ fn builtin_list_directory_stdout(
 }
 
 fn resolve_builtin_list_directory_target(
-    path_access_mode: PathAccessMode,
     command: &str,
     args: &[String],
     workspace_root: &Path,
@@ -5382,7 +5352,7 @@ fn resolve_builtin_list_directory_target(
     }
 
     let raw = target.unwrap_or(".");
-    let canonical = resolve_builtin_process_path(path_access_mode, workspace_root, cwd, raw, true)?;
+    let canonical = resolve_scoped_path(workspace_root, cwd, raw, true)?;
     if !canonical.is_dir() {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::InvalidInput,
@@ -5403,7 +5373,6 @@ fn is_builtin_list_flag(arg: &str) -> bool {
 }
 
 fn builtin_make_directory_stdout(
-    path_access_mode: PathAccessMode,
     command: &str,
     args: &[String],
     workspace_root: &Path,
@@ -5441,8 +5410,7 @@ fn builtin_make_directory_stdout(
 
     let mut created = Vec::new();
     for directory in directories {
-        let target =
-            resolve_builtin_process_path(path_access_mode, workspace_root, cwd, directory, false)?;
+        let target = resolve_scoped_path(workspace_root, cwd, directory, false)?;
         if parents {
             fs::create_dir_all(target.as_path()).map_err(|error| SandboxProcessRunError {
                 kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -5464,19 +5432,6 @@ fn builtin_make_directory_stdout(
     }
 
     Ok(format!("{}\n", created.join("\n")))
-}
-
-fn resolve_builtin_process_path(
-    path_access_mode: PathAccessMode,
-    workspace_root: &Path,
-    cwd: &Path,
-    raw: &str,
-    must_exist: bool,
-) -> Result<PathBuf, SandboxProcessRunError> {
-    if matches!(path_access_mode, PathAccessMode::UnrestrictedOs) {
-        return resolve_unrestricted_host_path(workspace_root, cwd, raw, must_exist);
-    }
-    resolve_scoped_path(workspace_root, cwd, raw, must_exist)
 }
 
 fn parse_process_runner_input(
@@ -6497,32 +6452,6 @@ fn resolve_host_working_directory_with_roots(
     Ok(resolved)
 }
 
-fn resolve_unrestricted_working_directory(
-    workspace_root: &Path,
-    cwd: Option<&str>,
-    path_env: &BTreeMap<String, PathBuf>,
-) -> Result<PathBuf, SandboxProcessRunError> {
-    let cwd_value = cwd.unwrap_or(".");
-    if cwd_value.contains('\0') {
-        return Err(SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: "host process runner denied cwd with embedded NUL byte".to_owned(),
-        });
-    }
-    let expanded_cwd = expand_host_access_safe_env_path(cwd_value, path_env)?;
-    let resolved_cwd = expanded_cwd.as_ref().map(|path| path.to_string_lossy().to_string());
-    let cwd_for_resolution = resolved_cwd.as_deref().unwrap_or(cwd_value);
-    let resolved =
-        resolve_unrestricted_host_path(workspace_root, workspace_root, cwd_for_resolution, true)?;
-    if !resolved.is_dir() {
-        return Err(SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: format!("host process runner cwd '{}' is not a directory", cwd_value),
-        });
-    }
-    Ok(resolved)
-}
-
 fn resolve_working_directory(
     workspace_root: &Path,
     cwd: Option<&str>,
@@ -7238,64 +7167,6 @@ fn resolve_host_access_path_with_roots(
     }
 }
 
-fn resolve_unrestricted_host_path(
-    workspace_root: &Path,
-    base: &Path,
-    raw: &str,
-    must_exist: bool,
-) -> Result<PathBuf, SandboxProcessRunError> {
-    if let Some(suffix) = virtual_workspace_path_suffix(raw) {
-        return resolve_scoped_path(
-            workspace_root,
-            workspace_root,
-            suffix.to_string_lossy().as_ref(),
-            must_exist,
-        );
-    }
-    if raw.contains('\0') {
-        return Err(SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: "host process runner denied path with embedded NUL byte".to_owned(),
-        });
-    }
-    let raw_path = Path::new(raw);
-    let candidate = if raw_path.is_absolute() { PathBuf::from(raw) } else { base.join(raw) };
-    if candidate.exists() {
-        return fs::canonicalize(candidate.as_path()).map_err(|error| SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: format!(
-                "host process runner denied invalid path '{}': {error}",
-                candidate.display()
-            ),
-        });
-    }
-    if must_exist {
-        return Err(SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: format!(
-                "host process runner required path '{}' does not exist",
-                candidate.display()
-            ),
-        });
-    }
-    Ok(normalize_host_path_lexically(candidate.as_path()))
-}
-
-fn normalize_host_path_lexically(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir | Component::Normal(_) => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
-}
-
 fn ensure_host_access_path_allowed(
     workspace_root: &Path,
     inspected: &Path,
@@ -7478,21 +7349,6 @@ fn resolve_process_prepend_path_entries(
         return Ok(Vec::new());
     }
     match process_runner_effective_path_access_mode(policy) {
-        PathAccessMode::UnrestrictedOs => {
-            let path_env = host_access_path_env_for_input(input);
-            return input
-                .prepend_path
-                .iter()
-                .map(|path| {
-                    let expanded = expand_host_access_safe_env_path(path.as_str(), &path_env)?;
-                    let resolved_path =
-                        expanded.as_ref().map(|path| path.to_string_lossy().to_string());
-                    let raw = resolved_path.as_deref().unwrap_or(path.as_str());
-                    let resolved = resolve_unrestricted_host_path(workspace_root, cwd, raw, true)?;
-                    require_prepend_path_directory(path.as_str(), resolved)
-                })
-                .collect();
-        }
         PathAccessMode::ApprovedRoots => {
             let host_roots = host_access_roots();
             let path_env = host_access_path_env_for_input(input);
@@ -11616,7 +11472,6 @@ fn build_process_command(
     cwd: &Path,
 ) -> Result<Command, SandboxProcessRunError> {
     let prepend_path = resolve_process_prepend_path_entries(policy, input, workspace_root, cwd)?;
-    let path_access_mode = process_runner_effective_path_access_mode(policy);
     let allow_cwd_resolution = process_runner_allows_cwd_process_resolution(policy);
     // Unix supervisors freeze an immutable launch spec before durable registration, so a
     // background target cannot defer executable resolution until exec.
@@ -11624,31 +11479,18 @@ fn build_process_command(
     if process_runner_allows_host_access(policy) {
         let host_roots = host_access_roots();
         let trusted_path = host_access_path();
-        let program = if matches!(path_access_mode, PathAccessMode::UnrestrictedOs) {
-            resolve_tier_b_process_program(
-                input.command.as_str(),
-                cwd,
-                OsStr::new(&trusted_path),
-                require_trusted_resolution,
-                allow_cwd_resolution,
-            )?
-        } else {
-            resolve_host_process_program_with_roots(
-                workspace_root,
-                cwd,
-                input.command.as_str(),
-                host_roots.as_slice(),
-                OsStr::new(&trusted_path),
-                require_trusted_resolution,
-                allow_cwd_resolution,
-            )?
-        };
-        let args = if matches!(path_access_mode, PathAccessMode::UnrestrictedOs) {
-            input.args.clone()
-        } else {
-            let path_env = host_access_path_env_for_input(input);
-            rewrite_host_access_process_args(input.args.as_slice(), workspace_root, &path_env)?
-        };
+        let program = resolve_host_process_program_with_roots(
+            workspace_root,
+            cwd,
+            input.command.as_str(),
+            host_roots.as_slice(),
+            OsStr::new(&trusted_path),
+            require_trusted_resolution,
+            allow_cwd_resolution,
+        )?;
+        let path_env = host_access_path_env_for_input(input);
+        let args =
+            rewrite_host_access_process_args(input.args.as_slice(), workspace_root, &path_env)?;
         let mut command = build_tier_b_process_command(program.as_path(), args.as_slice(), cwd)?;
         configure_host_access_process_environment(
             &mut command,
@@ -11662,11 +11504,12 @@ fn build_process_command(
         return Ok(command);
     }
 
-    let scoped_args = if matches!(path_access_mode, PathAccessMode::UnrestrictedOs) {
-        input.args.clone()
-    } else {
-        rewrite_arguments_to_scoped_paths(workspace_root, cwd, input.command.as_str(), &input.args)?
-    };
+    let scoped_args = rewrite_arguments_to_scoped_paths(
+        workspace_root,
+        cwd,
+        input.command.as_str(),
+        &input.args,
+    )?;
 
     if matches!(policy.tier, SandboxProcessRunnerTier::C) {
         let tier_c_policy = TierCPolicy {
@@ -12960,13 +12803,13 @@ mod tests {
         process_watch_events_projection, redacted_process_output_preview,
         redacted_process_output_text, resolve_host_executable_path_with_roots,
         resolve_host_working_directory, resolve_host_working_directory_with_roots,
-        resolve_scoped_path, resolve_unrestricted_working_directory, resolve_working_directory,
-        rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
-        rewrite_host_virtual_workspace_args, run_constrained_process,
-        run_constrained_process_with_fault_injection, same_path_case_aware,
-        tier_c_plan_inner_path_index, user_owned_host_roots, validate_argument_workspace_scope,
-        validate_cmd_invocation_shape, validate_host_argument_scope,
-        validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
+        resolve_scoped_path, resolve_working_directory, rewrite_arguments_to_scoped_paths,
+        rewrite_host_access_process_args, rewrite_host_virtual_workspace_args,
+        run_constrained_process, run_constrained_process_with_fault_injection,
+        same_path_case_aware, tier_c_plan_inner_path_index, user_owned_host_roots,
+        validate_argument_workspace_scope, validate_cmd_invocation_shape,
+        validate_host_argument_scope, validate_host_argument_scope_with_roots,
+        validate_host_interpreter_argument_guardrails,
         validate_host_interpreter_argument_guardrails_with_roots, validate_input_shape,
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
         validate_process_env_overrides, validate_process_prepend_path_shape,
@@ -13676,12 +13519,6 @@ mod tests {
         policy
     }
 
-    fn unrestricted_os_policy(workspace_root: PathBuf) -> SandboxProcessRunnerPolicy {
-        let mut policy = host_access_policy(workspace_root);
-        policy.path_access_mode = PathAccessMode::UnrestrictedOs;
-        policy
-    }
-
     fn unique_temp_dir(suffix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -13882,79 +13719,6 @@ mod tests {
     }
 
     #[test]
-    fn process_run_unrestricted_does_not_validate_container_args() {
-        let workspace = unique_temp_dir("workspace-unrestricted-docker-args");
-        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
-        let canonical_workspace = canonical_workspace_root(workspace.as_path())
-            .expect("workspace root should canonicalize");
-        let policy = unrestricted_os_policy(canonical_workspace.clone());
-        let input = process_runner_input(
-            "docker",
-            &["exec", "my-container", "ls", "-la", "/app", "/tmp", "/usr/local/bin", "/dev/null"],
-            None,
-        );
-
-        let command = build_process_command(
-            &policy,
-            &input,
-            canonical_workspace.as_path(),
-            canonical_workspace.as_path(),
-        )
-        .expect("unrestricted mode should not treat container args as host paths");
-
-        let args =
-            command.get_args().map(|arg| arg.to_string_lossy().to_string()).collect::<Vec<_>>();
-        assert_eq!(args, input.args);
-        let _ = fs::remove_dir_all(workspace.as_path());
-    }
-
-    #[test]
-    fn process_run_unrestricted_does_not_rewrite_workspace_arg_for_shell_payload() {
-        let workspace = unique_temp_dir("workspace-unrestricted-shell-payload");
-        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
-        let canonical_workspace = canonical_workspace_root(workspace.as_path())
-            .expect("workspace root should canonicalize");
-        let policy = unrestricted_os_policy(canonical_workspace.clone());
-        let input = process_runner_input("bash", &["-lc", "ls /workspace && ls /app"], None);
-
-        let command = build_process_command(
-            &policy,
-            &input,
-            canonical_workspace.as_path(),
-            canonical_workspace.as_path(),
-        )
-        .expect("unrestricted mode should preserve shell payload arguments");
-
-        let args =
-            command.get_args().map(|arg| arg.to_string_lossy().to_string()).collect::<Vec<_>>();
-        assert_eq!(args, input.args);
-        let _ = fs::remove_dir_all(workspace.as_path());
-    }
-
-    #[test]
-    fn process_run_unrestricted_allows_parent_components_after_normalization() {
-        let workspace = unique_temp_dir("workspace-unrestricted-parent-cwd");
-        let repo = workspace.join("repo");
-        let scripts = workspace.join("scripts");
-        fs::create_dir_all(repo.as_path()).expect("repo directory should be created");
-        fs::create_dir_all(scripts.as_path()).expect("scripts directory should be created");
-        let canonical_workspace = canonical_workspace_root(workspace.as_path())
-            .expect("workspace root should canonicalize");
-        let canonical_scripts =
-            fs::canonicalize(scripts.as_path()).expect("scripts directory should canonicalize");
-
-        let resolved = resolve_unrestricted_working_directory(
-            canonical_workspace.as_path(),
-            Some("repo/../scripts"),
-            &BTreeMap::new(),
-        )
-        .expect("unrestricted mode should normalize parent components before validation");
-
-        assert_eq!(resolved, canonical_scripts);
-        let _ = fs::remove_dir_all(workspace.as_path());
-    }
-
-    #[test]
     fn host_access_allows_user_owned_script_argument() {
         let _guard = PROCESS_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -14137,7 +13901,6 @@ mod tests {
         let args = vec!["/".to_owned()];
 
         let output = builtin_list_directory_stdout(
-            PathAccessMode::WorkspaceOnly,
             "ls",
             args.as_slice(),
             canonical_workspace.as_path(),
@@ -14172,7 +13935,6 @@ mod tests {
         let args = vec!["-x".to_owned()];
 
         let error = builtin_list_directory_stdout(
-            PathAccessMode::WorkspaceOnly,
             "ls",
             args.as_slice(),
             canonical_workspace.as_path(),
@@ -14416,7 +14178,7 @@ mod tests {
                 canonical_workspace.clone(),
                 vec!["sh".to_owned()],
             ),
-            unrestricted_os_policy(canonical_workspace.clone()),
+            host_access_policy(canonical_workspace.clone()),
         ];
 
         for policy in policies {
@@ -16742,11 +16504,11 @@ mod tests {
         let workspace = unique_temp_dir("workspace-unix-background-registration-fence");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let marker = workspace.join("user-code-executed.marker");
-        let mut policy = unrestricted_os_policy(workspace.clone());
-        policy.allowed_executables = vec!["sh".to_owned()];
+        let mut policy = host_access_policy(workspace.clone());
+        policy.allowed_executables = vec!["touch".to_owned()];
         let input = serde_json::to_vec(&serde_json::json!({
-            "command": "sh",
-            "args": ["-c", format!("printf executed > '{}'", marker.display())],
+            "command": "touch",
+            "args": [marker.display().to_string()],
             "background": true,
             "timeout_ms": BACKGROUND_TEST_EXECUTION_TIMEOUT_MS
         }))
@@ -17112,7 +16874,7 @@ mod tests {
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let mut policy =
             sandbox_policy_with_allowed_executables(workspace.clone(), vec![command.to_owned()]);
-        policy.path_access_mode = PathAccessMode::UnrestrictedOs;
+        policy.path_access_mode = PathAccessMode::ApprovedRoots;
         policy.egress_enforcement_mode = EgressEnforcementMode::None;
         let input = serde_json::to_vec(&serde_json::json!({
             "command": command,
