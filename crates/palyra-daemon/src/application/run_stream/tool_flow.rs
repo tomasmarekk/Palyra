@@ -5035,13 +5035,13 @@ fn browser_observe_selector_capture_preview(
 }
 
 // Workspace read results that the read tool already scanned and marked clean
-// (redacted=false, non-binary) keep their text mostly intact in previews;
+// (redacted/binary omitted or false) keep their text mostly intact in previews;
 // re-running the aggressive secret heuristics would mangle benign source code.
 fn workspace_read_text_already_sanitized(tool_name: &str, value: &Value) -> bool {
     tool_name == crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME
         && value.get("text").is_some_and(Value::is_string)
-        && value.get("redacted").and_then(Value::as_bool) == Some(false)
-        && !value.get("binary").and_then(Value::as_bool).unwrap_or(false)
+        && matches!(value.get("redacted"), None | Some(Value::Bool(false)))
+        && matches!(value.get("binary"), None | Some(Value::Bool(false)))
 }
 
 fn redact_sensitive_json_value(value: &mut Value, redaction: ToolResultPreviewRedaction) {
@@ -6397,8 +6397,6 @@ mod tests {
             "eof": true,
             "chunk_sha256": "0".repeat(64),
             "text": "export const ok = true;\n",
-            "binary": false,
-            "redacted": false,
         }))
         .expect("test payload should serialize");
 
@@ -6435,8 +6433,17 @@ mod tests {
             "redacted": false,
         }))
         .expect("test payload should serialize");
+        let malformed_flags_output = serde_json::to_vec(&json!({
+            "path": "src/app.js",
+            "text": "export const ok = true;\n",
+            "binary": "false",
+            "redacted": "false",
+        }))
+        .expect("test payload should serialize");
 
-        for output_json in [redacted_output, binary_output, host_path_output] {
+        for output_json in
+            [redacted_output, binary_output, host_path_output, malformed_flags_output]
+        {
             assert_eq!(
                 super::tool_result_sensitivity(
                     crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME,
