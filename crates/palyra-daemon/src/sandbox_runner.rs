@@ -185,6 +185,7 @@ const DESKTOP_CONTROL_CENTER_STATE_DIR: &str = "desktop-control-center";
 const DESKTOP_RUNTIME_STATE_DIR: &str = "runtime";
 const PROCESS_RUNNER_TEMP_RELATIVE_PATH: &[&str] = &["process-runner", "tmp"];
 const PROCESS_RUNNER_PYTHON_ENV_RELATIVE_PATH: &[&str] = &["process-runner", "python-env"];
+const PROCESS_RUNNER_PYTHON_ENV_CREATE_ATTEMPTS: usize = 4;
 const PYTHON_USER_BASE_DIR: &str = "python-userbase";
 const PIP_CACHE_DIR: &str = "pip-cache";
 // URL path segments following one of these markers (e.g. a path like .../<marker>/<value>) are
@@ -11873,6 +11874,7 @@ fn configure_workspace_python_environment(
     command
         .env("PYTHONUSERBASE", environment.user_base)
         .env("PIP_CACHE_DIR", environment.pip_cache)
+        .env("PYTHONNOUSERSITE", "1")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1");
     Ok(())
 }
@@ -11902,11 +11904,46 @@ fn process_runner_python_environment_root(
     workspace_root: &Path,
 ) -> Result<PathBuf, SandboxProcessRunError> {
     let workspace_key = process_runner_workspace_cache_key(workspace_root);
-    Ok(join_relative_components(
-        process_runner_runtime_root()?.as_path(),
-        PROCESS_RUNNER_PYTHON_ENV_RELATIVE_PATH,
-    )
-    .join(workspace_key))
+    let mut environment_parent = process_runner_runtime_root()?;
+    ensure_private_process_runner_directory(environment_parent.as_path())?;
+    for component in PROCESS_RUNNER_PYTHON_ENV_RELATIVE_PATH
+        .iter()
+        .copied()
+        .chain(std::iter::once(workspace_key.as_str()))
+    {
+        environment_parent.push(component);
+        ensure_private_process_runner_directory(environment_parent.as_path())?;
+    }
+    for _ in 0..PROCESS_RUNNER_PYTHON_ENV_CREATE_ATTEMPTS {
+        let nonce = process_owner_nonce().map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "palyra.process.run failed to generate an isolated Python environment name: {error}"
+            ),
+        })?;
+        let environment_root = environment_parent.join(format!("run-{nonce}"));
+        match fs::create_dir(environment_root.as_path()) {
+            Ok(()) => {
+                ensure_private_process_runner_directory(environment_root.as_path())?;
+                return Ok(environment_root);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                    message: format!(
+                        "palyra.process.run failed to create isolated Python environment: {error}"
+                    ),
+                });
+            }
+        }
+    }
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message:
+            "palyra.process.run could not allocate a unique isolated Python environment directory"
+                .to_owned(),
+    })
 }
 
 fn process_runner_child_temp_root(
@@ -16139,6 +16176,9 @@ mod tests {
         let environment = super::workspace_python_environment("python", workspace.as_path())
             .expect("python environment should resolve under state root")
             .expect("python commands should receive workspace-local Python environment");
+        let next_environment = super::workspace_python_environment("python", workspace.as_path())
+            .expect("second Python environment should resolve under state root")
+            .expect("Python commands should receive an isolated environment");
 
         let expected_root = super::join_relative_components(
             state_root.as_path(),
@@ -16146,8 +16186,18 @@ mod tests {
         );
         assert!(environment.user_base.starts_with(expected_root.as_path()));
         assert!(environment.pip_cache.starts_with(expected_root.as_path()));
+        assert!(next_environment.user_base.starts_with(expected_root.as_path()));
         assert!(!environment.user_base.starts_with(workspace.as_path()));
         assert!(!environment.pip_cache.starts_with(workspace.as_path()));
+        assert_ne!(
+            environment.user_base.parent(),
+            next_environment.user_base.parent(),
+            "Python userbase roots must not be reused across process runs"
+        );
+        assert!(
+            environment.user_base.parent().is_some_and(Path::is_dir),
+            "isolated Python environment root must exist before spawn"
+        );
         assert_eq!(
             environment.user_base.file_name().and_then(|name| name.to_str()),
             Some(super::PYTHON_USER_BASE_DIR)
