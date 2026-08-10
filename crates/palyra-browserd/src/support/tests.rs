@@ -1,6 +1,7 @@
 //! Crate-internal integration tests for browserd: gRPC service flows, persistence, downloads,
 //! navigation guards, and redaction. Compiled via `#[path]` from `lib.rs`; uses parity fixtures.
 
+use super::chromium_security_incident_for_launch;
 use super::{
     action_log_entry_to_proto, browser_v1, build_accessibility_tree_snapshot, build_dom_snapshot,
     build_state_store_from_env, chromium_active_tab_for_session,
@@ -44,6 +45,7 @@ const PARITY_NETWORK_LOG_HTML: &str = include_str!("../../../../fixtures/parity/
 const PARITY_REDIRECT_TOKEN_URL: &str =
     include_str!("../../../../fixtures/parity/redirect-token-url.txt");
 const PARITY_TRICKY_DOM_HTML: &str = include_str!("../../../../fixtures/parity/tricky-dom.html");
+const CHROMIUM_ENGINE_SOURCE: &str = include_str!("../engine/chromium.rs");
 
 fn insert_bearer_auth<T>(request: &mut Request<T>, token: &str) {
     let value =
@@ -1326,6 +1328,52 @@ fn chromium_remote_ip_guard_records_incident_for_private_addresses() {
         .clone()
         .expect("private IPv6 response IP should record an incident");
     assert!(message.contains("::1"), "incident should include violating IPv6 address: {message}");
+}
+
+#[test]
+fn chromium_process_replacement_retains_pending_remote_ip_incidents() {
+    let incident = Arc::new(StdMutex::new(None::<String>));
+    let replacement = chromium_security_incident_for_launch(Some(&incident));
+
+    assert!(Arc::ptr_eq(&incident, &replacement));
+    record_chromium_remote_ip_incident(
+        Some("http://10.0.0.8/"),
+        Some("10.0.0.8"),
+        false,
+        &incident,
+    );
+    assert!(
+        replacement
+            .lock()
+            .expect("replacement incident guard")
+            .as_deref()
+            .is_some_and(|reason| reason.contains("10.0.0.8")),
+        "replacement runtime must observe incidents recorded through the prior runtime"
+    );
+
+    let fresh = chromium_security_incident_for_launch(None);
+    assert!(fresh.lock().expect("fresh incident guard").is_none());
+}
+
+#[test]
+fn chromium_process_reconnect_enforces_incidents_around_launch() {
+    let reconnect = CHROMIUM_ENGINE_SOURCE
+        .split_once("async fn reconnect_chromium_process_runtime(")
+        .map(|(_, source)| source)
+        .and_then(|source| {
+            source.split_once("/// Looks up the live tab handle").map(|(body, _)| body)
+        })
+        .expect("Chromium process reconnect body");
+    let launch =
+        reconnect.find("launch_chromium_session_runtime(").expect("Chromium replacement launch");
+    let guard_checks = reconnect
+        .match_indices("enforce_chromium_remote_ip_guard(runtime, session_id).await?;")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    assert_eq!(guard_checks.len(), 2, "process reconnect must enforce exactly around replacement");
+    assert!(guard_checks[0] < launch, "pending incidents must terminate before replacement launch");
+    assert!(guard_checks[1] > launch, "incidents racing replacement must terminate before success");
 }
 
 #[test]

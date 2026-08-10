@@ -1850,6 +1850,14 @@ pub(crate) fn record_chromium_remote_ip_incident(
     }
 }
 
+/// Reuses the incident cell when a Chromium process is replaced so a response
+/// recorded by the old process cannot disappear during reconnect.
+pub(crate) fn chromium_security_incident_for_launch(
+    existing: Option<&Arc<std::sync::Mutex<Option<String>>>>,
+) -> Arc<std::sync::Mutex<Option<String>>> {
+    existing.cloned().unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None::<String>)))
+}
+
 /// Returns true when a loopback remote IP is just the local SOCKS5 proxy hop
 /// for an otherwise policy-clean response URL.
 pub(crate) fn chromium_loopback_remote_ip_is_expected_proxy_hop(
@@ -2160,7 +2168,12 @@ async fn launch_chromium_session_runtime(
     let proxy = ChromiumSessionProxy::spawn(allow_private_targets).await?;
     let proxy_uri = proxy.proxy_uri.clone();
     let private_target_policy = proxy.private_target_policy();
-    let security_incident = Arc::new(std::sync::Mutex::new(None::<String>));
+    let security_incident = {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        chromium_security_incident_for_launch(
+            chromium_sessions.get(session_id).map(|session| &session.security_incident),
+        )
+    };
     let mut chromium_session =
         run_chromium_blocking("chromium session initialization", move || {
             let profile_dir = tempfile::Builder::new()
@@ -2772,6 +2785,7 @@ async fn reconnect_chromium_process_runtime(
     session_id: &str,
     tab_id: &str,
 ) -> Result<Arc<HeadlessTab>, String> {
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     let session = {
         let sessions = runtime.sessions.lock().await;
         sessions.get(session_id).cloned().ok_or_else(|| "session_not_found".to_owned())?
@@ -2788,6 +2802,7 @@ async fn reconnect_chromium_process_runtime(
         }
         return Err(format!("chromium process reconnect failed: {error}"));
     }
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     if let Ok(mut health) = health.lock() {
         health.mark_process_reconnected();
     }
