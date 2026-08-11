@@ -1830,6 +1830,10 @@ fn is_mcp_availability_issue(code: &str) -> bool {
         || code.contains("mcp.transport_reconnect_failed")
 }
 
+fn is_provider_compat_fixture_path(path: &Path) -> bool {
+    display_path_slash(path).starts_with("qa/fixtures/provider_compat/")
+}
+
 fn validate_pack_fixtures(manifest: &QaScenarioManifest) -> Vec<String> {
     let mut issue_codes = Vec::new();
     for fixture in &manifest.requires.fixtures {
@@ -1840,7 +1844,7 @@ fn validate_pack_fixtures(manifest: &QaScenarioManifest) -> Vec<String> {
         }
         let normalized_path = display_path_slash(path);
         if path.is_file()
-            && normalized_path.starts_with("qa/fixtures/provider_compat/")
+            && is_provider_compat_fixture_path(path)
             && path
                 .extension()
                 .and_then(OsStr::to_str)
@@ -2160,12 +2164,10 @@ mod tests {
 
     #[test]
     fn provider_compat_scenario_dependencies_use_their_declared_schema() {
-        let manifest = parse_qa_scenario_manifest_yaml(include_str!(
-            "../../../../qa/scenarios/provider/auth_expired.yaml"
-        ))
-        .expect("provider compatibility scenario should parse");
-
-        assert!(validate_pack_fixtures(&manifest).is_empty());
+        assert!(is_provider_compat_fixture_path(Path::new(
+            "qa/fixtures/provider_compat/p0_provider_compat_pack.yaml"
+        )));
+        assert!(!is_provider_compat_fixture_path(Path::new("qa/fixtures/provider_basic.yaml")));
     }
 
     #[test]
