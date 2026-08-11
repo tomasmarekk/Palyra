@@ -1451,7 +1451,7 @@ mod tests {
 
             let report = sanitize_outbound_message(&message);
 
-            assert_eq!(report.sanitized_text, format!("safe prefix\n{replacement}"));
+            assert_eq!(report.sanitized_text, format!("safe prefix {replacement}"));
             assert!(!report.sanitized_text.contains(body));
             assert!(report.audit_event.reason_codes.contains(&reason.to_owned()));
         }
