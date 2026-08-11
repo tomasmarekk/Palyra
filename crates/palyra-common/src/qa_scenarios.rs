@@ -3756,13 +3756,13 @@ timeout:
             .replace("schema_version: 2", "schema_version: 4")
             .replace(
             "\nartifacts: []\n",
-            "\nartifacts:\n  - path: src/fault-once.txt\n    kind: workspace\n    required: true\n",
+            "\nartifacts:\n  - path: qa/fixtures/fault-once.txt\n    kind: workspace\n    required: true\n",
         );
         let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
             .expect("schema-v4 workspace artifact should parse");
 
         assert_eq!(manifest.artifacts.len(), 1);
-        assert_eq!(manifest.artifacts[0].path, "src/fault-once.txt");
+        assert_eq!(manifest.artifacts[0].path, "qa/fixtures/fault-once.txt");
         assert_eq!(manifest.artifacts[0].kind, QaScenarioArtifactKind::Workspace);
     }
 
