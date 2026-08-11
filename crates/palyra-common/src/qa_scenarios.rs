@@ -3622,9 +3622,10 @@ timeout:
 
     #[test]
     fn rejects_min_counts_that_would_expand_unbounded_preview_evidence() {
-        let event = V2_FIXTURE_SCENARIO.replace(
+        let event = V2_FIXTURE_SCENARIO.replacen(
             "  events: []",
-            "  events:\n    - event_type: qa.event\n      min_count: 4294967295",
+            "  events:\n    - event_type: qa.event\n      min_count: 4097",
+            1,
         );
         assert_validation_issue(
             event.as_str(),
@@ -3632,9 +3633,10 @@ timeout:
             "expected_min_count_out_of_range",
         );
 
-        let tool_call = V2_FIXTURE_SCENARIO.replace(
+        let tool_call = V2_FIXTURE_SCENARIO.replacen(
             "  tool_calls: []",
-            "  tool_calls:\n    - name: palyra.fs.read_file\n      min_count: 4294967295",
+            "  tool_calls:\n    - name: palyra.fs.read_file\n      min_count: 4097",
+            1,
         );
         assert_validation_issue(
             tool_call.as_str(),
