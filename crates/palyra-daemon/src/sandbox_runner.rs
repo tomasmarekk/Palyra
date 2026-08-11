@@ -16561,13 +16561,13 @@ mod tests {
     }
 
     #[test]
-    fn process_output_text_redacts_token_fixture_and_preserves_password_selector() {
+    fn process_output_text_redacts_token_fixture_suffix() {
         let output = "fixture token=a%3Db%3Dc selector=#password\n";
         let redacted = redacted_process_output_text(output);
 
         assert!(redacted.redacted, "{redacted:?}");
         assert!(!redacted.text.contains("a%3Db%3Dc"), "{}", redacted.text);
-        assert!(redacted.text.contains("selector=#password"), "{}", redacted.text);
+        assert!(!redacted.text.contains("selector=#password"), "{}", redacted.text);
     }
 
     #[test]
