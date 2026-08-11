@@ -78,11 +78,13 @@ jobs:
 
       - name: Build QA daemon runtime for integration tests
         if: matrix.mode == 'test'
-        run: cargo build -p palyra-daemon --bin palyrad --locked
+        # The package override in Cargo.toml wins over CARGO_PROFILE_DEV_DEBUG.
+        run: cargo --config profile.dev.package.palyra-daemon.debug=0 build -p palyra-daemon --bin palyrad --locked
 
       - name: Cargo test
         if: matrix.mode != 'build'
-        run: cargo test --workspace --locked
+        # Keep the full test graph while avoiding debug data for the largest crate.
+        run: cargo --config profile.test.package.palyra-daemon.debug=0 test --workspace --locked
 
       - name: Coding runtime warm-LSP soak (Unix)
         if: ${{ matrix.mode != 'build' && runner.os != 'Windows' }}
