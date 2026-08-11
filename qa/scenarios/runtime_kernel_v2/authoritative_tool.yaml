@@ -26,6 +26,10 @@ steps:
   - id: prompt
     action: user_prompt
     prompt: "Inspect the authoritative V2 workspace."
+  - id: approve_read
+    action: approval_decision
+    proposal_id: qa-v2-read
+    decision: allow
 expect:
   terminal_state: completed
   final_answer:
@@ -36,6 +40,8 @@ expect:
     - event_type: status
       min_count: 1
     - event_type: tool.call.started
+      min_count: 1
+    - event_type: approval.required
       min_count: 1
     - event_type: tool.call.completed
       min_count: 1
@@ -60,7 +66,6 @@ forbidden:
   tool_calls:
     - palyra.fs.apply_patch
   events:
-    - approval.required
     - run.failed
     - run.cancelled
     - runtime.shadow.differential

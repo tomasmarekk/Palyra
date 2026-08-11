@@ -26,12 +26,18 @@ steps:
   - id: prompt
     action: user_prompt
     prompt: "Inspect the QA workspace fixture with the read-only tool."
+  - id: approve_read
+    action: approval_decision
+    proposal_id: qa-real-read
+    decision: allow
 expect:
   terminal_state: completed
   final_answer:
     equals: "The workspace fixture contains initial sandbox content."
   events:
     - event_type: tool.call.started
+      min_count: 1
+    - event_type: approval.required
       min_count: 1
     - event_type: tool.call.completed
       min_count: 1
@@ -52,7 +58,6 @@ forbidden:
   tool_calls:
     - palyra.fs.apply_patch
   events:
-    - approval.required
     - run.failed
     - secret.exposed
   artifacts: []

@@ -205,8 +205,12 @@ fn authoritative_runtime_kernel_v2_profiles_preserve_exact_authority_boundaries(
 
     let mut read_only = parse_scenario(RUNTIME_KERNEL_V2_TOOL_SCENARIO);
     validate_policy_profile(&read_only)
-        .expect("authoritative V2 read-only profile should accept its exact tool");
+        .expect("authoritative V2 read-only profile should accept its exact approved tool");
     read_only.requires.tools.push("palyra.fs.apply_patch".to_owned());
+    assert!(validate_policy_profile(&read_only).is_err());
+
+    let mut read_only = parse_scenario(RUNTIME_KERNEL_V2_TOOL_SCENARIO);
+    read_only.steps.retain(|step| step.action != QaScenarioStepAction::ApprovalDecision);
     assert!(validate_policy_profile(&read_only).is_err());
 
     let mut approval = parse_scenario(RUNTIME_KERNEL_V2_APPROVAL_SCENARIO);
@@ -237,6 +241,19 @@ fn read_only_profile_requires_a_unique_explicit_read_tool_subset() {
 
     manifest.requires.tools =
         vec!["palyra.fs.read_file".to_owned(), "palyra.fs.read_file".to_owned()];
+    assert!(validate_policy_profile(&manifest).is_err());
+
+    let mut manifest = parse_scenario(READ_ONLY_SCENARIO);
+    manifest.steps.retain(|step| step.action != QaScenarioStepAction::ApprovalDecision);
+    assert!(validate_policy_profile(&manifest).is_err());
+
+    let mut manifest = parse_scenario(READ_ONLY_SCENARIO);
+    let approval = manifest
+        .steps
+        .iter_mut()
+        .find(|step| step.action == QaScenarioStepAction::ApprovalDecision)
+        .expect("read-only scenario should contain its allow decision");
+    approval.decision = Some(QaScenarioApprovalDecision::Deny);
     assert!(validate_policy_profile(&manifest).is_err());
 }
 

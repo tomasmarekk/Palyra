@@ -369,12 +369,13 @@ pub(super) fn validate_policy_profile(manifest: &QaScenarioManifest) -> Result<(
             "qa.runner.policy_profile_mismatch: authoritative V2 no-tool profiles cannot expose tools"
         ),
         "runtime_kernel_v2_authoritative_read_only"
-            if has_exact_tool_subset(&manifest.requires.tools, QA_READ_ONLY_TOOLS) =>
+            if has_exact_tool_subset(&manifest.requires.tools, QA_READ_ONLY_TOOLS)
+                && approval_steps_allow_only(manifest) =>
         {
             Ok(())
         }
         "runtime_kernel_v2_authoritative_read_only" => anyhow::bail!(
-            "qa.runner.policy_profile_mismatch: authoritative V2 read-only profile requires explicit workspace read tools"
+            "qa.runner.policy_profile_mismatch: authoritative V2 read-only profile requires explicit workspace read tools and allow-only approval decisions"
         ),
         "runtime_kernel_v2_authoritative_approval_denied"
             if has_exact_tools(&manifest.requires.tools, QA_APPROVAL_MUTATION_TOOLS)
@@ -385,11 +386,14 @@ pub(super) fn validate_policy_profile(manifest: &QaScenarioManifest) -> Result<(
         "runtime_kernel_v2_authoritative_approval_denied" => anyhow::bail!(
             "qa.runner.policy_profile_mismatch: authoritative V2 approval profile requires only the mutation tool and explicit deny decisions"
         ),
-        "qa_read_only" if has_exact_tool_subset(&manifest.requires.tools, QA_READ_ONLY_TOOLS) => {
+        "qa_read_only"
+            if has_exact_tool_subset(&manifest.requires.tools, QA_READ_ONLY_TOOLS)
+                && approval_steps_allow_only(manifest) =>
+        {
             Ok(())
         }
         "qa_read_only" => anyhow::bail!(
-            "qa.runner.policy_profile_mismatch: qa_read_only requires explicit workspace read tools"
+            "qa.runner.policy_profile_mismatch: qa_read_only requires explicit workspace read tools and allow-only approval decisions"
         ),
         "qa_mcp_persistent"
             if has_exact_tools(&manifest.requires.tools, QA_MCP_PERSISTENT_TOOLS)
