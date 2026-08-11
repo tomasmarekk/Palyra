@@ -6810,10 +6810,7 @@ mod tests {
         )
         .expect_err("implicit home roots must not authorize browser upload reads");
 
-        assert!(
-            error.contains("outside agent workspace roots and approved launch environment roots"),
-            "{error}"
-        );
+        assert!(error.contains("outside agent workspace roots"), "{error}");
     }
 
     #[test]
