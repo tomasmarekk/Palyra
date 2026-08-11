@@ -8018,7 +8018,9 @@ async fn grpc_run_stream_executes_memory_recall_tool_and_emits_memory_attestatio
             .context("failed to connect gateway gRPC client")?;
     let mut request = sample_run_stream_request_with_text("trigger memory recall tool".to_owned());
     request.allow_sensitive_tools = true;
-    let mut stream_request = tonic::Request::new(tokio_stream::iter(vec![request]));
+    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    request_sender.send(request).await.context("failed to send initial memory recall request")?;
+    let mut stream_request = tonic::Request::new(ReceiverStream::new(request_receiver));
     authorize_metadata(stream_request.metadata_mut())?;
     let mut response_stream = gateway_client
         .run_stream(stream_request)
@@ -8026,6 +8028,7 @@ async fn grpc_run_stream_executes_memory_recall_tool_and_emits_memory_attestatio
         .context("failed to call RunStream")?
         .into_inner();
 
+    let mut saw_approval_request = false;
     let mut saw_allow_decision = false;
     let mut saw_recall_result = false;
     let mut saw_memory_attestation = false;
@@ -8033,6 +8036,22 @@ async fn grpc_run_stream_executes_memory_recall_tool_and_emits_memory_attestatio
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("memory recall approval request missing proposal_id")?;
+                    request_sender
+                        .send(sample_tool_approval_response_request(
+                            proposal_id,
+                            true,
+                            "allow_once",
+                        ))
+                        .await
+                        .context("failed to approve memory recall request")?;
+                    saw_approval_request = true;
+                }
                 common_v1::run_stream_event::Body::ToolDecision(decision)
                     if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 =>
                 {
@@ -8085,6 +8104,7 @@ async fn grpc_run_stream_executes_memory_recall_tool_and_emits_memory_attestatio
         }
     }
 
+    assert!(saw_approval_request, "memory recall tool should request explicit approval");
     assert!(saw_allow_decision, "memory recall tool should produce allow decision");
     assert!(saw_recall_result, "memory recall tool should produce successful tool result");
     assert!(saw_memory_attestation, "memory recall tool should emit memory_runtime attestation");
@@ -8157,34 +8177,60 @@ async fn grpc_run_stream_memory_recall_without_session_uses_current_channel_dura
     let mut run_request =
         sample_run_stream_request_with_text("trigger no-session memory recall tool".to_owned());
     run_request.allow_sensitive_tools = true;
-    let mut request = tonic::Request::new(tokio_stream::iter(vec![run_request]));
+    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    request_sender
+        .send(run_request)
+        .await
+        .context("failed to send initial no-session memory recall request")?;
+    let mut request = tonic::Request::new(ReceiverStream::new(request_receiver));
     authorize_metadata_with_principal_and_channel(request.metadata_mut(), "user:ops", "cli")?;
     let mut response_stream =
         gateway_client.run_stream(request).await.context("failed to call RunStream")?.into_inner();
 
+    let mut saw_approval_request = false;
     let mut saw_recall_result = false;
     while let Some(event) = response_stream.next().await {
         let event = event.context("failed to read RunStream event")?;
-        if let Some(common_v1::run_stream_event::Body::ToolResult(result)) = event.body {
-            if result.success {
-                let output = serde_json::from_slice::<Value>(&result.output_json)
-                    .context("memory recall tool output_json should be valid JSON")?;
-                let top_candidates = output
-                    .get("top_candidates")
-                    .and_then(Value::as_array)
-                    .context("memory recall tool output must contain top_candidates")?;
-                assert!(
-                    top_candidates.iter().any(|candidate| {
-                        candidate.get("source_ref").and_then(Value::as_str)
-                            == Some(ingested_memory_id.as_str())
-                    }),
-                    "no-session memory recall should surface durable memory from the current channel: {output}"
-                );
-                saw_recall_result = true;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let proposal_id = approval_request
+                        .proposal_id
+                        .as_ref()
+                        .map(|proposal_id| proposal_id.ulid.as_str())
+                        .context("no-session memory recall approval request missing proposal_id")?;
+                    request_sender
+                        .send(sample_tool_approval_response_request(
+                            proposal_id,
+                            true,
+                            "allow_once",
+                        ))
+                        .await
+                        .context("failed to approve no-session memory recall request")?;
+                    saw_approval_request = true;
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    let output = serde_json::from_slice::<Value>(&result.output_json)
+                        .context("memory recall tool output_json should be valid JSON")?;
+                    let top_candidates = output
+                        .get("top_candidates")
+                        .and_then(Value::as_array)
+                        .context("memory recall tool output must contain top_candidates")?;
+                    assert!(
+                        top_candidates.iter().any(|candidate| {
+                            candidate.get("source_ref").and_then(Value::as_str)
+                                == Some(ingested_memory_id.as_str())
+                        }),
+                        "no-session memory recall should surface durable memory from the current channel: {output}"
+                    );
+                    saw_recall_result = true;
+                }
+                _ => {}
             }
         }
     }
 
+    assert!(saw_approval_request, "no-session memory recall should request explicit approval");
     assert!(saw_recall_result, "no-session memory recall should produce a successful tool result");
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
