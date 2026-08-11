@@ -347,6 +347,9 @@ async fn default_v2_admits_new_connector_route_messages() {
         })
         .await
         .expect("default route agent should be configured");
+    state
+        .complete_daemon_startup_recovery()
+        .expect("route admission should run after startup recovery");
     let input = route_input();
     let plan = route_plan(&input);
     let context = route_context();
