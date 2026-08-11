@@ -81,9 +81,10 @@ fn serialize_redacted_provider_output(output: &ProviderTurnOutput) -> Result<Str
     let Some(redacted) = crate::journal::redact_payload_json(payload.as_bytes()) else {
         return Ok(payload);
     };
-    let mut redacted_value: serde_json::Value = serde_json::from_str(&redacted).map_err(|error| {
-        Status::internal(format!("failed to parse redacted provider turn output: {error}"))
-    })?;
+    let mut redacted_value: serde_json::Value =
+        serde_json::from_str(&redacted).map_err(|error| {
+            Status::internal(format!("failed to parse redacted provider turn output: {error}"))
+        })?;
     let usage = redacted_value
         .get_mut("usage")
         .and_then(serde_json::Value::as_object_mut)

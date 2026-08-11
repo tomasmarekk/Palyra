@@ -2803,10 +2803,7 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("query")
         );
-        assert_eq!(
-            workspace_symbols.approval_posture,
-            ToolApprovalPosture::ApprovalRequired
-        );
+        assert_eq!(workspace_symbols.approval_posture, ToolApprovalPosture::ApprovalRequired);
     }
 
     #[test]

@@ -2323,8 +2323,7 @@ mod tests {
             let request_context = tool_request_context("user:ops");
             let mut budget = 1;
 
-            let denied =
-                decide_tool_call(&config, &mut budget, &request_context, tool_name, false);
+            let denied = decide_tool_call(&config, &mut budget, &request_context, tool_name, false);
 
             assert!(!denied.allowed, "{tool_name} should require explicit approval");
             assert!(denied.approval_required);
