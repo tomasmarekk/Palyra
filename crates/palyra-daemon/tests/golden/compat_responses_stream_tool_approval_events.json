@@ -96,6 +96,27 @@
     "has_arguments": true
   },
   {
+    "event": "approval.required",
+    "type": "approval.required",
+    "has_response_id": true,
+    "has_approval_id": true,
+    "has_tool_call_id": true,
+    "tool_name": "palyra.fs.read_file",
+    "approval_required": true,
+    "risk_level": "high",
+    "has_raw_input_json": false
+  },
+  {
+    "event": "approval.resolved",
+    "type": "approval.resolved",
+    "has_response_id": true,
+    "has_approval_id": true,
+    "has_tool_call_id": true,
+    "approved": false,
+    "has_reason": true,
+    "decision_scope": "once"
+  },
+  {
     "event": "response.output_item.done",
     "type": "response.output_item.done",
     "output_index": 2,
