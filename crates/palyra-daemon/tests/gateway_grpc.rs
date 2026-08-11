@@ -2035,7 +2035,7 @@ async fn grpc_route_message_v2_bundle_admits_authoritative_channel_path() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_route_message_bot_loop_guard_drops_without_provider_call() -> Result<()> {
+async fn grpc_route_message_untrusted_bot_claims_do_not_activate_loop_guard() -> Result<()> {
     let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
         ScriptedOpenAiResponse::immediate(
             200,
@@ -2044,6 +2044,10 @@ async fn grpc_route_message_bot_loop_guard_drops_without_provider_call() -> Resu
         ScriptedOpenAiResponse::immediate(
             200,
             r#"{"choices":[{"message":{"content":"bot loop second reply"}}]}"#.to_owned(),
+        ),
+        ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"bot loop third reply"}}]}"#.to_owned(),
         ),
         ScriptedOpenAiResponse::immediate(
             200,
@@ -2106,7 +2110,7 @@ async fn grpc_route_message_bot_loop_guard_drops_without_provider_call() -> Resu
     assert!(second.accepted, "second loop candidate should still route at threshold");
     assert_eq!(request_count.load(Ordering::Relaxed), 2);
 
-    let dropped = route_message_with_sender(
+    let third = route_message_with_sender(
         &mut client,
         "@palyra loop candidate three",
         "01ARZ3NDEKTSV4RRFFQ69G5FC7",
@@ -2115,16 +2119,8 @@ async fn grpc_route_message_bot_loop_guard_drops_without_provider_call() -> Resu
         "Alpha Bot",
     )
     .await?;
-    assert!(!dropped.accepted, "third loop candidate should be dropped");
-    assert!(!dropped.queued_for_retry);
-    assert_eq!(dropped.decision_reason, "bot_loop_protection");
-    assert!(dropped.run_id.is_none(), "dropped loop turn must not allocate a run");
-    assert!(dropped.outputs.is_empty(), "dropped loop turn must not emit output");
-    assert_eq!(
-        request_count.load(Ordering::Relaxed),
-        2,
-        "bot-loop drop must not call the model provider"
-    );
+    assert!(third.accepted, "an untrusted sender handle must not activate bot-loop suppression");
+    assert_eq!(request_count.load(Ordering::Relaxed), 3);
 
     let human = route_message_with_sender(
         &mut client,
@@ -2136,56 +2132,16 @@ async fn grpc_route_message_bot_loop_guard_drops_without_provider_call() -> Resu
     )
     .await?;
     assert!(human.accepted, "different sender in same channel should not inherit bot cooldown");
-    assert_eq!(request_count.load(Ordering::Relaxed), 3);
+    assert_eq!(request_count.load(Ordering::Relaxed), 4);
 
     let message_events = load_message_router_journal_events(&journal_db_path)?;
-    let dropped_bot_loop = message_events
-        .iter()
-        .find(|payload| {
+    assert!(
+        !message_events.iter().any(|payload| {
             payload.get("event").and_then(Value::as_str) == Some("channel.bot_loop.dropped")
-        })
-        .context("bot-loop drop event should be persisted")?;
-    assert_eq!(
-        dropped_bot_loop.pointer("/payload/bot_loop_kind").and_then(Value::as_str),
-        Some("dropped")
-    );
-    assert!(
-        dropped_bot_loop
-            .pointer("/payload/bot_loop/key_hash_sha256")
-            .and_then(Value::as_str)
-            .is_some_and(|hash| hash.starts_with("sha256:")),
-        "bot-loop event should include a hashed pair key: {dropped_bot_loop}"
-    );
-    assert!(
-        !dropped_bot_loop.to_string().contains("bot:alpha"),
-        "bot-loop audit event should not expose raw sender identity: {dropped_bot_loop}"
-    );
-    assert!(
-        message_events.iter().any(|payload| {
-            payload.get("event").and_then(Value::as_str) == Some("channel.turn.dropped")
-                && payload.pointer("/payload/admission/reason_code").and_then(Value::as_str)
-                    == Some("channel.admission.drop.bot_loop_protection")
+                || (payload.get("event").and_then(Value::as_str) == Some("message.rejected")
+                    && payload.get("reason").and_then(Value::as_str) == Some("bot_loop_protection"))
         }),
-        "admission drop should carry the bot-loop protection reason"
-    );
-    assert!(
-        message_events.iter().any(|payload| {
-            payload.get("event").and_then(Value::as_str) == Some("channel.turn.dispatched")
-                && payload.pointer("/payload/dispatch/kind").and_then(Value::as_str)
-                    == Some("not_dispatched")
-                && payload
-                    .pointer("/payload/dispatch/model_request_started")
-                    .and_then(Value::as_bool)
-                    == Some(false)
-        }),
-        "dropped bot-loop turn should record a no-provider dispatch outcome"
-    );
-    assert!(
-        message_events.iter().any(|payload| {
-            payload.get("event").and_then(Value::as_str) == Some("message.rejected")
-                && payload.get("reason").and_then(Value::as_str) == Some("bot_loop_protection")
-        }),
-        "router journal should expose the short bot-loop rejection reason"
+        "untrusted sender claims must not produce bot-loop suppression evidence"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -14008,7 +13964,7 @@ fn write_channel_router_config_with_channel_rule_suffix_and_extra_sections(
 ) -> Result<PathBuf> {
     let config_path = unique_temp_daemon_config_path();
     #[rustfmt::skip]
-    let config_body = format!("[channel_router]\nenabled = true\nmax_message_bytes = 8192\nmax_retry_queue_depth_per_channel = 4\nmax_retry_attempts = 2\nretry_backoff_ms = 25\n\n[channel_router.routing]\ndefault_channel_enabled = false\ndefault_allow_direct_messages = false\ndefault_direct_message_policy = \"deny\"\ndefault_isolate_session_by_sender = false\ndefault_broadcast_strategy = \"deny\"\ndefault_concurrency_limit = 2\nchannels = [\n  {{ channel = \"cli\", enabled = true, mention_patterns = [\"@palyra\"], allow_from = [\"user:ops\"], allow_direct_messages = true, direct_message_policy = \"allow\", isolate_session_by_sender = false, response_prefix = \"[cli] \", auto_ack_text = \"processing\", auto_reaction = \"eyes\", broadcast_strategy = \"mention_only\", concurrency_limit = 1{channel_rule_suffix} }}\n]\n{extra_sections}\n[tool_call.process_runner]\nenabled = true\negress_enforcement_mode = \"preflight\"\nworkspace_root = {}\nallowed_executables = []\nallowed_egress_hosts = []\nallowed_dns_suffixes = []\ncpu_time_limit_ms = 2000\nmemory_limit_bytes = 134217728\nmax_output_bytes = 65536\n", toml_string(std::env::current_dir().context("failed to resolve workspace root for channel router process runner test config")?.to_string_lossy().as_ref()));
+    let config_body = format!("[channel_router]\nenabled = true\nmax_message_bytes = 8192\nmax_retry_queue_depth_per_channel = 4\nmax_retry_attempts = 2\nretry_backoff_ms = 25\n\n[channel_router.routing]\ndefault_channel_enabled = false\ndefault_allow_direct_messages = false\ndefault_direct_message_policy = \"deny\"\ndefault_isolate_session_by_sender = false\ndefault_broadcast_strategy = \"deny\"\ndefault_concurrency_limit = 2\nchannels = [\n  {{ channel = \"cli\", enabled = true, mention_patterns = [\"@palyra\"], allow_from = [\"user:ops\", \"bot:alpha\", \"user:human\"], allow_direct_messages = true, direct_message_policy = \"allow\", isolate_session_by_sender = false, response_prefix = \"[cli] \", auto_ack_text = \"processing\", auto_reaction = \"eyes\", broadcast_strategy = \"mention_only\", concurrency_limit = 1{channel_rule_suffix} }}\n]\n{extra_sections}\n[tool_call.process_runner]\nenabled = true\negress_enforcement_mode = \"preflight\"\nworkspace_root = {}\nallowed_executables = []\nallowed_egress_hosts = []\nallowed_dns_suffixes = []\ncpu_time_limit_ms = 2000\nmemory_limit_bytes = 134217728\nmax_output_bytes = 65536\n", toml_string(std::env::current_dir().context("failed to resolve workspace root for channel router process runner test config")?.to_string_lossy().as_ref()));
     fs::write(&config_path, config_body).with_context(|| {
         format!("failed to write channel router test config at {}", config_path.display())
     })?;
