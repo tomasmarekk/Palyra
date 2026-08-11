@@ -661,12 +661,17 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
     }
-    let mut boundary = max_bytes;
+    const TRUNCATION_MARKER: &str = "…";
+    if max_bytes < TRUNCATION_MARKER.len() {
+        return String::new();
+    }
+    let mut boundary = max_bytes - TRUNCATION_MARKER.len();
     while boundary > 0 && !value.is_char_boundary(boundary) {
         boundary -= 1;
     }
-    let mut output = value[..boundary].to_owned();
-    output.push('…');
+    let mut output = String::with_capacity(max_bytes);
+    output.push_str(&value[..boundary]);
+    output.push_str(TRUNCATION_MARKER);
     output
 }
 
