@@ -1321,6 +1321,9 @@ fn classify_sensitive_assignment_key(key: &str) -> Option<&'static str> {
     if compact.contains("refreshtoken") {
         return Some("refresh_token");
     }
+    if compact.ends_with("token") {
+        return Some("token");
+    }
     if compact.contains("clientsecret") {
         return Some("client_secret");
     }
