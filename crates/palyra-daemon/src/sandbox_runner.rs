@@ -12835,7 +12835,7 @@ fn reserve_output_budget(remaining_budget: &AtomicUsize, requested_bytes: usize)
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
-        ffi::{OsStr, OsString},
+        ffi::OsString,
         fs, io,
         path::{Path, PathBuf},
         process::{Command, Stdio},
@@ -15894,7 +15894,8 @@ mod tests {
             Path::new(r"C:\Tools\Node\node.exe"),
             Path::new(r"C:\Windows\System32"),
         );
-        let directories = std::env::split_paths(OsStr::new(path.as_str())).collect::<Vec<_>>();
+        let directories =
+            std::env::split_paths(std::ffi::OsStr::new(path.as_str())).collect::<Vec<_>>();
 
         assert_eq!(
             directories,
@@ -16274,15 +16275,19 @@ mod tests {
         assert!(!temp_root.starts_with(workspace.as_path()));
         assert!(temp_root.is_dir(), "temp root should exist before process spawn");
         #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(temp_root.as_path())
-                .expect("temp root metadata should resolve")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700,
-            "process child temp root must be owner-only"
-        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                fs::metadata(temp_root.as_path())
+                    .expect("temp root metadata should resolve")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "process child temp root must be owner-only"
+            );
+        }
     }
 
     #[test]
