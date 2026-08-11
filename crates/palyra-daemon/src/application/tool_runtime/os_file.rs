@@ -2436,8 +2436,8 @@ mod tests {
         let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let target = tempdir.path().join("app.js");
-        let contents = "const sessionKey = \"s058-auth-session\";\n\
-                        localStorage.setItem(sessionKey, JSON.stringify(state));\n";
+        let contents = "const sessionStorageKey = \"s058-auth-session\";\n\
+                        localStorage.setItem(sessionStorageKey, JSON.stringify(state));\n";
         fs::write(target.as_path(), contents).expect("OS file should be written");
 
         let read = execute_os_file_operation(
