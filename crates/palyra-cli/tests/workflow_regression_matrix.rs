@@ -994,15 +994,17 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
     let created_session_id = session_create_payload
         .get("session_id")
         .and_then(Value::as_str)
-        .context("browser session create should return a canonical session_id")?;
-    assert_eq!(
-        created_session_id.len(),
-        26,
-        "browser session create should return a reusable canonical ULID"
+        .context("browser session create should return a redacted session_id")?;
+    assert!(
+        created_session_id.starts_with("session-") && created_session_id.len() == 20,
+        "browser session create should return a stable redacted handle: {created_session_id}"
     );
     let session_id =
         latest_browser_session_id(browser_endpoint.as_str(), BROWSER_AUTH_TOKEN, "admin:local")?;
-    assert_eq!(created_session_id, session_id);
+    assert_ne!(
+        created_session_id, session_id,
+        "browser session create must not expose the internal canonical ULID"
+    );
 
     let session_list_after =
         run_cli_json(&workdir, &["browser", "session", "list"], &browser_cli_env)?;
@@ -1016,6 +1018,11 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
         .get("sessions")
         .and_then(Value::as_array)
         .context("browser session list after should include sessions")?;
+    assert_eq!(
+        sessions.first().and_then(|session| session.get("session_id")).and_then(Value::as_str),
+        Some(created_session_id),
+        "session create and list should use the same stable redacted handle"
+    );
     assert_eq!(
         sessions.first().and_then(|session| session.get("principal")).and_then(Value::as_str),
         Some("admin:local")
@@ -1272,7 +1279,7 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
         run_cli_json(&workdir, &["sessions", "list", "--json"], &browser_cli_env)?,
         "sessions list before show",
     )?;
-    let updated_before_show = session_updated_at(&sessions_before_show, "workflow:browser")?;
+    let updated_before_show = only_session_updated_at(&sessions_before_show)?;
 
     let sessions_show_output = run_cli_json(
         &workdir,
@@ -1332,7 +1339,7 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
         run_cli_json(&workdir, &["sessions", "list", "--json"], &browser_cli_env)?,
         "sessions list after show",
     )?;
-    let updated_after_show = session_updated_at(&sessions_after_show, "workflow:browser")?;
+    let updated_after_show = only_session_updated_at(&sessions_after_show)?;
     assert_eq!(
         updated_after_show, updated_before_show,
         "sessions show/status must not mutate session recency"
@@ -1656,17 +1663,18 @@ fn assert_json_success(output: Output, command_name: &str) -> Result<Value> {
         .with_context(|| format!("{command_name} stdout should be valid JSON"))
 }
 
-fn session_updated_at(payload: &Value, session_key: &str) -> Result<i64> {
-    payload
+fn only_session_updated_at(payload: &Value) -> Result<i64> {
+    let sessions = payload
         .get("sessions")
         .and_then(Value::as_array)
-        .and_then(|sessions| {
-            sessions.iter().find(|session| {
-                session.get("session_key").and_then(Value::as_str) == Some(session_key)
-            })
-        })
+        .context("session list should include a sessions array")?;
+    if sessions.len() != 1 {
+        anyhow::bail!("isolated session workflow should contain exactly one gateway session");
+    }
+    sessions
+        .first()
         .and_then(|session| session.get("updated_at_unix_ms").and_then(Value::as_i64))
-        .with_context(|| format!("session {session_key} should include updated_at_unix_ms"))
+        .context("gateway session should include updated_at_unix_ms")
 }
 
 fn seed_install_root(install_root: &Path) -> Result<()> {
