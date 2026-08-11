@@ -74,7 +74,7 @@ use crate::journal::{
     OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
     OrchestratorTapeAppendRequest, OrchestratorTerminalTapeEvent,
     RuntimeGenerationInvalidateRequest, SessionProjectContextStateUpsertRequest,
-    ToolJobTailReadRequest, ToolJobsListFilter, WorkspaceDocumentWriteRequest,
+    WorkspaceDocumentWriteRequest,
 };
 use crate::model_provider::ProviderError;
 use crate::objectives::{
