@@ -3702,6 +3702,9 @@ enabled = true
 
     #[test]
     fn auth_vault_candidates_include_configured_storage_vault_with_gateway_identity() {
+        let _env_guard =
+            crate::app::test_env_lock_for_tests().lock().expect("env lock should be available");
+        let _vault_directory = ScopedVaultDirectory::unset();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
         let identity_store_root = state_root.join("identity");
@@ -3880,6 +3883,10 @@ enabled = true
         previous: Option<std::ffi::OsString>,
     }
 
+    struct ScopedVaultDirectory {
+        previous: Option<std::ffi::OsString>,
+    }
+
     struct ScopedAuthProfilesPath {
         previous: Option<std::ffi::OsString>,
     }
@@ -3940,6 +3947,28 @@ enabled = true
                 std::env::set_var("PALYRA_VAULT_BACKEND", "encrypted_file");
             }
             Self { previous }
+        }
+    }
+
+    impl ScopedVaultDirectory {
+        fn unset() -> Self {
+            let previous = std::env::var_os("PALYRA_VAULT_DIR");
+            // SAFETY: this test holds the shared CLI test env lock while the override is active.
+            unsafe {
+                std::env::remove_var("PALYRA_VAULT_DIR");
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ScopedVaultDirectory {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                // SAFETY: this test holds the shared CLI test env lock while the override is active.
+                unsafe {
+                    std::env::set_var("PALYRA_VAULT_DIR", previous);
+                }
+            }
         }
     }
 
