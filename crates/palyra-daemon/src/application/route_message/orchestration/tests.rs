@@ -1,9 +1,10 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{fs, future::Future, pin::Pin, sync::Arc};
 
 use tokio::sync::{mpsc, Notify};
 
 use super::*;
 use crate::{
+    agents::AgentCreateRequest,
     application::channel_turn::ChannelTurnEnvelopeInput,
     gateway::tests::{build_test_runtime_state, build_test_runtime_state_with_runtime_overrides},
     journal::{
@@ -328,6 +329,24 @@ fn pin_existing_legacy_route_session(
 #[tokio::test]
 async fn default_v2_admits_new_connector_route_messages() {
     let state = build_test_runtime_state(false);
+    let workspace = tempfile::tempdir().expect("route agent workspace should exist");
+    fs::write(workspace.path().join("AGENTS.md"), "# Route test agent\n")
+        .expect("route agent instructions should exist");
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "route-default".to_owned(),
+            display_name: "Route Default".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![workspace.path().to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("default route agent should be configured");
     let input = route_input();
     let plan = route_plan(&input);
     let context = route_context();
