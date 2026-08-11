@@ -7,6 +7,7 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Child, ChildStderr, Command, Stdio},
+    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
@@ -18,9 +19,13 @@ use tempfile::TempDir;
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const STARTUP_RETRY_ATTEMPTS: usize = 8;
 const STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
+// Real-daemon startup releases a reserved port before spawning. Serializing loopback users keeps
+// parallel fixture listeners from claiming that narrow gap and receiving the daemon health probe.
+static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn palyra_daemon_status_reads_health_endpoint() -> Result<()> {
+    let _network_test = lock_network_tests();
     let (child, port, state_root) = spawn_palyrad_with_dynamic_port()?;
     let _daemon = ChildGuard::new(child, state_root);
 
@@ -42,6 +47,7 @@ fn palyra_daemon_status_reads_health_endpoint() -> Result<()> {
 
 #[test]
 fn palyra_gateway_status_distinguishes_runtime_from_service_manager() -> Result<()> {
+    let _network_test = lock_network_tests();
     let (child, port, state_root) = spawn_palyrad_with_dynamic_port()?;
     let state_root_arg = state_root.path().to_string_lossy().into_owned();
     let _daemon = ChildGuard::new(child, state_root);
@@ -82,6 +88,7 @@ fn palyra_gateway_status_distinguishes_runtime_from_service_manager() -> Result<
 
 #[test]
 fn palyra_daemon_admin_status_without_token_succeeds_when_auth_is_disabled() -> Result<()> {
+    let _network_test = lock_network_tests();
     let (child, port, state_root) =
         spawn_palyrad_with_dynamic_port_and_env(&[("PALYRA_ADMIN_REQUIRE_AUTH", "false")])?;
     let _daemon = ChildGuard::new(child, state_root);
@@ -115,6 +122,7 @@ fn palyra_daemon_admin_status_without_token_succeeds_when_auth_is_disabled() -> 
 
 #[test]
 fn palyra_daemon_admin_status_without_token_fails_when_auth_is_required() -> Result<()> {
+    let _network_test = lock_network_tests();
     let (child, port, state_root) = spawn_palyrad_with_dynamic_port()?;
     let _daemon = ChildGuard::new(child, state_root);
 
@@ -162,6 +170,7 @@ fn palyra_daemon_run_status_rejects_non_canonical_run_id() -> Result<()> {
 
 #[test]
 fn palyra_daemon_run_inspection_supports_json_output() -> Result<()> {
+    let _network_test = lock_network_tests();
     let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
     let status_fixture = spawn_json_fixture(
         format!("/admin/v1/runs/{run_id}"),
@@ -272,6 +281,7 @@ fn palyra_daemon_run_inspection_supports_json_output() -> Result<()> {
 
 #[test]
 fn palyra_daemon_run_tape_compact_omits_large_tool_catalog_snapshot() -> Result<()> {
+    let _network_test = lock_network_tests();
     let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
     let tool_catalog_payload = serde_json::json!({
         "tools": [
@@ -448,6 +458,10 @@ fn reserve_loopback_port() -> Result<u16> {
         .port();
     drop(listener);
     Ok(port)
+}
+
+fn lock_network_tests() -> MutexGuard<'static, ()> {
+    NETWORK_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn wait_for_health(port: u16, daemon: &mut Child, timeout: Duration) -> Result<()> {
