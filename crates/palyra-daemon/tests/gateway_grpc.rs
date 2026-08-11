@@ -1930,9 +1930,15 @@ async fn grpc_route_message_rejects_without_mention_and_records_reason() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_route_message_v2_bundle_fails_closed_without_channel_adapter() -> Result<()> {
+async fn grpc_route_message_v2_bundle_admits_authoritative_channel_path() -> Result<()> {
     let (openai_base_url, _request_bodies, request_count, server_handle) =
-        spawn_scripted_openai_server_with_request_capture(Vec::new())?;
+        spawn_scripted_openai_server_with_request_capture(vec![
+            ScriptedOpenAiResponse::immediate(
+                200,
+                r#"{"choices":[{"message":{"content":"authoritative v2 route reply"}}]}"#
+                    .to_owned(),
+            ),
+        ])?;
     let (child, admin_port, grpc_port, journal_db_path, config_path) =
         spawn_palyrad_with_openai_provider_and_channel_router_with_v2_compatibility_bundle(
             openai_base_url.as_str(),
@@ -1973,16 +1979,39 @@ async fn grpc_route_message_v2_bundle_fails_closed_without_channel_adapter() -> 
             ENVELOPE_ID,
         )
         .await?;
-    assert!(!dispatch_response.accepted);
-    assert_eq!(
-        dispatch_response.decision_reason, "runtime.channel_v2_adapter_unavailable",
-        "authoritative V2 channel turns must fail closed until the V2 adapter is available"
+    assert!(
+        dispatch_response.accepted,
+        "authoritative V2 channel turns should use the admitted route path"
+    );
+    assert_eq!(dispatch_response.decision_reason, "routed");
+    let dispatch_run_id = dispatch_response
+        .run_id
+        .as_ref()
+        .map(|run_id| run_id.ulid.as_str())
+        .context("authoritative V2 route should return a run id")?;
+    assert!(
+        dispatch_response
+            .outputs
+            .first()
+            .is_some_and(|output| output.text.contains("authoritative v2 route reply")),
+        "authoritative V2 route should emit the provider response"
     );
     assert_eq!(
         request_count.load(Ordering::Relaxed),
-        0,
-        "an unavailable V2 channel adapter must not silently fall back to the legacy provider path"
+        1,
+        "authoritative V2 route should dispatch exactly one provider request"
     );
+    let connection =
+        Connection::open(&journal_db_path).context("failed to open V2 route journal database")?;
+    let runtime_version: String = connection
+        .query_row(
+            "SELECT runtime_version FROM runtime_kernel_heads WHERE run_ulid = ?1",
+            params![dispatch_run_id],
+            |row| row.get(0),
+        )
+        .context("authoritative V2 route should persist a runtime kernel head")?;
+    assert_eq!(runtime_version, "v2");
+    drop(connection);
 
     let message_events = load_message_router_journal_events(&journal_db_path)?;
     assert!(
