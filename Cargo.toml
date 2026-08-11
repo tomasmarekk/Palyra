@@ -102,9 +102,10 @@ unimplemented = "deny"
 empty_drop = "deny"
 inefficient_to_string = "deny"
 
-# Full debug info pushes the daemon's MSVC archive beyond the 4 GiB COFF limit.
+# Daemon debug artifacts exceed MSVC limits and destabilize clean hosted builds.
+# Opt in locally with `cargo --config profile.dev.package.palyra-daemon.debug=1`.
 [profile.dev.package.palyra-daemon]
-debug = 1
+debug = 0
 
 [profile.test.package.palyra-daemon]
-debug = 1
+debug = 0
