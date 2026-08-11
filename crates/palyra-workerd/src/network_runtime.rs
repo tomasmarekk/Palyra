@@ -1634,6 +1634,28 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn bubblewrap_runtime_is_unavailable(result: &WorkerRemoteToolResultEnvelope) -> bool {
+        if result.success || result.error.as_deref() != Some("worker.process.exit_nonzero") {
+            return false;
+        }
+        let Ok(output) = serde_json::from_str::<serde_json::Value>(result.output_json.as_str())
+        else {
+            return false;
+        };
+
+        // Generic CI hosts can ship bwrap while denying the namespaces it needs. Only host
+        // permission failures count as unavailable; plan and wrapped-command failures must fail.
+        output.get("sandbox_backend").and_then(serde_json::Value::as_str)
+            == Some("sandbox_tier_c_linux_bubblewrap")
+            && output.get("stderr").and_then(serde_json::Value::as_str).is_some_and(|stderr| {
+                stderr.starts_with("bwrap: ")
+                    && (stderr.contains("Operation not permitted")
+                        || stderr.contains("Permission denied")
+                        || stderr.contains("No permissions to create new namespace"))
+            })
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn remote_process_runs_in_tier_c_with_bounded_output_and_cleanup() {
         let request = process_request(
@@ -1642,6 +1664,7 @@ mod tests {
         );
 
         let result = match ReferenceNetworkWorker::execute_remote_request(&request, 60_000) {
+            Ok(result) if bubblewrap_runtime_is_unavailable(&result) => return,
             Ok(result) => result,
             Err(NetworkWorkerRuntimeError::ProcessSandboxUnavailable(reason))
                 if reason.contains("requires binary 'bwrap'") =>
@@ -1649,7 +1672,7 @@ mod tests {
                 return;
             }
             Err(error) => {
-                panic!("Tier-C process should execute or fail for missing bwrap: {error}")
+                panic!("Tier-C process should execute or fail for unavailable bwrap: {error}")
             }
         };
         let output: serde_json::Value =
@@ -1657,9 +1680,9 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(output["stdout"], "worker-ok");
-        assert_eq!(output["network_isolation"], "os_enforced");
-        assert_eq!(output["environment"], "fixed_minimal");
-        assert_eq!(output["cleanup"], "process_reaped");
+        assert_eq!(output["remote_worker"]["network_isolation"], "os_enforced");
+        assert_eq!(output["remote_worker"]["environment"], "fixed_minimal");
+        assert_eq!(output["remote_worker"]["cleanup"], "process_reaped");
         assert!(result.cleanup_report.is_verified());
     }
 
@@ -1672,12 +1695,13 @@ mod tests {
         );
         match ReferenceNetworkWorker::execute_remote_request(&timeout, 60_000) {
             Err(NetworkWorkerRuntimeError::ProcessTimeout) => {}
+            Ok(result) if bubblewrap_runtime_is_unavailable(&result) => return,
             Err(NetworkWorkerRuntimeError::ProcessSandboxUnavailable(reason))
                 if reason.contains("requires binary 'bwrap'") =>
             {
                 return;
             }
-            other => panic!("Tier-C timeout should reap or fail for missing bwrap: {other:?}"),
+            other => panic!("Tier-C timeout should reap or fail for unavailable bwrap: {other:?}"),
         }
 
         let output_limit =
