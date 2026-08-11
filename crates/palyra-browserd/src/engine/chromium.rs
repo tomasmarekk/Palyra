@@ -4888,7 +4888,7 @@ pub(crate) async fn click_with_chromium(
     allow_downloads: bool,
 ) -> ChromiumActionOutcome {
     enum ClickAttempt {
-        Clicked { download_like: bool },
+        Clicked { download_like: bool, may_open_window: bool },
         DownloadBlocked,
         Disabled,
         NotFound,
@@ -4921,6 +4921,7 @@ pub(crate) async fn click_with_chromium(
                 chromium_element_has_attribute(attributes, "download"),
                 chromium_element_attribute(attributes, "href"),
             );
+            let may_open_window = chromium_element_may_open_window(attributes);
             if download_like && !allow_downloads {
                 return Ok(ClickAttempt::DownloadBlocked);
             }
@@ -4943,14 +4944,18 @@ pub(crate) async fn click_with_chromium(
                     selector_for_attempt
                 )
             })?;
-            Ok(ClickAttempt::Clicked { download_like })
+            Ok(ClickAttempt::Clicked { download_like, may_open_window })
         })
         .await;
 
         match attempt {
-            Ok(ClickAttempt::Clicked { download_like }) => {
+            Ok(ClickAttempt::Clicked { download_like, may_open_window }) => {
                 let new_tab_count = match chromium_sync_session_tabs_after_click(
-                    runtime, session_id, false, started, timeout_ms,
+                    runtime,
+                    session_id,
+                    may_open_window,
+                    started,
+                    timeout_ms,
                 )
                 .await
                 {
@@ -4964,8 +4969,6 @@ pub(crate) async fn click_with_chromium(
                         };
                     }
                 };
-                let settle_ms = DEFAULT_ACTION_RETRY_INTERVAL_MS.min(timeout_ms.max(1));
-                tokio::time::sleep(Duration::from_millis(settle_ms)).await;
                 let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
                 return ChromiumActionOutcome {
                     success: true,
@@ -5046,15 +5049,22 @@ fn chromium_element_has_attribute(attributes: Option<&[String]>, expected_name: 
     })
 }
 
+fn chromium_element_may_open_window(attributes: Option<&[String]>) -> bool {
+    ["target", "formtarget"].iter().any(|attribute| {
+        chromium_element_attribute(attributes, attribute)
+            .is_some_and(|value| value.eq_ignore_ascii_case("_blank"))
+    }) || chromium_element_has_attribute(attributes, "onclick")
+}
+
 async fn chromium_sync_session_tabs_after_click(
     runtime: &BrowserRuntimeState,
     session_id: &str,
-    opened_window: bool,
+    may_open_window: bool,
     started: Instant,
     timeout_ms: u64,
 ) -> Result<u32, String> {
     let first_sync_count = chromium_sync_session_tabs(runtime, session_id).await?;
-    if first_sync_count > 0 || !opened_window {
+    if first_sync_count > 0 {
         return Ok(first_sync_count);
     }
 
@@ -5064,9 +5074,22 @@ async fn chromium_sync_session_tabs_after_click(
         .saturating_mul(CHROMIUM_NEW_TAB_RETRY_DELAY_MS);
     let popup_sync_timeout = Duration::from_millis(timeout_ms.min(popup_sync_max_wait_ms));
     let popup_sync_started = Instant::now();
+    let initial_remaining_ms = timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
+    if initial_remaining_ms == 0 {
+        return Ok(0);
+    }
+    tokio::time::sleep(Duration::from_millis(
+        DEFAULT_ACTION_RETRY_INTERVAL_MS.min(initial_remaining_ms),
+    ))
+    .await;
+    let deferred_sync_count = chromium_sync_session_tabs(runtime, session_id).await?;
+    if deferred_sync_count > 0 || !may_open_window {
+        return Ok(deferred_sync_count);
+    }
+
     loop {
-        // `window.open` can return before Chromium exposes the new CDP target,
-        // especially on slower Windows runners.
+        // Host-observed popup candidates get the longer retry window because
+        // Chromium can publish their CDP targets late on slower Windows hosts.
         if started.elapsed() >= click_timeout || popup_sync_started.elapsed() >= popup_sync_timeout
         {
             return Ok(0);
@@ -6090,8 +6113,8 @@ fn chromium_viewport_dimensions_match(
 mod tests {
     use super::{
         chromium_cookie_delete_requests, chromium_element_capture_script,
-        chromium_layout_metrics_from_cdp, chromium_network_log_headers,
-        chromium_observe_state_script, chromium_permission_origin,
+        chromium_element_may_open_window, chromium_layout_metrics_from_cdp,
+        chromium_network_log_headers, chromium_observe_state_script, chromium_permission_origin,
         chromium_permission_origins_for_urls, chromium_permission_reset_request,
         chromium_permission_set_requests, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
@@ -6147,6 +6170,20 @@ mod tests {
         assert_eq!(clamped.page_url, "https://example.invalid/oversized");
         assert!(clamped.page_body.len() <= 17);
         assert!(clamped.title.len() <= 5);
+    }
+
+    #[test]
+    fn chromium_popup_hint_uses_host_observed_element_metadata() {
+        for attributes in [
+            vec!["target".to_owned(), "_blank".to_owned()],
+            vec!["formtarget".to_owned(), "_BLANK".to_owned()],
+            vec!["onclick".to_owned(), "login()".to_owned()],
+        ] {
+            assert!(chromium_element_may_open_window(Some(attributes.as_slice())));
+        }
+        let same_tab = vec!["target".to_owned(), "_self".to_owned()];
+        assert!(!chromium_element_may_open_window(Some(same_tab.as_slice())));
+        assert!(!chromium_element_may_open_window(None));
     }
 
     #[test]
