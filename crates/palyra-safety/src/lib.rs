@@ -1416,8 +1416,22 @@ fn sensitive_assignment_key_allows_path_reference(key: &str) -> bool {
 /// Mirrors the vault's `<scope>/<key>` grammar without making the safety crate
 /// depend on the storage/cryptography crate.
 fn is_vault_reference_value(value: &str) -> bool {
+    let value = value.trim().trim_end_matches([',', ';']).trim();
     let normalized =
-        value.trim().trim_end_matches([',', ';']).trim().trim_matches(['"', '\'', '`']).trim();
+        if let Some(quote) = value.chars().next().filter(|ch| matches!(ch, '"' | '\'' | '`')) {
+            let Some((closing_index, quote_len)) = find_closing_quote(value, quote) else {
+                return false;
+            };
+            // JSON scans retain closing container delimiters after the scalar.
+            let suffix = value[closing_index + quote_len..].trim();
+            if !suffix.chars().all(|ch| matches!(ch, ',' | ';' | '}' | ']')) {
+                return false;
+            }
+            &value[quote.len_utf8()..closing_index]
+        } else {
+            value
+        };
+    let normalized = normalized.trim();
     let reference = normalized
         .strip_prefix("${vault:")
         .and_then(|rest| rest.strip_suffix('}'))
@@ -3678,6 +3692,8 @@ mod tests {
             .any(|code| code == "secret_leak.assignment.password"));
         assert!(is_vault_reference_value("global/openai_key"));
         assert!(is_vault_reference_value("${vault:principal:user:ops/api_key}"));
+        assert!(is_vault_reference_value(r#""global/openai_key"}"#));
+        assert!(!is_vault_reference_value(r#""global/openai_key" + injected"#));
         assert!(!is_vault_reference_value("vault:correcthorsebatterystaple"));
         assert!(!is_vault_reference_value("${vault:verylongrandomsecretvalue}"));
     }
