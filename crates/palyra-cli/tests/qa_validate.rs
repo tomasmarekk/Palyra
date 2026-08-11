@@ -1228,21 +1228,21 @@ mode:
   runner: fixture
   deterministic: true
 runner:
-  provider_fixture: missing/fixture.yaml
+  provider_fixture: qa/fixtures/real_agent_runner.yaml
   policy_profile: qa_no_tools
 requires:
   capabilities: [agent_run, qa_lab]
   tools: []
   fixtures:
-    - missing/fixture.yaml
+    - qa/fixtures/real_agent_runner.yaml
 steps:
   - id: prompt
     action: user_prompt
-    prompt: "Exercise missing fixture handling."
+    prompt: "Return the exact deterministic QA response."
 expect:
   terminal_state: completed
   final_answer:
-    contains: ["done"]
+    contains: ["intentionally absent response"]
   events:
     - event_type: run.completed
       min_count: 1
@@ -1292,6 +1292,7 @@ scorecard:
     .context("failed to write release regression suite")?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
         .args(["qa", "gate", "--suite"])
         .arg(suite_path.as_os_str())
         .arg("--json")
