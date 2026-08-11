@@ -285,7 +285,7 @@ Examples:
   palyra qa run-pack --tag p0 --json
   palyra qa run-pack --tag release_smoke --output artifacts/qa-pack-report.json
   palyra qa gate --suite qa/suites/pr_smoke.yaml --json
-  palyra qa provider-compat --path fixtures/provider_compat --json
+  palyra qa provider-compat --path qa/fixtures/provider_compat --json
 
 Discoverability:
   `qa validate` checks QA Lab scenario manifests before runner or replay tooling consumes them.

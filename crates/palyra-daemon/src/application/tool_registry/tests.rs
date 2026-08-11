@@ -38,7 +38,7 @@ use std::sync::{Mutex, OnceLock};
 
 static AVAILABILITY_PROBE_CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const SCHEMA_TRANSFORM_FIXTURE: &str =
-    include_str!("../../../../../fixtures/provider_compat/schema_transform_cases.json");
+    include_str!("../../../../../qa/fixtures/provider_compat/schema_transform_cases.json");
 
 fn config(allowed_tools: &[&str]) -> ToolCallConfig {
     ToolCallConfig {

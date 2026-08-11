@@ -1838,12 +1838,27 @@ fn validate_pack_fixtures(manifest: &QaScenarioManifest) -> Vec<String> {
             issue_codes.push(format!("missing_fixture:{fixture}"));
             continue;
         }
+        let normalized_path = display_path_slash(path);
         if path.is_file()
+            && normalized_path.starts_with("qa/fixtures/provider_compat/")
             && path
                 .extension()
                 .and_then(OsStr::to_str)
                 .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
-            && display_path_slash(path).starts_with("qa/fixtures/")
+        {
+            match fs::read_to_string(path)
+                .ok()
+                .and_then(|text| parse_provider_compat_fixture_pack_yaml(text.as_str()).ok())
+            {
+                Some(_) => {}
+                None => issue_codes.push(format!("invalid_provider_compat_fixture:{fixture}")),
+            }
+        } else if path.is_file()
+            && path
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
+            && normalized_path.starts_with("qa/fixtures/")
             && fixture.contains("provider")
         {
             match fs::read_to_string(path)
@@ -2141,6 +2156,16 @@ mod tests {
         assert_eq!(gate_artifact_root(None, None), PathBuf::from("target/qa-lab"));
         assert_eq!(gate_artifact_reference_base(Some("report.json"), None), ".");
         assert_eq!(gate_artifact_reference_base(None, None), "target/qa-lab");
+    }
+
+    #[test]
+    fn provider_compat_scenario_dependencies_use_their_declared_schema() {
+        let manifest = parse_qa_scenario_manifest_yaml(include_str!(
+            "../../../../qa/scenarios/provider/auth_expired.yaml"
+        ))
+        .expect("provider compatibility scenario should parse");
+
+        assert!(validate_pack_fixtures(&manifest).is_empty());
     }
 
     #[test]

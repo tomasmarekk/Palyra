@@ -3,7 +3,7 @@ Validate provider compatibility fixtures
 Usage: palyra qa provider-compat [OPTIONS]
 
 Options:
-      --path <PATH>      [default: fixtures/provider_compat]
+      --path <PATH>      [default: qa/fixtures/provider_compat]
       --output <OUTPUT>
       --json
   -h, --help             Print help

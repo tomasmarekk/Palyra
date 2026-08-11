@@ -103,7 +103,7 @@ fn parse_qa_provider_compat_with_output_and_json() {
         "qa",
         "provider-compat",
         "--path",
-        "fixtures/provider_compat",
+        "qa/fixtures/provider_compat",
         "--output",
         "artifacts/provider-compat.json",
         "--json",
@@ -112,7 +112,7 @@ fn parse_qa_provider_compat_with_output_and_json() {
         parsed.command,
         Command::Qa {
             command: QaCommand::ProviderCompat {
-                path: "fixtures/provider_compat".to_owned(),
+                path: "qa/fixtures/provider_compat".to_owned(),
                 output: Some("artifacts/provider-compat.json".to_owned()),
                 json: true,
             }

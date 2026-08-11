@@ -24,7 +24,7 @@ pub enum QaCommand {
     },
     #[command(about = "Validate provider compatibility fixtures")]
     ProviderCompat {
-        #[arg(long, default_value = "fixtures/provider_compat")]
+        #[arg(long, default_value = "qa/fixtures/provider_compat")]
         path: String,
         #[arg(long)]
         output: Option<String>,

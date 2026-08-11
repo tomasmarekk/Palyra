@@ -13,7 +13,7 @@ requires:
   tools:
     - palyra.fs.read_file
   fixtures:
-    - fixtures/provider_compat/p0_provider_compat_pack.yaml
+    - qa/fixtures/provider_compat/p0_provider_compat_pack.yaml
 steps:
   - id: prompt
     action: user_prompt

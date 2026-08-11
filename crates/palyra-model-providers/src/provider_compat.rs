@@ -464,7 +464,7 @@ pub fn provider_compat_fixture_schema_snapshot() -> Value {
         "schema_version": PROVIDER_COMPAT_FIXTURE_SCHEMA_VERSION,
         "format": PROVIDER_COMPAT_FIXTURE_FORMAT,
         "encoding": "yaml",
-        "examples_root": "fixtures/provider_compat",
+        "examples_root": "qa/fixtures/provider_compat",
         "required_sections": [
             "schema_version",
             "id",
@@ -1238,7 +1238,7 @@ mod tests {
     use crate::{ProviderError, ProviderFailureAction};
 
     const EXAMPLE_PACK: &str =
-        include_str!("../../../fixtures/provider_compat/p0_provider_compat_pack.yaml");
+        include_str!("../../../qa/fixtures/provider_compat/p0_provider_compat_pack.yaml");
 
     #[test]
     fn fixture_pack_covers_required_categories() {
@@ -1403,7 +1403,7 @@ fixtures:
             "schema_version": 1,
             "format": "palyra-provider-compat-fixture-pack",
             "encoding": "yaml",
-            "examples_root": "fixtures/provider_compat",
+            "examples_root": "qa/fixtures/provider_compat",
             "required_sections": [
                 "schema_version",
                 "id",

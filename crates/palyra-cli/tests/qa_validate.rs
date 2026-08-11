@@ -244,7 +244,7 @@ fn qa_provider_compat_reports_failure_classes_and_recovery_paths() -> Result<()>
     let output_path = temp_dir.path().join("provider-compat").join("report.json");
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .current_dir(repo_root())
-        .args(["qa", "provider-compat", "--path", "fixtures/provider_compat", "--output"])
+        .args(["qa", "provider-compat", "--path", "qa/fixtures/provider_compat", "--output"])
         .arg(output_path.as_os_str())
         .arg("--json")
         .output()
