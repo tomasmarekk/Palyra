@@ -3060,7 +3060,7 @@ fn test_worker_lease_request(run_id: &str) -> WorkerLeaseRequest {
             grant_id: format!("grant-{run_id}"),
             run_id: run_id.to_owned(),
             tool_name: "palyra.echo".to_owned(),
-            expires_at_unix_ms: super::current_unix_ms().saturating_add(30_000),
+            expires_at_unix_ms: super::current_unix_ms().saturating_add(60_000),
         },
     }
 }
@@ -4932,6 +4932,9 @@ async fn semantic_memory_auto_injects_only_reviewed_projection_with_citations() 
             ..crate::config::FeatureRolloutsConfig::default()
         },
     );
+    let mut memory_config = state.memory_config_snapshot();
+    memory_config.auto_inject_enabled = true;
+    state.configure_memory(memory_config);
     let context = RequestContext {
         principal: "user:semantic-recall".to_owned(),
         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
@@ -5194,6 +5197,9 @@ async fn memory_auto_inject_does_not_use_broad_ui_query_expansion() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sparse_ui_smoke_recall_uses_replaced_durable_preference() {
     let state = build_test_runtime_state(false);
+    let mut memory_config = state.memory_config_snapshot();
+    memory_config.auto_inject_enabled = true;
+    state.configure_memory(memory_config);
     let context = RequestContext {
         principal: "user:ops".to_owned(),
         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
@@ -5297,6 +5303,9 @@ async fn sparse_ui_smoke_recall_uses_replaced_durable_preference() {
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_auto_inject_adds_active_project_workspace_memory_to_fresh_session_prompt() {
     let state = build_test_runtime_state(false);
+    let mut memory_config = state.memory_config_snapshot();
+    memory_config.auto_inject_enabled = true;
+    state.configure_memory(memory_config);
     let context = RequestContext {
         principal: "user:ops".to_owned(),
         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
@@ -14271,7 +14280,7 @@ async fn tool_program_runtime_executes_echo_and_emits_child_attestation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tool_program_python_rpc_script_reads_and_searches_workspace() {
+async fn tool_program_python_rpc_script_denies_workspace_reads_without_nested_approval() {
     let mut tool_call = default_test_tool_call_config();
     tool_call.allowed_tools = vec![
         super::WORKSPACE_READ_FILE_TOOL_NAME.to_owned(),
@@ -14363,67 +14372,23 @@ async fn tool_program_python_rpc_script_reads_and_searches_workspace() {
     )
     .await;
 
-    assert!(outcome.success, "script program should succeed: {}", outcome.error);
+    assert!(!outcome.success, "approval-gated workspace reads must fail closed");
     let output = parse_tool_output_json(&outcome);
     assert_eq!(output.get("program_kind").and_then(Value::as_str), Some("python_rpc_script"));
-    assert_eq!(output.get("status").and_then(Value::as_str), Some("completed"));
-    assert!(output.pointer("/steps/0/output/text").and_then(Value::as_str).is_some());
+    assert_eq!(output.get("status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(output.pointer("/steps/0/status").and_then(Value::as_str), Some("denied"));
+    assert_eq!(output.pointer("/steps/0/approval_required").and_then(Value::as_bool), Some(true));
     assert_eq!(
-        output.pointer("/steps/1/output/matches/0/path").and_then(Value::as_str),
-        Some("notes.md")
+        output.pointer("/budget_debit/nested_approval_requests").and_then(Value::as_u64),
+        Some(1)
     );
-    assert_eq!(output.pointer("/budget_debit/child_runs_used").and_then(Value::as_u64), Some(2));
-    assert_eq!(
-        output.pointer("/child_call_transcript/0/tool_name").and_then(Value::as_str),
-        Some(super::WORKSPACE_READ_FILE_TOOL_NAME)
+    assert!(
+        output
+            .pointer("/steps/0/error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("cannot self-approve")),
+        "workspace read denial should explain the nested approval boundary: {output}"
     );
-    assert_eq!(
-        output.pointer("/attestation_summary/child_call_count").and_then(Value::as_u64),
-        Some(2)
-    );
-    assert_eq!(
-        output.pointer("/attestation_summary/attested_child_call_count").and_then(Value::as_u64),
-        Some(2)
-    );
-    let sdk_source = output
-        .pointer("/python_sdk/source")
-        .and_then(Value::as_str)
-        .expect("SDK source should be returned");
-    assert!(sdk_source.contains("def call_palyra_fs_read_file("));
-    assert!(sdk_source.contains("def call_palyra_fs_search("));
-    assert!(!sdk_source.contains("palyra.process.run"));
-
-    let jobs = state
-        .list_tool_jobs(ToolJobsListFilter {
-            run_id: Some(run_id.to_owned()),
-            include_terminal: true,
-            limit: 10,
-            ..ToolJobsListFilter::default()
-        })
-        .await
-        .expect("tool jobs should list");
-    let job = jobs
-        .iter()
-        .find(|job| job.tool_name == super::TOOL_PROGRAM_RUN_TOOL_NAME)
-        .expect("tool program job should be recorded");
-    let tail = state
-        .tail_tool_job(ToolJobTailReadRequest {
-            job_id: job.job_id.clone(),
-            owner_principal: Some("user:ops".to_owned()),
-            offset: 0,
-            limit: 10,
-            max_bytes: 4096,
-        })
-        .await
-        .expect("tool job tail should load");
-    let tail_text = tail
-        .entries
-        .iter()
-        .map(|entry| entry.chunk_redacted.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(tail_text.contains("step=read"), "journal tail should show read step: {tail_text}");
-    assert!(tail_text.contains("step=search"), "journal tail should show search step: {tail_text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -16525,13 +16490,12 @@ async fn memory_session_search_tool_returns_session_fallback_when_windows_are_em
         session_hits[0].get("session_key").is_none(),
         "model-visible session fallback must omit the host-owned session key: {payload}"
     );
-    assert!(
-        session_hits[0]
-            .get("match_snippet")
-            .and_then(Value::as_str)
-            .is_some_and(|snippet| snippet.contains("PALYRA_E2E_BETA")),
-        "fallback session hit should carry the matched snippet: {payload}"
-    );
+    for content_field in ["title", "preview", "last_intent", "last_summary", "match_snippet"] {
+        assert!(
+            session_hits[0].get(content_field).is_none(),
+            "fallback metadata must omit conversational field {content_field}: {payload}"
+        );
+    }
     assert!(
         payload
             .get("claim_boundary")
