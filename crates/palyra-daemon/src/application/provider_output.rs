@@ -78,7 +78,28 @@ fn serialize_redacted_provider_output(output: &ProviderTurnOutput) -> Result<Str
     let payload = serde_json::to_string(output).map_err(|error| {
         Status::internal(format!("failed to serialize provider turn output: {error}"))
     })?;
-    Ok(crate::journal::redact_payload_json(payload.as_bytes()).unwrap_or(payload))
+    let Some(redacted) = crate::journal::redact_payload_json(payload.as_bytes()) else {
+        return Ok(payload);
+    };
+    let mut redacted_value: serde_json::Value = serde_json::from_str(&redacted).map_err(|error| {
+        Status::internal(format!("failed to parse redacted provider turn output: {error}"))
+    })?;
+    let usage = redacted_value
+        .get_mut("usage")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| Status::internal("redacted provider turn output omitted usage metadata"))?;
+    usage.insert("prompt_tokens".to_owned(), output.usage.prompt_tokens.into());
+    usage.insert("completion_tokens".to_owned(), output.usage.completion_tokens.into());
+    usage.insert("total_tokens".to_owned(), output.usage.total_tokens.into());
+    if let Some(cache_read_tokens) = output.usage.cache_read_tokens {
+        usage.insert("cache_read_tokens".to_owned(), cache_read_tokens.into());
+    }
+    if let Some(cache_write_tokens) = output.usage.cache_write_tokens {
+        usage.insert("cache_write_tokens".to_owned(), cache_write_tokens.into());
+    }
+    serde_json::to_string(&redacted_value).map_err(|error| {
+        Status::internal(format!("failed to serialize redacted provider turn output: {error}"))
+    })
 }
 
 fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
