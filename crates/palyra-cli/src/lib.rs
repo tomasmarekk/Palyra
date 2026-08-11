@@ -6298,12 +6298,14 @@ fn is_unquoted_cli_arg_char(value: char) -> bool {
     value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.' | '/' | '\\' | ':' | '=')
 }
 
+#[cfg(any(windows, test))]
 fn powershell_encoded_cli_command(args: &[String]) -> String {
     let script = powershell_invocation_script(args);
     let encoded = BASE64_STANDARD.encode(utf16le_bytes(script.as_str()));
     format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand \"{encoded}\"")
 }
 
+#[cfg(any(windows, test))]
 fn powershell_invocation_script(args: &[String]) -> String {
     let Some((program, rest)) = args.split_first() else {
         return String::new();
@@ -6316,10 +6318,12 @@ fn powershell_invocation_script(args: &[String]) -> String {
     script
 }
 
+#[cfg(any(windows, test))]
 fn quote_powershell_single_quoted_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+#[cfg(any(windows, test))]
 fn utf16le_bytes(value: &str) -> Vec<u8> {
     value.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }

@@ -12069,6 +12069,7 @@ fn process_runner_workspace_cache_key(workspace_root: &Path) -> String {
     format!("workspace-{:016x}", hasher.finish())
 }
 
+#[cfg(test)]
 fn join_relative_components(root: &Path, components: &[&str]) -> PathBuf {
     components.iter().fold(root.to_path_buf(), |path, component| path.join(component))
 }
