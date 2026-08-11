@@ -2783,7 +2783,7 @@ mod tests {
     #[test]
     fn code_intel_registry_exposes_read_only_symbol_tools() {
         let health = registry_entry("palyra.code.health").expect("code health entry exists");
-        assert_eq!(health.approval_posture, ToolApprovalPosture::Safe);
+        assert_eq!(health.approval_posture, ToolApprovalPosture::ApprovalRequired);
         assert_eq!(health.parallelism_policy, ToolParallelismPolicy::ReadOnly);
         assert!(health.capabilities.iter().any(|capability| capability == "filesystem_read"));
 
@@ -2803,7 +2803,10 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("query")
         );
-        assert_eq!(workspace_symbols.approval_posture, ToolApprovalPosture::Safe);
+        assert_eq!(
+            workspace_symbols.approval_posture,
+            ToolApprovalPosture::ApprovalRequired
+        );
     }
 
     #[test]
