@@ -12,7 +12,7 @@ turns:
         - proposal_id: qa-fault-mutation
           tool_name: palyra.fs.apply_patch
           input_json:
-            patch: "*** Begin Patch\n*** Update File: src/app.txt\n@@\n-initial sandbox content\n+fault effect happened once\n*** End Patch\n"
+            patch: "*** Begin Patch\n*** Update File: qa/fixtures/app.txt\n@@\n-initial sandbox content\n+fault effect happened once\n*** End Patch\n"
       prompt_tokens: 8
       completion_tokens: 10
   - id: process_before_ack_crash

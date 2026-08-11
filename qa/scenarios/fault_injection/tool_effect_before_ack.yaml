@@ -58,7 +58,7 @@ forbidden:
   artifacts: []
   claims: []
 artifacts:
-  - path: src/app.txt
+  - path: qa/fixtures/app.txt
     kind: workspace
     required: true
     sha256: 78930e608b8acfc1799a5e09e2f1bdb408dde4fd2607d38b86acb16130c2c550
