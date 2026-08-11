@@ -2607,8 +2607,9 @@ fn same_origin(left: &Url, right: &Url) -> bool {
 
 fn remote_url_targets_loopback(url: &Url) -> bool {
     url.host_str().is_some_and(|host| {
+        let address_host = host.strip_prefix('[').and_then(|value| value.strip_suffix(']')).unwrap_or(host);
         host.eq_ignore_ascii_case("localhost")
-            || host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+            || address_host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
     })
 }
 
