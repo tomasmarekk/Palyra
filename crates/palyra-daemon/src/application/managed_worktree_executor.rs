@@ -777,6 +777,7 @@ impl ManagedWorktreeExecutor {
                 "-C".to_owned(),
                 git_path_argument(worktree_path),
                 "config".to_owned(),
+                "--local".to_owned(),
                 "--includes".to_owned(),
                 "--name-only".to_owned(),
                 "--null".to_owned(),
