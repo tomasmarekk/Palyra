@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="${PALYRA_PRE_PUSH_PROFILE:-fast}"
 
+# Keep hook-only build artifacts bounded; callers can opt back into debug data.
+export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
+export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
+
 resolve_cargo() {
   if command -v cargo >/dev/null 2>&1; then
     command -v cargo
