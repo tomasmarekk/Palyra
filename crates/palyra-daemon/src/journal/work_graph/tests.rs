@@ -122,7 +122,7 @@ fn expire_claim(store: &JournalStore, work_item_id: &str) {
         .execute(
             r#"
                 UPDATE work_graph_items
-                SET claim_expires_at_unix_ms = 1
+                SET claim_expires_at_unix_ms = claim_heartbeat_at_unix_ms
                 WHERE graph_ulid = 'graph-1' AND work_item_ulid = ?1
             "#,
             params![work_item_id],
