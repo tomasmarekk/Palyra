@@ -1919,7 +1919,7 @@ mod tests {
         let error = resolve_missing_workspace_root_after_patch_validation(
             std::slice::from_ref(&workspace),
             "invalid-patch-target",
-            "*** Begin Patch\n*** Add File: broken.txt\nmissing addition marker\n*** End Patch",
+            "*** End File",
         )
         .expect_err("invalid patch must fail before root creation");
 
