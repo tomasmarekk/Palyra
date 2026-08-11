@@ -10524,11 +10524,13 @@ turns:
             200_u16,
             r#"{"choices":[{"message":{"content":"cached alpha beta"}}]}"#.to_owned(),
         )]);
-        let provider = build_model_provider(&multi_provider_test_config(
+        let mut config = multi_provider_test_config(
             openai_base_url,
             "http://127.0.0.1:9".to_owned(),
-        ))
-        .expect("registry-backed provider should build");
+        );
+        config.registry.providers[0].auth_profile_id = Some("cache-openai".to_owned());
+        let provider =
+            build_model_provider(&config).expect("registry-backed provider should build");
 
         let mut first_request =
             ProviderRequest::from_input_text("cache me".to_owned(), false, Vec::new(), None);
