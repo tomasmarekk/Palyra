@@ -1092,10 +1092,9 @@ mod live_owner_tests {
 
     #[test]
     fn mcp_tools_remain_behind_canonical_backend_dispatch() {
-        assert!(
-            TOOL_FLOW_SOURCE
-                .contains("execute_tool_with_runtime_dispatch_with_cancellation_and_progress(")
-        );
+        let canonical_dispatch =
+            ["execute_tool_with_runtime_dispatch_with_", "cancellation_and_progress("].concat();
+        assert!(TOOL_FLOW_SOURCE.contains(canonical_dispatch.as_str()));
         assert!(!TOOL_FLOW_SOURCE.contains("execute_persistent_mcp_tool("));
     }
 
