@@ -9585,6 +9585,12 @@ mod tests {
             ExecutionBackendPreference::Docker.as_str(),
             WorkspaceStrategyDescriptor::container_volume().attestation_digest_sha256(),
         ));
+        let expected_patch_sha256 = report
+            .patch_bundle
+            .as_ref()
+            .expect("test report should contain a patch bundle")
+            .patch_sha256
+            .clone();
         let (engine, _) = FakeDockerEngine::new(Ok(report));
         let runner = DockerRunner::new(safe_container_profile(), engine)
             .expect("safe Docker profile should build runner");
@@ -9611,7 +9617,7 @@ mod tests {
             serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
         assert_eq!(
             payload["workspace_writeback"]["patch_bundle"]["patch_sha256"],
-            "2222222222222222222222222222222222222222222222222222222222222222"
+            expected_patch_sha256
         );
         assert_eq!(payload["workspace_writeback"]["patch_bundle"]["reviewed"], true);
         assert_eq!(payload["workspace_writeback"]["patch_bundle"]["file_count"], 2);
