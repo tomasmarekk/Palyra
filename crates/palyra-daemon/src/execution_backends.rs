@@ -6954,7 +6954,7 @@ mod tests {
     use std::{
         collections::BTreeSet,
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{Arc, Mutex},
     };
 
@@ -7067,6 +7067,25 @@ mod tests {
             process_runner,
             wasm_runtime: test_wasm_policy(),
         }
+    }
+
+    fn live_docker_tool_call_config(
+        profile: &ContainerBackendProfile,
+        workspace: &Path,
+        allowed_executable: &str,
+        execution_timeout_ms: u64,
+        allow_interpreters: bool,
+    ) -> ToolCallConfig {
+        let mut policy = test_policy();
+        policy.workspace_root = workspace.to_path_buf();
+        policy.allowed_executables = vec![allowed_executable.to_owned()];
+        policy.allow_interpreters = allow_interpreters;
+        policy.cpu_time_limit_ms = profile.limits.cpu_time_limit_ms;
+        policy.memory_limit_bytes = profile.limits.memory_limit_bytes;
+        policy.max_output_bytes = profile.limits.max_output_bytes;
+        let mut config = test_tool_call_config(policy);
+        config.execution_timeout_ms = execution_timeout_ms;
+        config
     }
 
     fn safe_container_profile() -> ContainerBackendProfile {
@@ -8815,6 +8834,14 @@ mod tests {
         let workspace = temporary.path().join("workspace");
         fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
         fs::write(workspace.join("seed.txt"), "seed\n").expect("seed file should exist");
+        fs::write(
+            workspace.join("qualify.sh"),
+            "set -eu\n\
+             test \"$API_TOKEN\" = live-secret\n\
+             printf 'qualified\\n' > live.txt\n\
+             if wget -q -T 2 -O - http://example.com; then exit 91; fi\n",
+        )
+        .expect("qualification script should exist");
         let (_vault_root, vault) =
             temp_vault_with_secret(VaultScope::Global, "live-token", b"live-secret");
         let mut profile = safe_container_profile();
@@ -8829,15 +8856,13 @@ mod tests {
             source_kind: ContainerEnvSourceKind::VaultRef,
             value: "vault://global/live-token".to_owned(),
         }];
+        let config =
+            live_docker_tool_call_config(&profile, workspace.as_path(), "sh", 20_000, true);
         let governor = test_resource_governor(temporary.path());
         let runner = DockerRunner::new(profile, super::DockerCliEngine)
             .expect("live Docker profile should validate")
             .with_resource_governor(governor.clone());
-        let mut policy = test_policy();
-        policy.allowed_executables = vec!["sh".to_owned()];
-        let mut config = test_tool_call_config(policy);
-        config.execution_timeout_ms = 20_000;
-        let input = br#"{"command":"sh","args":["-c","test \"$API_TOKEN\" = live-secret && printf 'qualified\\n' > live.txt && if wget -q -T 2 -O - http://example.com; then exit 91; fi"]}"#;
+        let input = br#"{"command":"sh","args":["/workspace/qualify.sh"]}"#;
 
         let outcome = runner
             .run_process(ExecutionBackendProcessRunRequest {
@@ -8902,14 +8927,12 @@ mod tests {
         profile.user = current_docker_user();
         profile.limits.cpu_time_limit_ms = 10_000;
         profile.limits.memory_limit_bytes = 64 * 1024 * 1024;
+        let config =
+            live_docker_tool_call_config(&profile, workspace.as_path(), "sleep", 20_000, false);
         let governor = test_resource_governor(temporary.path());
         let runner = DockerRunner::new(profile, super::DockerCliEngine)
             .expect("live Docker profile should validate")
             .with_resource_governor(governor.clone());
-        let mut policy = test_policy();
-        policy.allowed_executables = vec!["sh".to_owned()];
-        let mut config = test_tool_call_config(policy);
-        config.execution_timeout_ms = 20_000;
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation_trigger = cancelled.clone();
         let trigger = tokio::spawn(async move {
@@ -8922,7 +8945,7 @@ mod tests {
                 config: &config,
                 proposal_id: "proposal-docker-live-cancel",
                 tool_name: "palyra.process.run",
-                input_json: br#"{"command":"sh","args":["-c","sleep 30"]}"#,
+                input_json: br#"{"command":"sleep","args":["30"]}"#,
                 vault: None,
                 cancellation_requested: Some(cancelled),
                 process_progress_sink: None,
@@ -8962,12 +8985,10 @@ mod tests {
         profile.mounts[0].host_path = workspace.to_string_lossy().into_owned();
         profile.user = current_docker_user();
         profile.limits.cpu_time_limit_ms = 120_000;
+        let config =
+            live_docker_tool_call_config(&profile, workspace.as_path(), "sleep", 120_000, false);
         let runner = DockerRunner::new(profile, super::DockerCliEngine)
             .expect("live Docker crash profile should validate");
-        let mut policy = test_policy();
-        policy.allowed_executables = vec!["sleep".to_owned()];
-        let mut config = test_tool_call_config(policy);
-        config.execution_timeout_ms = 120_000;
 
         let outcome = runner
             .run_process(ExecutionBackendProcessRunRequest {
@@ -9127,6 +9148,15 @@ mod tests {
         fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
         fs::write(temporary.path().join("host-secret.txt"), "must-not-be-mounted\n")
             .expect("mount escape sentinel should exist");
+        fs::write(
+            workspace.join("output-cap.sh"),
+            "set -eu\n\
+             test ! -e /host-secret.txt\n\
+             yes x | head -c 65536\n",
+        )
+        .expect("output-cap script should exist");
+        fs::write(workspace.join("cpu-cap.sh"), "while :; do :; done\n")
+            .expect("CPU-cap script should exist");
         let mut profile = safe_container_profile();
         profile.profile_id = "docker-live-resource-caps".to_owned();
         profile.image = image.clone();
@@ -9135,19 +9165,17 @@ mod tests {
         profile.limits.cpu_time_limit_ms = 1_000;
         profile.limits.memory_limit_bytes = 32 * 1024 * 1024;
         profile.limits.max_output_bytes = 1_024;
+        let config =
+            live_docker_tool_call_config(&profile, workspace.as_path(), "sh", 15_000, true);
         let runner = DockerRunner::new(profile, super::DockerCliEngine)
             .expect("live Docker profile should validate");
-        let mut policy = test_policy();
-        policy.allowed_executables = vec!["sh".to_owned()];
-        let mut config = test_tool_call_config(policy);
-        config.execution_timeout_ms = 15_000;
 
         let output_outcome = runner
             .run_process(ExecutionBackendProcessRunRequest {
                 config: &config,
                 proposal_id: "proposal-docker-live-output-cap",
                 tool_name: "palyra.process.run",
-                input_json: br#"{"command":"sh","args":["-c","test ! -e /host-secret.txt && yes x | head -c 65536"]}"#,
+                input_json: br#"{"command":"sh","args":["/workspace/output-cap.sh"]}"#,
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
@@ -9171,7 +9199,7 @@ mod tests {
                 config: &config,
                 proposal_id: "proposal-docker-live-cpu-cap",
                 tool_name: "palyra.process.run",
-                input_json: br#"{"command":"sh","args":["-c","while :; do :; done"]}"#,
+                input_json: br#"{"command":"sh","args":["/workspace/cpu-cap.sh"]}"#,
                 vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
