@@ -2281,6 +2281,7 @@ fn console_usage_insights_expose_budget_governance_and_override_requests() -> Re
     let insights = client
         .get(format!("http://127.0.0.1:{admin_port}/console/v1/usage/insights"))
         .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
         .send()
         .context("failed to fetch usage insights")?
         .error_for_status()
