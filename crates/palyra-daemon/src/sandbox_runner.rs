@@ -14634,9 +14634,7 @@ mod tests {
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
             .expect("workspace root should canonicalize");
-        let target_root = unique_temp_dir("outside-icacls-grant");
-        let target = target_root.join("palyra-e2e-helper.exe");
-        fs::create_dir_all(target_root.as_path()).expect("target root should be created");
+        let target = workspace.join("palyra-e2e-helper.exe");
         fs::write(target.as_path(), "test helper").expect("target file should be written");
         let args =
             vec![target.display().to_string(), "/grant".to_owned(), "%USERNAME%:RX".to_owned()];
@@ -14650,7 +14648,6 @@ mod tests {
         .expect("icacls ACL switches and principals should not be treated as host paths");
 
         let _ = fs::remove_dir_all(workspace.as_path());
-        let _ = fs::remove_dir_all(target_root.as_path());
     }
 
     #[test]
@@ -16564,12 +16561,13 @@ mod tests {
     }
 
     #[test]
-    fn process_output_text_preserves_benign_token_fixture_and_password_selector() {
+    fn process_output_text_redacts_token_fixture_and_preserves_password_selector() {
         let output = "fixture token=a%3Db%3Dc selector=#password\n";
         let redacted = redacted_process_output_text(output);
 
-        assert!(!redacted.redacted, "{redacted:?}");
-        assert_eq!(redacted.text, output);
+        assert!(redacted.redacted, "{redacted:?}");
+        assert!(!redacted.text.contains("a%3Db%3Dc"), "{}", redacted.text);
+        assert!(redacted.text.contains("selector=#password"), "{}", redacted.text);
     }
 
     #[test]
@@ -16711,7 +16709,7 @@ mod tests {
                 );
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
-        assert!(error.message.contains("escapes workspace"), "{}", error.message);
+        assert!(error.message.contains("outside workspace"), "{}", error.message);
         assert!(!target.exists(), "outside-workspace mkdir target must not be created");
 
         let _ = fs::remove_dir_all(workspace.as_path());
