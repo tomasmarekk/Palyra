@@ -72,6 +72,7 @@ use crate::{
 };
 
 const NETWORKED_WORKER_NODE_CAPABILITY_TIMEOUT_MS: u64 = 30_000;
+const NETWORKED_WORKER_GRANT_ADMISSION_SLACK_MS: i64 = 5_000;
 const NETWORKED_WORKER_NODE_CAPABILITY_MAX_PAYLOAD_BYTES: u64 = 512 * 1024;
 const NETWORKED_WORKER_WORKSPACE_BUNDLE_MAX_BYTES: usize = 384 * 1024;
 const NETWORKED_WORKER_WORKSPACE_BUNDLE_MAX_ENTRIES: usize = 128;
@@ -2787,6 +2788,8 @@ fn build_worker_lease_request(
 ) -> Result<WorkerLeaseRequest, String> {
     let now_unix_ms = current_unix_ms();
     let ttl_ms = runtime_state.config.networked_workers.lease_ttl_ms;
+    let ttl_ms_i64 = i64::try_from(ttl_ms)
+        .map_err(|_| "networked worker lease ttl exceeds the supported range".to_owned())?;
     let grant_id = Ulid::new().to_string();
     let read_only = WorkerRemoteToolKind::from_tool_name(tool_name)
         .is_none_or(remote_tool_kind_uses_read_only_workspace);
@@ -2823,10 +2826,9 @@ fn build_worker_lease_request(
             grant_id,
             run_id: context.run_id.to_owned(),
             tool_name: tool_name.to_owned(),
-            // `ttl_ms as i64` only wraps for absurd operator-configured TTLs
-            // (> i64::MAX ms); the wrap turns negative and merely expires the
-            // grant immediately, which fails safe.
-            expires_at_unix_ms: now_unix_ms.saturating_add(ttl_ms as i64),
+            expires_at_unix_ms: now_unix_ms
+                .saturating_add(ttl_ms_i64)
+                .saturating_add(NETWORKED_WORKER_GRANT_ADMISSION_SLACK_MS),
         },
     })
 }
