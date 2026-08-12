@@ -4,7 +4,7 @@ Usage: palyra [OPTIONS] <COMMAND>
 
 Commands:
   version         Show CLI build metadata
-  setup           Bootstrap a Palyra installation [aliases: init]
+  setup           Bootstrap a Palyra installation [alias: init]
   doctor          Run diagnostics, repair previews, and rollback workflows
   health          Run a narrow liveness/readiness probe across HTTP and gRPC gateway surfaces
   logs            Tail local gateway journal diagnostics
@@ -41,10 +41,10 @@ Commands:
   state           Inspect and repair local durable state
   sandbox         Inspect effective process-runner and WASM sandbox policy surfaces
   completion      Generate shell completion scripts
-  onboarding      Run guided onboarding workflows [aliases: onboard]
+  onboarding      Run guided onboarding workflows [alias: onboard]
   deployment      Inspect deployment profiles, run preflights, and generate deploy recipes
   configure       Safely reconfigure an existing installation
-  gateway         Gateway and runtime diagnostics surface [aliases: daemon]
+  gateway         Gateway and runtime diagnostics surface [alias: daemon]
   dashboard       Resolve or open the operator dashboard URL
   backup          Create or verify portable operator backups
   reset           Reset selected local runtime scopes
@@ -60,7 +60,7 @@ Commands:
   run             Wait for runs and export trajectories for audit and evals
   models          Inspect and configure model providers and defaults
   patch           Apply workspace patches through the guarded patch engine
-  skills          Manage skill packages, trust, and lifecycle gates [aliases: skill]
+  skills          Manage skill packages, trust, and lifecycle gates [alias: skill]
   secrets         Manage local secrets and vault-backed credentials
   security        Run security audits and posture checks
   tunnel          Open an SSH tunnel for remote daemon access
