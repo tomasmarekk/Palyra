@@ -19,7 +19,7 @@ runs:
   steps:
     - name: Setup Node.js with npm cache
       if: ${{ inputs.cache == 'true' }}
-      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
       with:
         node-version-file: ${{ inputs.node-version-file }}
         cache: npm
@@ -27,7 +27,7 @@ runs:
 
     - name: Setup Node.js without cache
       if: ${{ inputs.cache != 'true' }}
-      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
       with:
         node-version-file: ${{ inputs.node-version-file }}
 
