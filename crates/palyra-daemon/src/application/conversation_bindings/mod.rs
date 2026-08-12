@@ -551,7 +551,7 @@ impl ConversationBindingStore {
     #[cfg(test)]
     pub fn open_temp() -> Self {
         let path = std::env::temp_dir()
-            .join(format!("palyra-conversation-bindings-{}.json", ulid::Ulid::new()));
+            .join(format!("palyra-conversation-bindings-{}.json", ulid::Ulid::generate()));
         Self::open(path).expect("temporary conversation binding store should open")
     }
 
@@ -1359,8 +1359,8 @@ mod tests {
 
     #[test]
     fn create_touch_list_and_reload_are_durable() {
-        let path =
-            std::env::temp_dir().join(format!("palyra-bindings-test-{}.json", ulid::Ulid::new()));
+        let path = std::env::temp_dir()
+            .join(format!("palyra-bindings-test-{}.json", ulid::Ulid::generate()));
         let store = ConversationBindingStore::open(&path).expect("store opens");
         let created = store
             .create_or_touch(create_request("01ARZ3NDEKTSV4RRFFQ69G5FAV", 1_000))

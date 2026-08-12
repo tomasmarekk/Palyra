@@ -1335,7 +1335,7 @@ mod tests {
     use ulid::Ulid;
 
     fn temp_project_context_root() -> PathBuf {
-        std::env::temp_dir().join(format!("palyra-project-context-{}", Ulid::new()))
+        std::env::temp_dir().join(format!("palyra-project-context-{}", Ulid::generate()))
     }
 
     #[test]

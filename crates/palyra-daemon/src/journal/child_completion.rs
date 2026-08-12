@@ -449,7 +449,7 @@ pub(super) fn materialize_child_completion_tx(
             )
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             dedupe_key,
             task.task_id,
             child_session_id,
@@ -483,7 +483,7 @@ pub(super) fn materialize_child_completion_tx(
                 created_at_unix_ms, updated_at_unix_ms
             ) VALUES (?1, ?2, ?3, 'pending', 'child.announce.pending', 0, NULL, ?4, ?4)
         "#,
-        params![Ulid::new().to_string(), envelope_id, dedupe_key, task.updated_at_unix_ms],
+        params![Ulid::generate().to_string(), envelope_id, dedupe_key, task.updated_at_unix_ms],
     )?;
     Ok(())
 }
@@ -781,7 +781,7 @@ fn classify_orphan_children_tx(connection: &Connection, now: i64) -> Result<u64,
                     updated_at_unix_ms = excluded.updated_at_unix_ms
             "#,
             params![
-                Ulid::new().to_string(),
+                Ulid::generate().to_string(),
                 recovery.task_id,
                 u64_to_sqlite(recovery.child_generation, "child_generation")?,
                 recovery.outcome,

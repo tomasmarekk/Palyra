@@ -526,7 +526,7 @@ pub(crate) fn build_channel_router_preview_input(
         )));
     }
     Ok(channel_router::InboundMessage {
-        envelope_id: Ulid::new().to_string(),
+        envelope_id: Ulid::generate().to_string(),
         channel,
         conversation_id: payload.conversation_id.and_then(|value| {
             let trimmed = value.trim();

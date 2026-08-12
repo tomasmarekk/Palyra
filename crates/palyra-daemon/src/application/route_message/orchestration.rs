@@ -360,12 +360,12 @@ async fn admit_v2_route_message_run(
     );
     RunAdmissionController::new(&runtime_state.journal_store)
         .admit(RunAdmissionCommand::from_verified(
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             format!("route_message:{}", session.session_id),
             format!("route_message:{envelope_id}"),
             run_id.to_owned(),
             run_id.to_owned(),
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             JournalRunAdmissionSessionSelector {
                 session_id: Some(session.session_id.clone()),
                 session_key: None,
@@ -431,8 +431,8 @@ pub(crate) async fn handle_routed_route_message(
         runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
         // The intake denial happens before any session/run exists, so fresh
         // ids are minted purely to give the journal event a stable shape.
-        let journal_session_id = Ulid::new().to_string();
-        let journal_run_id = Ulid::new().to_string();
+        let journal_session_id = Ulid::generate().to_string();
+        let journal_run_id = Ulid::generate().to_string();
         // Journal writes are best-effort throughout this flow: the routing
         // outcome must not change because an audit append failed.
         let _ = record_message_router_journal_event(
@@ -490,7 +490,7 @@ pub(crate) async fn handle_routed_route_message(
     let session = resolved_session.session;
     let previous_run_id_for_context = session.last_run_id.clone();
     let session_id = session.session_id.clone();
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let binding_kind = if plan.reply_thread_id.as_deref().is_some_and(|value| !value.is_empty()) {
         ConversationBindingKind::Thread
     } else {

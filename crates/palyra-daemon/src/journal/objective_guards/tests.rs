@@ -19,8 +19,8 @@ impl GuardFixture {
         generation: u64,
         decision: ObjectiveContinuationDecision,
     ) -> ObjectiveProgressObservation {
-        let attempt_id = Ulid::new().to_string();
-        let judge_task_id = Ulid::new().to_string();
+        let attempt_id = Ulid::generate().to_string();
+        let judge_task_id = Ulid::generate().to_string();
         self.store
             .reserve_objective_attempt(&ObjectiveAttemptReserveRequest {
                 attempt_id: attempt_id.clone(),
@@ -84,8 +84,8 @@ fn fixture() -> GuardFixture {
     let root = tempfile::tempdir().expect("temporary journal root should create");
     let db_path = root.path().join("journal.db");
     let store = open_store(db_path.clone());
-    let session_id = Ulid::new().to_string();
-    let root_run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let root_run_id = Ulid::generate().to_string();
     store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
             session_id: session_id.clone(),
@@ -111,7 +111,7 @@ fn fixture() -> GuardFixture {
         _root: root,
         db_path,
         store,
-        objective_id: Ulid::new().to_string(),
+        objective_id: Ulid::generate().to_string(),
         session_id,
         root_run_id,
     }
@@ -283,7 +283,7 @@ fn authoritative_v2_plan_is_atomic_idempotent_and_queryable() {
     let fixture = fixture();
     fixture.reserve_attempt(1, ObjectiveContinuationDecision::Continue);
     let request = V2ComplexPlanEnsureRequest {
-        plan_item_id: Ulid::new().to_string(),
+        plan_item_id: Ulid::generate().to_string(),
         objective_id: fixture.objective_id.clone(),
         session_id: fixture.session_id.clone(),
         root_run_id: fixture.root_run_id.clone(),
@@ -304,7 +304,7 @@ fn authoritative_v2_plan_is_atomic_idempotent_and_queryable() {
     assert_eq!(created.plan_item.reason_code, AUTO_PLAN_REASON);
 
     let mut replay_request = request;
-    replay_request.plan_item_id = Ulid::new().to_string();
+    replay_request.plan_item_id = Ulid::generate().to_string();
     let replay = fixture
         .store
         .ensure_v2_complex_plan(&replay_request)
@@ -360,7 +360,7 @@ fn unchanged_success_evidence_counts_as_no_progress() {
 fn non_objective_complex_plan_uses_validated_run_scope() {
     let fixture = fixture();
     let request = V2ComplexPlanEnsureRequest {
-        plan_item_id: Ulid::new().to_string(),
+        plan_item_id: Ulid::generate().to_string(),
         objective_id: format!("run:{}", fixture.root_run_id),
         session_id: fixture.session_id.clone(),
         root_run_id: fixture.root_run_id.clone(),

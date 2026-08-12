@@ -579,7 +579,7 @@ impl JournalStore {
         applied_steps: &[String],
         remaining_findings: &[StateHealthFinding],
     ) -> Result<String, JournalError> {
-        let event_id = Ulid::new().to_string();
+        let event_id = Ulid::generate().to_string();
         let now = current_unix_ms()?;
         let payload = json!({
             "event_name": "state.repair.applied",
@@ -1260,7 +1260,7 @@ fn create_state_repair_backup(
         .map_err(|source| JournalError::CreateDirectory { path: backup_dir.clone(), source })?;
     enforce_owner_only_permissions(backup_dir.as_path(), 0o700)?;
     let backup_path =
-        backup_dir.join(format!("journal-{}-{}.sqlite3", created_at_unix_ms, Ulid::new()));
+        backup_dir.join(format!("journal-{}-{}.sqlite3", created_at_unix_ms, Ulid::generate()));
     connection.execute("VACUUM INTO ?1", params![backup_path.to_string_lossy().as_ref()])?;
     enforce_owner_only_permissions(backup_path.as_path(), 0o600)?;
     let size_bytes =

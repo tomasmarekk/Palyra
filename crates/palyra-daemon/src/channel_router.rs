@@ -1456,7 +1456,7 @@ impl ChannelRouter {
     fn generate_pairing_code() -> String {
         // Take the ULID tail: its trailing characters come from the random
         // section, while a prefix would be timestamp-derived and guessable.
-        let raw = Ulid::new().to_string();
+        let raw = Ulid::generate().to_string();
         raw[raw.len().saturating_sub(DM_PAIRING_CODE_LENGTH)..].to_owned()
     }
 

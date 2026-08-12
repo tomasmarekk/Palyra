@@ -336,7 +336,7 @@ impl DesktopCompanionState {
         output_voice_label: Option<&str>,
     ) {
         self.voice.audit_log.push(DesktopCompanionVoiceAuditEntry {
-            audit_id: Ulid::new().to_string(),
+            audit_id: Ulid::generate().to_string(),
             kind: kind.into(),
             detail: detail.into(),
             created_at_unix_ms,
@@ -366,7 +366,7 @@ impl DesktopCompanionState {
         created_at_unix_ms: i64,
     ) {
         self.notifications.push(DesktopCompanionNotification {
-            notification_id: Ulid::new().to_string(),
+            notification_id: Ulid::generate().to_string(),
             kind,
             title: title.into(),
             detail: detail.into(),
@@ -403,7 +403,7 @@ impl DesktopCompanionState {
         reason: &str,
         created_at_unix_ms: i64,
     ) -> String {
-        let draft_id = Ulid::new().to_string();
+        let draft_id = Ulid::generate().to_string();
         self.offline_drafts.push(DesktopCompanionOfflineDraft {
             draft_id: draft_id.clone(),
             session_id: session_id.and_then(normalize_optional_text).map(str::to_owned),
@@ -505,7 +505,7 @@ impl DesktopOnboardingState {
     /// Ensures old or malformed state files always have a flow id.
     pub(crate) fn ensure_flow_id(&mut self) {
         if self.flow_id.trim().is_empty() {
-            self.flow_id = Ulid::new().to_string();
+            self.flow_id = Ulid::generate().to_string();
         }
     }
 
@@ -551,7 +551,7 @@ impl DesktopOnboardingState {
 impl Default for DesktopOnboardingState {
     fn default() -> Self {
         Self {
-            flow_id: Ulid::new().to_string(),
+            flow_id: Ulid::generate().to_string(),
             welcome_acknowledged_at_unix_ms: None,
             state_root_confirmed_at_unix_ms: None,
             dashboard_handoff_at_unix_ms: None,
@@ -1197,7 +1197,7 @@ fn load_desktop_runtime_secrets(
 }
 
 fn generate_secret_token() -> String {
-    format!("{}{}", Ulid::new(), Ulid::new())
+    format!("{}{}", Ulid::generate(), Ulid::generate())
 }
 
 fn generate_desktop_secret(key: &str) -> Result<String> {

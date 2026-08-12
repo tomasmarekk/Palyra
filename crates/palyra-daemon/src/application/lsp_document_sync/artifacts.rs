@@ -56,7 +56,7 @@ impl DiagnosticsArtifactStore {
         if bytes.is_empty() || bytes.len() > self.max_artifact_bytes {
             return Err(LspDocumentSyncError::ArtifactTooLarge);
         }
-        let artifact_id = format!("diag_{kind}_{}", ulid::Ulid::new());
+        let artifact_id = format!("diag_{kind}_{}", ulid::Ulid::generate());
         let target = self.artifact_path(artifact_id.as_str())?;
         let temporary = self.owner_root.join(format!(".{artifact_id}.tmp"));
         let result = (|| {

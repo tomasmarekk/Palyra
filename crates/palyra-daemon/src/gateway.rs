@@ -393,7 +393,7 @@ pub(crate) async fn ingest_memory_best_effort(
     }
     if let Err(error) = runtime_state
         .ingest_memory_item(MemoryItemCreateRequest {
-            memory_id: Ulid::new().to_string(),
+            memory_id: Ulid::generate().to_string(),
             principal: principal.to_owned(),
             channel: channel.map(str::to_owned),
             session_id: session_id.map(str::to_owned),
@@ -2117,7 +2117,7 @@ async fn record_process_run_verification_classification(
     };
     let event = match crate::application::verification::VerificationEvent::create(
         crate::application::verification::VerificationEventCreateRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: context.session_id.to_owned(),
             run_id: context.run_id.to_owned(),
             workspace_root: crate::application::project_facts::workspace_root_ref(
@@ -2169,7 +2169,7 @@ async fn record_verification_journal_projection(
     };
     if let Err(error) = runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: projection.session_id,
             run_id: projection.run_id,
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
@@ -2432,9 +2432,9 @@ fn run_owned_background_process_from_tool_output(
     let lifetime_ms =
         payload.get("lifetime_ms").and_then(Value::as_u64).unwrap_or(120_000).min(30 * 60_000);
     let expires_at_unix_ms = now.saturating_add(i64::try_from(lifetime_ms).unwrap_or(i64::MAX));
-    let instance_id = RuntimeInstanceId::parse(format!("process:{}", Ulid::new()).as_str())
+    let instance_id = RuntimeInstanceId::parse(format!("process:{}", Ulid::generate()).as_str())
         .map_err(|error| Status::internal(error.to_string()))?;
-    let lease_id = RuntimeLeaseId::parse(format!("process-lease:{}", Ulid::new()).as_str())
+    let lease_id = RuntimeLeaseId::parse(format!("process-lease:{}", Ulid::generate()).as_str())
         .map_err(|error| Status::internal(error.to_string()))?;
     let descriptor = RuntimeHandleDescriptorV1 {
         schema_version: RUNTIME_HANDLE_SCHEMA_VERSION,
@@ -2557,9 +2557,9 @@ fn prepare_background_process_registration(
         run_identity: RuntimeRunId::parse(context.run_id)
             .map_err(|error| Status::failed_precondition(error.to_string()))?,
         generation,
-        instance_id: RuntimeInstanceId::parse(format!("process:{}", Ulid::new()).as_str())
+        instance_id: RuntimeInstanceId::parse(format!("process:{}", Ulid::generate()).as_str())
             .map_err(|error| Status::internal(error.to_string()))?,
-        lease_id: RuntimeLeaseId::parse(format!("process-lease:{}", Ulid::new()).as_str())
+        lease_id: RuntimeLeaseId::parse(format!("process-lease:{}", Ulid::generate()).as_str())
             .map_err(|error| Status::internal(error.to_string()))?,
         state: Arc::new(Mutex::new(BackgroundProcessRegistrationState::Pending)),
     }))
@@ -3431,7 +3431,7 @@ async fn record_process_input_journal_event(
     };
     if let Err(error) = runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: context.session_id.to_owned(),
             run_id: context.run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
@@ -3489,7 +3489,7 @@ async fn record_process_keys_journal_event(
     };
     if let Err(error) = runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: context.session_id.to_owned(),
             run_id: context.run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
@@ -5204,7 +5204,7 @@ async fn record_run_failure_journal_event(
 
     if let Err(error) = runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::RunFailed as i32,
@@ -5468,7 +5468,7 @@ pub(crate) fn build_pending_tool_approval(
             .to_owned(),
     };
     PendingToolApproval {
-        approval_id: Ulid::new().to_string(),
+        approval_id: Ulid::generate().to_string(),
         request_summary,
         policy_snapshot,
         prompt,
@@ -5537,7 +5537,7 @@ pub(crate) async fn record_approval_requested_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::ToolProposed as i32,
@@ -5622,7 +5622,7 @@ pub(crate) async fn record_approval_resolved_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
@@ -5688,7 +5688,7 @@ pub(crate) async fn record_message_router_journal_event(
     }
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::MessageReceived as i32,
@@ -5720,9 +5720,9 @@ pub(crate) async fn record_vault_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
@@ -5757,9 +5757,9 @@ pub(crate) async fn record_agent_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
@@ -5782,9 +5782,9 @@ pub(crate) async fn record_auth_profile_saved_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
@@ -5819,9 +5819,9 @@ pub(crate) async fn record_auth_profile_deleted_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
@@ -5862,9 +5862,9 @@ pub(crate) async fn record_auth_refresh_journal_event(
     let redacted_reason = crate::model_provider::sanitize_remote_error(outcome.reason.as_str());
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
@@ -5993,7 +5993,7 @@ pub(crate) fn classify_sandbox_escape_attempt(error: &str) -> Option<SandboxEsca
 /// Opens a throwaway encrypted-file vault under a unique temp directory.
 #[cfg(test)]
 pub(crate) fn build_test_vault() -> Arc<Vault> {
-    let nonce = Ulid::new();
+    let nonce = Ulid::generate();
     let root = std::env::temp_dir().join(format!("palyra-gateway-test-vault-{nonce}"));
     let identity_root =
         std::env::temp_dir().join(format!("palyra-gateway-test-vault-identity-{nonce}"));

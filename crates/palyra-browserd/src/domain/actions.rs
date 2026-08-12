@@ -435,7 +435,7 @@ pub(crate) async fn finalize_session_action(
             return (None, Vec::new(), String::new());
         };
         let entry = BrowserActionLogEntryInternal {
-            action_id: Ulid::new().to_string(),
+            action_id: Ulid::generate().to_string(),
             action_name: request.action_name.to_owned(),
             selector: request.selector.to_owned(),
             success: request.success,

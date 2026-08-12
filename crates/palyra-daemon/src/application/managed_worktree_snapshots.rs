@@ -257,7 +257,7 @@ impl WorktreeSnapshotStore {
         let index_path = PathBuf::from(index_path_output.trim());
         let index_bytes = read_bounded_file(index_path.as_path(), self.config.max_file_bytes)?;
         enforce_snapshot_content_policy(index_bytes.as_slice())?;
-        let snapshot_id = format!("snapshot_{}", ulid::Ulid::new());
+        let snapshot_id = format!("snapshot_{}", ulid::Ulid::generate());
         let snapshot_root = self.config.artifact_root.join(snapshot_id.as_str());
         create_private_dir(snapshot_root.as_path())?;
         let mut creation = SnapshotCreationGuard::new(snapshot_root.clone());
@@ -867,7 +867,7 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), WorktreeSnapshotError
     fs::create_dir_all(parent)
         .map_err(|error| WorktreeSnapshotError::Storage(error.to_string()))?;
     let mut temporary_name = path.as_os_str().to_os_string();
-    temporary_name.push(format!(".restore.{}", ulid::Ulid::new()));
+    temporary_name.push(format!(".restore.{}", ulid::Ulid::generate()));
     let temporary_path = PathBuf::from(temporary_name);
     fs::write(temporary_path.as_path(), bytes)
         .map_err(|error| WorktreeSnapshotError::Storage(error.to_string()))?;
@@ -877,7 +877,7 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), WorktreeSnapshotError
             return Err(WorktreeSnapshotError::Storage(rename_error.to_string()));
         }
         let mut rollback_name = path.as_os_str().to_os_string();
-        rollback_name.push(format!(".rollback.{}", ulid::Ulid::new()));
+        rollback_name.push(format!(".rollback.{}", ulid::Ulid::generate()));
         let rollback_path = PathBuf::from(rollback_name);
         fs::rename(path, rollback_path.as_path())
             .map_err(|error| WorktreeSnapshotError::Storage(error.to_string()))?;

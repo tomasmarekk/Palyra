@@ -287,7 +287,7 @@ impl RunStreamV2Callbacks {
                 .retain_provider_proposal(retained)
                 .map_err(|_| self.kernel_failure("runtime.provider.tool_proposal_invalid"))?;
             let operation_id =
-                RuntimeOperationId::parse(format!("tool-operation:{}", Ulid::new()).as_str())
+                RuntimeOperationId::parse(format!("tool-operation:{}", Ulid::generate()).as_str())
                     .map_err(|_| self.kernel_failure("runtime.provider.tool_operation_invalid"))?;
             proposal = Some((request, operation_id));
         }
@@ -1168,9 +1168,9 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
         result: DeliveryResult,
     ) -> HarnessFuture<'a, Result<HarnessDeliveryBinding, RuntimeErrorEnvelopeV1>> {
         Box::pin(async move {
-            let operation_id = RuntimeOperationId::parse(Ulid::new().to_string().as_str())
+            let operation_id = RuntimeOperationId::parse(Ulid::generate().to_string().as_str())
                 .map_err(|_| self.kernel_failure("runtime.delivery.operation_id_invalid"))?;
-            let output_event_id = RuntimeEventId::parse(Ulid::new().to_string().as_str())
+            let output_event_id = RuntimeEventId::parse(Ulid::generate().to_string().as_str())
                 .map_err(|_| self.kernel_failure("runtime.delivery.output_event_id_invalid"))?;
             Ok(HarnessDeliveryBinding {
                 delivery_intent_id: result.delivery_intent_id,
@@ -2030,14 +2030,14 @@ mod production_wiring_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn exact_receipt_converges_before_closed_transport_despite_late_cancel() {
         let state = build_test_runtime_state(false);
-        let session_id = Ulid::new().to_string();
-        let run_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
+        let run_id = Ulid::generate().to_string();
         admit_test_v2_run(
             &state.journal_store,
             session_id.as_str(),
             run_id.as_str(),
             "user:ops",
-            Ulid::new().to_string().as_str(),
+            Ulid::generate().to_string().as_str(),
         )
         .expect("test run should admit through the canonical V2 controller");
         let (_, generation) = state

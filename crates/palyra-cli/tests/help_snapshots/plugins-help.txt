@@ -4,7 +4,7 @@ Usage: palyra plugins [OPTIONS] <COMMAND>
 
 Commands:
   list
-  inspect      [aliases: info]
+  inspect      [alias: info]
   discover
   check
   explain
@@ -14,7 +14,7 @@ Commands:
   dry-run
   permissions
   test
-  install      [aliases: bind]
+  install      [alias: bind]
   update
   enable
   disable

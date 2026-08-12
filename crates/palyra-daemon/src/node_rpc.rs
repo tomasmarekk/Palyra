@@ -219,7 +219,7 @@ impl NodeRpcServiceImpl {
         identity_fingerprint: &str,
         transcript_hash_hex: &str,
     ) -> Result<String, Status> {
-        let approval_id = Ulid::new().to_string();
+        let approval_id = Ulid::generate().to_string();
         let prompt = ApprovalPromptRecord {
             title: format!("Approve device pairing for {device_id}"),
             risk_level: ApprovalRiskLevel::High,
@@ -272,7 +272,7 @@ impl NodeRpcServiceImpl {
             .create_approval_record(ApprovalCreateRequest {
                 approval_id: approval_id.clone(),
                 session_id: session_id.to_owned(),
-                run_id: Ulid::new().to_string(),
+                run_id: Ulid::generate().to_string(),
                 principal: NODE_PAIRING_PRINCIPAL.to_owned(),
                 device_id: device_id.to_owned(),
                 channel: Some(NODE_PAIRING_CHANNEL.to_owned()),
@@ -778,7 +778,7 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
                             let response = node_v1::NodeEventResponse {
                                 v: message.v.max(1),
                                 event_id: Some(common_v1::CanonicalId {
-                                    ulid: Ulid::new().to_string(),
+                                    ulid: Ulid::generate().to_string(),
                                 }),
                                 accepted: false,
                                 reason: "capability_result_owner_unavailable".to_owned(),
@@ -809,7 +809,7 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
                 };
                 let response = node_v1::NodeEventResponse {
                     v: message.v.max(1),
-                    event_id: Some(common_v1::CanonicalId { ulid: Ulid::new().to_string() }),
+                    event_id: Some(common_v1::CanonicalId { ulid: Ulid::generate().to_string() }),
                     accepted: true,
                     reason: "accepted".to_owned(),
                     dispatch: dispatch.clone().map(Self::dispatch_to_proto),

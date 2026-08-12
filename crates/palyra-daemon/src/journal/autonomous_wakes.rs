@@ -258,7 +258,7 @@ impl JournalStore {
             (AutonomousWakeDecision::Admitted, None)
         };
 
-        let admission_id = Ulid::new().to_string();
+        let admission_id = Ulid::generate().to_string();
         let created_at_unix_ms = current_unix_ms()?;
         transaction.execute(
             r#"
@@ -317,7 +317,7 @@ impl JournalStore {
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 "#,
                 params![
-                    Ulid::new().to_string(),
+                    Ulid::generate().to_string(),
                     admission_id,
                     request.owner_principal,
                     request.routine_id,
@@ -755,8 +755,8 @@ mod tests {
     fn active_user_input_preempts_autonomous_wake_atomically() {
         let root = tempfile::tempdir().expect("temporary root should create");
         let store = open_store(root.path().join("journal.db"));
-        let session_id = Ulid::new().to_string();
-        let run_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
+        let run_id = Ulid::generate().to_string();
         store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
                 session_id: session_id.clone(),
@@ -780,7 +780,7 @@ mod tests {
             .expect("run should create");
         store
             .create_orchestrator_queued_input(&OrchestratorQueuedInputCreateRequest {
-                queued_input_id: Ulid::new().to_string(),
+                queued_input_id: Ulid::generate().to_string(),
                 run_id: run_id.clone(),
                 session_id,
                 state: "pending".to_owned(),

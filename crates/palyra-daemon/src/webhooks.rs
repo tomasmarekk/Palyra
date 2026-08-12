@@ -1386,7 +1386,7 @@ mod tests {
     fn webhook_test_integration_accepts_valid_signature_once(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (registry, vault, _temp) = test_registry_with_signed_webhook()?;
-        let nonce = Ulid::new().to_string();
+        let nonce = Ulid::generate().to_string();
         let payload_bytes =
             signed_test_webhook_payload("github.repo_a", "push", nonce.as_str(), b"super-secret")?;
 

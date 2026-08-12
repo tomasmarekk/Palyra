@@ -91,7 +91,7 @@ impl JournalStore {
             });
         }
 
-        let handoff_id = Ulid::new().to_string();
+        let handoff_id = Ulid::generate().to_string();
         transaction.execute(
             r#"
                 INSERT INTO work_graph_handoffs (
@@ -243,7 +243,7 @@ impl JournalStore {
         if snapshot.graph.owner.principal != request.actor_principal && !worker_allowed {
             return Err(invalid_handoff("comment principal is outside the graph ACL"));
         }
-        let comment_id = Ulid::new().to_string();
+        let comment_id = Ulid::generate().to_string();
         let provenance_sha256 = digest_json(&json!({
             "comment_id": comment_id,
             "graph_id": request.graph_id,
@@ -367,7 +367,7 @@ impl JournalStore {
             WorkGraphReviewDecision::Approve => REVIEW_APPROVED_REASON,
             WorkGraphReviewDecision::Reject => REVIEW_REJECTED_REASON,
         };
-        let review_id = Ulid::new().to_string();
+        let review_id = Ulid::generate().to_string();
         let provenance_sha256 = digest_json(&json!({
             "review_id": review_id,
             "handoff_provenance_sha256": handoff.provenance_sha256,

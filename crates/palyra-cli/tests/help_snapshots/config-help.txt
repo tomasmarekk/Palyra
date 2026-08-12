@@ -8,7 +8,7 @@ Commands:
   validate  Validate the local configuration file
   explain   Explain configuration metadata and effective source
   doctor    Check config, env overrides, and unsafe rollout posture
-  list      List effective configuration values [aliases: show]
+  list      List effective configuration values [alias: show]
   get       Read one configuration key
   set       Set one configuration key
   unset     Remove one configuration key

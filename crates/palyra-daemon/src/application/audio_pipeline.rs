@@ -80,7 +80,7 @@ impl AudioInputArtifactV1 {
         let created_at_unix_ms = unix_ms();
         Self {
             v: AUDIO_PIPELINE_SCHEMA_VERSION,
-            artifact_id: Ulid::new().to_string(),
+            artifact_id: Ulid::generate().to_string(),
             file_name: descriptor.file_name,
             content_type: descriptor.content_type,
             codec: descriptor.codec,
@@ -708,7 +708,7 @@ impl AudioPipeline {
             TrustLabel::ExternalUntrusted,
         );
         let created_at_unix_ms = unix_ms();
-        let artifact_id = Ulid::new().to_string();
+        let artifact_id = Ulid::generate().to_string();
         let text = redaction.redacted_text;
         let transcript_sha256 = sha256_hex(text.as_bytes());
         let duration_ms = response.duration_ms.unwrap_or(input.duration_ms);
@@ -829,7 +829,7 @@ impl AudioPipeline {
         let created_at_unix_ms = unix_ms();
         let artifact = AudioOutputArtifactV1 {
             v: AUDIO_PIPELINE_SCHEMA_VERSION,
-            artifact_id: Ulid::new().to_string(),
+            artifact_id: Ulid::generate().to_string(),
             source_run_id: receipt.run_id.clone(),
             source_text_sha256: sha256_hex(receipt.text.as_bytes()),
             content_type: response.content_type,

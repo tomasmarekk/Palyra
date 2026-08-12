@@ -550,7 +550,7 @@ impl LspWorkspaceSupervisor {
         let now = unix_time_ms();
         let handle = LspServerHandleV2 {
             schema_version: LSP_HANDLE_SCHEMA_VERSION,
-            handle_id: format!("lsp_{}", ulid::Ulid::new()),
+            handle_id: format!("lsp_{}", ulid::Ulid::generate()),
             workspace_root_sha256: key.workspace_root_sha256.clone(),
             worktree_id: request.worktree_id,
             language: request.language,
@@ -1515,7 +1515,7 @@ fn write_registry(
     let payload = serde_json::to_vec_pretty(registry)
         .map_err(|error| LspWorkspaceSupervisorError::Persistence(error.to_string()))?;
     let mut temporary = path.as_os_str().to_os_string();
-    temporary.push(format!(".tmp.{}", ulid::Ulid::new()));
+    temporary.push(format!(".tmp.{}", ulid::Ulid::generate()));
     let temporary = PathBuf::from(temporary);
     fs::write(temporary.as_path(), payload)
         .map_err(|error| LspWorkspaceSupervisorError::Persistence(error.to_string()))?;
@@ -1523,7 +1523,7 @@ fn write_registry(
     if let Err(rename_error) = fs::rename(temporary.as_path(), path) {
         if path.is_file() {
             let mut swap = path.as_os_str().to_os_string();
-            swap.push(format!(".swap.{}", ulid::Ulid::new()));
+            swap.push(format!(".swap.{}", ulid::Ulid::generate()));
             let swap = PathBuf::from(swap);
             fs::rename(path, swap.as_path())
                 .map_err(|error| LspWorkspaceSupervisorError::Persistence(error.to_string()))?;

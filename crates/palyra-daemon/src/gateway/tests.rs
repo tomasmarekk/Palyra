@@ -1844,7 +1844,7 @@ fn pending_process_cleanup_synthetic_registration_failure_remains_owned_for_retr
 #[test]
 fn process_reconciliation_preserves_exact_current_runtime_authority() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let pid = 3_450_000_u32.saturating_add(std::process::id());
     let process = explicit_stop_test_process(&state, run_id.as_str(), pid, "periodic-authority");
 
@@ -1880,7 +1880,7 @@ fn process_reconciliation_preserves_exact_current_runtime_authority() {
 #[test]
 fn process_reconciliation_finalizes_exact_current_runtime_absence() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let pid = 3_475_000_u32.saturating_add(std::process::id());
     let provenance = ProcessProvenance {
         ownership_kind: ProcessOwnershipKind::WindowsJobObject,
@@ -1946,7 +1946,7 @@ fn process_reconciliation_finalizes_exact_current_runtime_absence() {
 #[test]
 fn process_reconciliation_keeps_unix_group_absence_orphaned_and_owned() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let pid = 3_475_000_u32.saturating_add(std::process::id());
     let provenance = ProcessProvenance {
         ownership_kind: ProcessOwnershipKind::UnixProcessGroup,
@@ -2169,8 +2169,8 @@ async fn admit_session_queued_input_persists_followup_for_active_run() {
         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
         channel: Some("discord:ops".to_owned()),
     };
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     upsert_test_orchestrator_session(&state, &context, session_id.as_str());
     state
         .start_orchestrator_run(OrchestratorRunStartRequest {
@@ -2282,9 +2282,9 @@ async fn grpc_run_stream_provider_supersession_suppresses_stale_output_and_settl
     const REPLACEMENT_OUTPUT: &str = "generation-N-plus-1-output";
 
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
-    let envelope_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
+    let envelope_id = Ulid::generate().to_string();
 
     // This regression exercises provider replacement on the compatibility runtime, so model an
     // existing legacy session explicitly instead of admitting a forbidden new legacy session.
@@ -2579,7 +2579,7 @@ fn seed_archived_objective_for_job(state: &std::sync::Arc<GatewayRuntimeState>, 
         .objectives
         .upsert_objective(ObjectiveUpsert {
             record: ObjectiveRecord {
-                objective_id: Ulid::new().to_string(),
+                objective_id: Ulid::generate().to_string(),
                 kind: ObjectiveKind::Objective,
                 state: ObjectiveState::Archived,
                 name: "Archived automation".to_owned(),
@@ -2720,7 +2720,7 @@ fn cleanup_test_tool_outcome(success: bool, output: Value) -> super::ToolExecuti
         output_json: serde_json::to_vec(&output).expect("test output should serialize"),
         error: if success { String::new() } else { "failed".to_owned() },
         attestation: crate::tool_protocol::ToolAttestation {
-            attestation_id: Ulid::new().to_string(),
+            attestation_id: Ulid::generate().to_string(),
             execution_sha256: "cleanup-test".to_owned(),
             executed_at_unix_ms: 0,
             timed_out: false,
@@ -2840,8 +2840,8 @@ fn process_run_verification_status_requires_a_zero_terminal_exit_code_to_pass() 
 #[tokio::test(flavor = "multi_thread")]
 async fn gateway_tape_append_rejects_unmapped_event_after_generation_closure() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state
         .journal_store
@@ -3179,9 +3179,9 @@ impl Drop for TestSafeguardFailureGuard {
 
 fn build_test_approval_request(subject_suffix: usize) -> ApprovalCreateRequest {
     ApprovalCreateRequest {
-        approval_id: Ulid::new().to_string(),
-        session_id: Ulid::new().to_string(),
-        run_id: Ulid::new().to_string(),
+        approval_id: Ulid::generate().to_string(),
+        session_id: Ulid::generate().to_string(),
+        run_id: Ulid::generate().to_string(),
         principal: "user:ops".to_owned(),
         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
         channel: Some("cli".to_owned()),
@@ -6694,11 +6694,11 @@ async fn networked_worker_lifecycle_events_are_journaled() {
         .expect("worker lease assignment should succeed");
     assert_eq!(lease.run_id, "run-worker-01");
     assert_eq!(assigned.reason_code, "worker.assigned");
-    let queued_remote_request_id = Ulid::new().to_string();
+    let queued_remote_request_id = Ulid::generate().to_string();
     state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
             remote_request_id: queued_remote_request_id.clone(),
-            node_request_id: Ulid::new().to_string(),
+            node_request_id: Ulid::generate().to_string(),
             worker_id: "worker-01".to_owned(),
             lease_id: lease.lease_id.clone(),
             session_id: session_id.to_owned(),
@@ -6709,8 +6709,8 @@ async fn networked_worker_lifecycle_events_are_journaled() {
             request_sha256: super::sha256_hex(b"worker-lifecycle-queued-dispatch"),
         })
         .expect("queued dispatch claim should be created");
-    let inflight_remote_request_id = Ulid::new().to_string();
-    let inflight_node_request_id = Ulid::new().to_string();
+    let inflight_remote_request_id = Ulid::generate().to_string();
+    let inflight_node_request_id = Ulid::generate().to_string();
     let inflight_request_sha256 = super::sha256_hex(b"worker-lifecycle-inflight-dispatch");
     state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
@@ -7119,8 +7119,8 @@ async fn networked_worker_completion_journal_failure_retains_exact_active_lease(
         )
         .await
         .expect("worker lease assignment should succeed");
-    let remote_request_id = Ulid::new().to_string();
-    let node_request_id = Ulid::new().to_string();
+    let remote_request_id = Ulid::generate().to_string();
+    let node_request_id = Ulid::generate().to_string();
     let request_sha256 = super::sha256_hex(b"worker-completion-atomic-dispatch");
     state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
@@ -8286,8 +8286,8 @@ async fn networked_worker_expiry_cancels_queued_dispatch_claim_before_dequeue() 
         .assign_networked_worker_lease(worker_id, test_worker_lease_request("run-dispatch-expiry"))
         .await
         .expect("worker lease assignment should succeed");
-    let remote_request_id = Ulid::new().to_string();
-    let node_request_id = Ulid::new().to_string();
+    let remote_request_id = Ulid::generate().to_string();
+    let node_request_id = Ulid::generate().to_string();
     let claim = state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
             remote_request_id: remote_request_id.clone(),
@@ -8349,8 +8349,8 @@ async fn networked_worker_revocation_before_payload_release_cancels_reservation(
         )
         .await
         .expect("worker lease assignment should succeed");
-    let remote_request_id = Ulid::new().to_string();
-    let node_request_id = Ulid::new().to_string();
+    let remote_request_id = Ulid::generate().to_string();
+    let node_request_id = Ulid::generate().to_string();
     let request_sha256 = super::sha256_hex(b"unreleased-dispatch-payload");
     state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
@@ -8366,8 +8366,8 @@ async fn networked_worker_revocation_before_payload_release_cancels_reservation(
             request_sha256: request_sha256.clone(),
         })
         .expect("exact dispatch claim should be created");
-    let delivery_attempt_id = Ulid::new().to_string();
-    let delivery_token = format!("{}{}", Ulid::new(), Ulid::new());
+    let delivery_attempt_id = Ulid::generate().to_string();
+    let delivery_token = format!("{}{}", Ulid::generate(), Ulid::generate());
     assert!(matches!(
         state
             .journal_store
@@ -8427,8 +8427,8 @@ async fn networked_worker_quarantine_moves_inflight_claim_to_reconciliation() {
         )
         .await
         .expect("worker lease assignment should succeed");
-    let remote_request_id = Ulid::new().to_string();
-    let node_request_id = Ulid::new().to_string();
+    let remote_request_id = Ulid::generate().to_string();
+    let node_request_id = Ulid::generate().to_string();
     let request_sha256 = super::sha256_hex(b"dispatch-payload");
     state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
@@ -8472,7 +8472,7 @@ async fn networked_worker_quarantine_moves_inflight_claim_to_reconciliation() {
     );
     assert!(durable_claim.revoked_fleet_generation.is_some());
     assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
-    let wrong_attempt = Ulid::new().to_string();
+    let wrong_attempt = Ulid::generate().to_string();
     let mismatch = state
         .settle_reconciling_networked_worker_dispatch(
             &networked_worker_settlement_identity(
@@ -8536,8 +8536,8 @@ async fn networked_worker_late_result_uses_pre_expiry_host_observation_after_ttl
         )
         .await
         .expect("worker lease assignment should succeed");
-    let remote_request_id = Ulid::new().to_string();
-    let node_request_id = Ulid::new().to_string();
+    let remote_request_id = Ulid::generate().to_string();
+    let node_request_id = Ulid::generate().to_string();
     let request_sha256 = super::sha256_hex(b"dispatch-payload");
     state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
@@ -8646,8 +8646,8 @@ async fn networked_worker_restart_cancels_only_queued_dispatch_claims() {
         .assign_networked_worker_lease(worker_id, test_worker_lease_request("run-dispatch-restart"))
         .await
         .expect("worker lease assignment should succeed");
-    let queued_remote_request_id = Ulid::new().to_string();
-    let queued_node_request_id = Ulid::new().to_string();
+    let queued_remote_request_id = Ulid::generate().to_string();
+    let queued_node_request_id = Ulid::generate().to_string();
     let queued_request_sha256 = super::sha256_hex(b"queued-dispatch-payload");
     state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
@@ -8663,8 +8663,8 @@ async fn networked_worker_restart_cancels_only_queued_dispatch_claims() {
             request_sha256: queued_request_sha256,
         })
         .expect("queued dispatch claim should be created");
-    let inflight_remote_request_id = Ulid::new().to_string();
-    let inflight_node_request_id = Ulid::new().to_string();
+    let inflight_remote_request_id = Ulid::generate().to_string();
+    let inflight_node_request_id = Ulid::generate().to_string();
     let inflight_request_sha256 = super::sha256_hex(b"inflight-dispatch-payload");
     state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
@@ -8752,8 +8752,8 @@ async fn networked_worker_result_authorization_requires_exact_active_claim() {
         .assign_networked_worker_lease(worker_id, test_worker_lease_request("run-result-authority"))
         .await
         .expect("worker lease assignment should succeed");
-    let remote_request_id = Ulid::new().to_string();
-    let node_request_id = Ulid::new().to_string();
+    let remote_request_id = Ulid::generate().to_string();
+    let node_request_id = Ulid::generate().to_string();
     let request_sha256 = super::sha256_hex(b"result-authority-payload");
     state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
@@ -8770,8 +8770,8 @@ async fn networked_worker_result_authorization_requires_exact_active_claim() {
         })
         .expect("exact dispatch claim should be created");
 
-    let wrong_node_request_id = Ulid::new().to_string();
-    let wrong_remote_request_id = Ulid::new().to_string();
+    let wrong_node_request_id = Ulid::generate().to_string();
+    let wrong_remote_request_id = Ulid::generate().to_string();
     for (candidate_remote_request_id, candidate_node_request_id, candidate_worker_id) in [
         (remote_request_id.as_str(), node_request_id.as_str(), worker_id),
         (remote_request_id.as_str(), wrong_node_request_id.as_str(), worker_id),
@@ -8886,8 +8886,8 @@ async fn networked_worker_stale_run_generation_cannot_settle_dispatch() {
         .assign_networked_worker_lease(worker_id, test_worker_lease_request(run_id))
         .await
         .expect("worker lease assignment should succeed");
-    let remote_request_id = Ulid::new().to_string();
-    let node_request_id = Ulid::new().to_string();
+    let remote_request_id = Ulid::generate().to_string();
+    let node_request_id = Ulid::generate().to_string();
     let request_sha256 = super::sha256_hex(b"stale-run-generation-payload");
     state
         .create_networked_worker_dispatch_claim(&NetworkedWorkerDispatchClaimCreateRequest {
@@ -9544,7 +9544,7 @@ async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() 
                     .as_ref()
                     .expect("worker dispatch should carry a delivery reservation");
                 assert!(dispatch.input_json.is_empty());
-                let wrong_attempt = Ulid::new().to_string();
+                let wrong_attempt = Ulid::generate().to_string();
                 assert_eq!(
                     worker_node_runtime
                         .fetch_networked_worker_payload(
@@ -10078,8 +10078,8 @@ fn create_released_networked_worker_dispatch_claim(
             request_sha256: request_sha256.clone(),
         })
         .expect("stable replay dispatch claim should create");
-    let delivery_attempt_id = Ulid::new().to_string();
-    let delivery_token = format!("{}{}", Ulid::new(), Ulid::new());
+    let delivery_attempt_id = Ulid::generate().to_string();
+    let delivery_token = format!("{}{}", Ulid::generate(), Ulid::generate());
     assert!(matches!(
         state
             .journal_store
@@ -10150,8 +10150,8 @@ async fn networked_worker_result_receipt_replays_exactly_and_rejects_conflicts()
         )
         .await
         .expect("worker assignment should succeed");
-    let remote_request_id = Ulid::new().to_string();
-    let node_request_id = Ulid::new().to_string();
+    let remote_request_id = Ulid::generate().to_string();
+    let node_request_id = Ulid::generate().to_string();
     let delivery_attempt_id = create_released_networked_worker_dispatch_claim(
         state.as_ref(),
         worker_id,
@@ -10244,7 +10244,7 @@ async fn networked_worker_result_receipt_replays_exactly_and_rejects_conflicts()
             receipt.clone(),
             Some(NetworkedWorkerDispatchSettlementIdentity {
                 remote_request_id: remote_request_id.clone(),
-                delivery_attempt_id: Some(Ulid::new().to_string()),
+                delivery_attempt_id: Some(Ulid::generate().to_string()),
                 session_id: session_id.to_owned(),
                 run_generation,
             }),
@@ -10334,8 +10334,8 @@ async fn networked_worker_archived_result_receipt_replays_with_first_observation
         )
         .await
         .expect("worker assignment should succeed");
-    let remote_request_id = Ulid::new().to_string();
-    let node_request_id = Ulid::new().to_string();
+    let remote_request_id = Ulid::generate().to_string();
+    let node_request_id = Ulid::generate().to_string();
     let delivery_attempt_id = create_released_networked_worker_dispatch_claim(
         state.as_ref(),
         worker_id,
@@ -10975,7 +10975,7 @@ async fn process_keys_journal_event_redacts_keys_and_links_pid() {
 
 #[test]
 fn cleanup_resource_parsers_extract_run_owned_handles() {
-    let session_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
     let process_output = serde_json::to_vec(&json!({
         "background": true,
         "pid": 111,
@@ -11059,7 +11059,7 @@ fn cleanup_resource_parsers_extract_run_owned_handles() {
 #[test]
 fn process_stop_parser_requires_bound_typed_ownership_proof() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let pid = 4_000_000_u32.saturating_add(std::process::id());
     let process = explicit_stop_test_process(&state, run_id.as_str(), pid, "parser");
     let now = 100_000_i64;
@@ -11216,7 +11216,7 @@ fn explicit_stop_test_process_with_provenance(
 #[test]
 fn verified_explicit_process_stop_retires_durable_lease_before_forgetting_authority() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let pid = 4_100_000_u32.saturating_add(std::process::id());
     let process = explicit_stop_test_process(&state, run_id.as_str(), pid, "verified");
     let output = serde_json::to_vec(&json!({
@@ -11273,7 +11273,7 @@ fn verified_explicit_process_stop_retires_durable_lease_before_forgetting_author
 #[test]
 fn unverifiable_explicit_process_stop_retains_durable_lease_and_run_authority() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let pid = 4_200_000_u32.saturating_add(std::process::id());
     let process = explicit_stop_test_process(&state, run_id.as_str(), pid, "unverified");
     let output = serde_json::to_vec(&json!({
@@ -11312,8 +11312,8 @@ fn unverifiable_explicit_process_stop_retains_durable_lease_and_run_authority() 
 #[test]
 fn cleanup_resource_registry_deduplicates_and_drains_browser_sessions() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
-    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
+    let session_id = Ulid::generate().to_string();
 
     state.record_run_browser_session(run_id.as_str(), session_id.as_str());
     state.record_run_browser_session(run_id.as_str(), session_id.as_str());
@@ -11327,8 +11327,8 @@ fn cleanup_resource_registry_deduplicates_and_drains_browser_sessions() {
 #[tokio::test(flavor = "multi_thread")]
 async fn terminal_cancel_cleanup_drains_registered_resources_after_noop_snapshot() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
-    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
+    let session_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
 
     state.record_run_browser_session(run_id.as_str(), "browser-session-terminal-noop");
@@ -11368,8 +11368,8 @@ async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome
     let _delivery_timeout =
         ScopedEnvVar::set_str("PALYRA_TEST_RUN_STREAM_TERMINAL_DELIVERY_TIMEOUT_MS", "5000");
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
-    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
+    let session_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let mut run_state = RunStateMachine::default();
     run_state.transition(RunTransition::Accept).expect("run should accept");
@@ -11476,8 +11476,8 @@ async fn cancel_racing_blocked_final_delivery_produces_one_done_terminal_outcome
 #[tokio::test(flavor = "multi_thread")]
 async fn orchestrator_cancel_freezes_feature_usage_only_after_settlement() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
-    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
+    let session_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state.record_feature_usage(
         run_id.as_str(),
@@ -11506,8 +11506,8 @@ async fn orchestrator_cancel_freezes_feature_usage_only_after_settlement() {
         },
     );
 
-    let late_run_id = Ulid::new().to_string();
-    let late_session_id = Ulid::new().to_string();
+    let late_run_id = Ulid::generate().to_string();
+    let late_session_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, late_session_id.as_str(), late_run_id.as_str()).await;
     let late_cancel = state
         .request_orchestrator_cancel(OrchestratorCancelRequest {
@@ -11677,8 +11677,8 @@ async fn exercise_process_verification_usage(
     );
     configure_feature_usage_test_agent(&state, "feature-usage-process", workspace.as_path()).await;
 
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let context = super::ToolRuntimeExecutionContext {
         principal: "user:ops",
@@ -11695,7 +11695,7 @@ async fn exercise_process_verification_usage(
         "cwd": ".",
     }))
     .expect("process usage input should serialize");
-    let proposal_id = Ulid::new().to_string();
+    let proposal_id = Ulid::generate().to_string();
     let outcome = super::execute_tool_with_runtime_dispatch(
         &state,
         context,
@@ -11728,14 +11728,14 @@ async fn exercise_workspace_patch_verification_usage(
     fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
         .expect("feature usage patch fixture should be written");
 
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let patch =
         "*** Begin Patch\n*** Update File: notes.txt\n@@\n-beta\n+beta-updated\n*** End Patch\n";
     let input = serde_json::to_vec(&json!({ "patch": patch }))
         .expect("workspace patch usage input should serialize");
-    let proposal_id = Ulid::new().to_string();
+    let proposal_id = Ulid::generate().to_string();
     let outcome = execute_workspace_patch_tool(
         &state,
         crate::application::tool_runtime::workspace_patch::WorkspacePatchToolRequest {
@@ -11787,10 +11787,10 @@ async fn workspace_patch_verification_usage_records_explicit_fallback_when_disab
 #[tokio::test(flavor = "multi_thread")]
 async fn ordinary_terminal_run_does_not_enter_feature_usage_window() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
-    let proposal_id = Ulid::new().to_string();
+    let proposal_id = Ulid::generate().to_string();
     let outcome = super::execute_tool_with_runtime_dispatch(
         &state,
         super::ToolRuntimeExecutionContext {
@@ -11833,10 +11833,10 @@ async fn invalid_process_input_does_not_record_verification_usage() {
         feature_rollouts_with_verification_runtime(true),
         tool_call,
     );
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
-    let proposal_id = Ulid::new().to_string();
+    let proposal_id = Ulid::generate().to_string();
     let outcome = super::execute_tool_with_runtime_dispatch(
         &state,
         super::ToolRuntimeExecutionContext {
@@ -11874,12 +11874,12 @@ async fn rejected_workspace_patch_does_not_record_verification_usage() {
     );
     configure_feature_usage_test_agent(&state, "feature-usage-rejected-patch", workspace.as_path())
         .await;
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let input = serde_json::to_vec(&json!({ "patch": "not a workspace patch" }))
         .expect("rejected patch input should serialize");
-    let proposal_id = Ulid::new().to_string();
+    let proposal_id = Ulid::generate().to_string();
     let outcome = execute_workspace_patch_tool(
         &state,
         crate::application::tool_runtime::workspace_patch::WorkspacePatchToolRequest {
@@ -11905,8 +11905,8 @@ async fn rejected_workspace_patch_does_not_record_verification_usage() {
 #[tokio::test(flavor = "multi_thread")]
 async fn run_cleanup_tape_event_records_background_process_outcomes() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
@@ -12034,8 +12034,8 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_tool_effect_starts_append_distinct_ordered_tape_rows() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
 
     for seq in 0..2 {
@@ -12071,8 +12071,8 @@ async fn repeated_tool_effect_starts_append_distinct_ordered_tape_rows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn run_cleanup_tape_event_records_detached_background_handoff() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
@@ -12157,8 +12157,8 @@ async fn run_cleanup_tape_event_records_detached_background_handoff() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cleanup_run_resources_returns_detached_background_warning() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
@@ -12247,8 +12247,8 @@ fn process_list_entry_reports_runtime_status_details() {
 #[test]
 fn closed_browser_session_registry_marks_and_clears_handles() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
-    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
+    let session_id = Ulid::generate().to_string();
 
     assert!(!state.is_browser_session_closed(session_id.as_str()));
     state.record_closed_browser_session(session_id.as_str());
@@ -12267,8 +12267,8 @@ fn closed_browser_session_registry_marks_and_clears_handles() {
 #[tokio::test(flavor = "multi_thread")]
 async fn successful_run_finalization_cleans_run_owned_resource_tracking() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
 
     state.record_run_browser_session(run_id.as_str(), "browser-session-success");
@@ -12312,8 +12312,8 @@ async fn successful_run_finalization_cleans_run_owned_resource_tracking() {
 #[tokio::test(flavor = "multi_thread")]
 async fn terminal_settlement_commits_additional_tape_evidence_before_generation_closure() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
 
     let (sender, _receiver) = tokio::sync::mpsc::channel(4);
@@ -12367,8 +12367,8 @@ async fn terminal_settlement_commits_additional_tape_evidence_before_generation_
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_settlement_failure_retains_cleanup_ownership_and_heartbeat() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let durable_state_before = state
         .orchestrator_run_status_snapshot(run_id.clone())
@@ -12457,8 +12457,8 @@ async fn cancelled_settlement_failure_retains_cleanup_ownership_and_heartbeat() 
 #[tokio::test(flavor = "multi_thread")]
 async fn late_cancelled_finalization_failure_retains_cleanup_ownership_and_heartbeat() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let durable_state_before = state
         .orchestrator_run_status_snapshot(run_id.clone())
@@ -12554,8 +12554,8 @@ async fn late_cancelled_finalization_failure_retains_cleanup_ownership_and_heart
 #[tokio::test(flavor = "multi_thread")]
 async fn completed_finalization_failure_retains_cleanup_ownership_and_heartbeat() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let durable_state_before = state
         .orchestrator_run_status_snapshot(run_id.clone())
@@ -12644,8 +12644,8 @@ async fn completed_finalization_failure_retains_cleanup_ownership_and_heartbeat(
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_cancel_before_finalization_records_one_summary_and_terminal_status() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state
         .request_orchestrator_cancel(OrchestratorCancelRequest {
@@ -12695,8 +12695,8 @@ async fn pending_cancel_before_finalization_records_one_summary_and_terminal_sta
 #[tokio::test(flavor = "multi_thread")]
 async fn preterminalized_cancel_blocks_late_status_projection() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let flow_control = run_stream_flow_control(&state, run_id.as_str()).await;
     state
@@ -12739,8 +12739,8 @@ async fn preterminalized_cancel_blocks_late_status_projection() {
 #[tokio::test(flavor = "multi_thread")]
 async fn preterminalized_failure_controls_late_completion_state() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state
         .update_orchestrator_run_state(
@@ -12782,8 +12782,8 @@ async fn preterminalized_failure_controls_late_completion_state() {
 #[tokio::test(flavor = "multi_thread")]
 async fn successful_run_finalization_cleans_resources_when_done_status_channel_closed() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
 
     state.record_run_browser_session(run_id.as_str(), "browser-session-closed-channel");
@@ -12822,8 +12822,8 @@ async fn full_response_channel_times_out_terminal_delivery_after_durable_settlem
     let _delivery_timeout =
         ScopedEnvVar::set_str("PALYRA_TEST_RUN_STREAM_TERMINAL_DELIVERY_TIMEOUT_MS", "20");
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state.record_run_browser_session(run_id.as_str(), "browser-session-delivery-timeout");
 
@@ -12873,8 +12873,8 @@ async fn full_response_channel_times_out_terminal_delivery_after_durable_settlem
 #[tokio::test(flavor = "multi_thread")]
 async fn successful_run_finalization_allocates_after_existing_tape_rows() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state.record_run_browser_session(run_id.as_str(), "browser-session-summary-conflict");
     state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
@@ -12938,8 +12938,8 @@ async fn successful_run_finalization_allocates_after_existing_tape_rows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pending_cancel_allocates_after_existing_tape_rows() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state.record_run_browser_session(run_id.as_str(), "browser-session-cancel-summary-conflict");
     state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
@@ -13031,8 +13031,8 @@ async fn start_registered_background_process_for_reconciliation_test(
         crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let outcome = super::execute_tool_with_runtime_dispatch(
         &state,
@@ -13433,8 +13433,8 @@ async fn post_launch_registration_failure_performs_exact_synchronous_cleanup() {
         crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let connection = Connection::open(&state.journal_config.db_path)
         .expect("test journal database should reopen");
@@ -13548,8 +13548,8 @@ async fn terminal_cleanup_waits_for_durable_process_publication() {
         crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     state
         .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::InProgress, None)
@@ -13712,8 +13712,8 @@ async fn registration_and_synchronous_cleanup_failure_transfers_exact_authority_
         crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let before_pids = crate::sandbox_runner::registered_background_process_pids();
     let process_outcome = super::execute_tool_with_runtime_dispatch(
@@ -13833,8 +13833,8 @@ async fn failed_run_finalization_cleans_run_owned_process_tracking() {
         crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let process_outcome = super::execute_tool_with_runtime_dispatch(
         &state,
@@ -13964,8 +13964,8 @@ async fn durable_process_cleanup_finalization_retries_after_failure() {
         crate::sandbox_runner::PathAccessMode::ApprovedRoots;
     tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
     let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
     let process_outcome = super::execute_tool_with_runtime_dispatch(
         &state,
@@ -14090,8 +14090,8 @@ async fn durable_process_cleanup_finalization_retries_after_failure() {
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_run_does_not_remain_lifecycle_active() {
     let state = build_test_runtime_state(false);
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
 
     state
@@ -14136,8 +14136,8 @@ async fn failed_run_does_not_remain_lifecycle_active() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tool_outcomes_record_and_forget_run_cleanup_resources() {
     let state = build_test_runtime_state(false);
-    let run_id = Ulid::new().to_string();
-    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
+    let session_id = Ulid::generate().to_string();
     let context = super::ToolRuntimeExecutionContext {
         principal: "user:ops",
         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -15465,11 +15465,11 @@ async fn resolve_route_tool_approval_outcome_does_not_reuse_pending_record_acros
         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
         channel: Some("cli".to_owned()),
     };
-    let session_id = Ulid::new().to_string();
-    let run_id_first = Ulid::new().to_string();
-    let proposal_id_first = Ulid::new().to_string();
-    let run_id_second = Ulid::new().to_string();
-    let proposal_id_second = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id_first = Ulid::generate().to_string();
+    let proposal_id_first = Ulid::generate().to_string();
+    let run_id_second = Ulid::generate().to_string();
+    let proposal_id_second = Ulid::generate().to_string();
     let approval_subject_id = "tool:palyra.process.run";
     let input_json = serde_json::to_vec(&json!({
         "command": "echo",
@@ -15605,12 +15605,12 @@ async fn resolve_route_tool_approval_outcome_does_not_rehydrate_resolved_record_
         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
         channel: Some("cli".to_owned()),
     };
-    let session_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
     let approval_subject_id = "tool:palyra.process.run".to_owned();
 
     let mut approval_request = build_test_approval_request(901);
     approval_request.session_id = session_id.clone();
-    approval_request.run_id = Ulid::new().to_string();
+    approval_request.run_id = Ulid::generate().to_string();
     approval_request.principal = context.principal.clone();
     approval_request.device_id = context.device_id.clone();
     approval_request.channel = context.channel.clone();
@@ -15644,8 +15644,8 @@ async fn resolve_route_tool_approval_outcome_does_not_rehydrate_resolved_record_
         "test precondition: session cache should be empty before route rehydration"
     );
 
-    let run_id = Ulid::new().to_string();
-    let proposal_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
+    let proposal_id = Ulid::generate().to_string();
     let input_json = serde_json::to_vec(&json!({
         "command": "echo",
         "args": ["route-approval-resolved"]
@@ -15719,12 +15719,12 @@ async fn resolve_route_tool_approval_outcome_does_not_reuse_once_scope_record() 
         device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
         channel: Some("cli".to_owned()),
     };
-    let session_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
     let approval_subject_id = "tool:palyra.process.run".to_owned();
 
     let mut approval_request = build_test_approval_request(902);
     approval_request.session_id = session_id.clone();
-    approval_request.run_id = Ulid::new().to_string();
+    approval_request.run_id = Ulid::generate().to_string();
     approval_request.principal = context.principal.clone();
     approval_request.device_id = context.device_id.clone();
     approval_request.channel = context.channel.clone();
@@ -15747,8 +15747,8 @@ async fn resolve_route_tool_approval_outcome_does_not_reuse_once_scope_record() 
         .await
         .expect("approval resolve should succeed");
 
-    let run_id = Ulid::new().to_string();
-    let proposal_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
+    let proposal_id = Ulid::generate().to_string();
     let input_json = serde_json::to_vec(&json!({
         "command": "echo",
         "args": ["route-approval-once"]
@@ -17551,7 +17551,7 @@ async fn os_file_allows_absolute_path_inside_launch_workspace_root() {
     let workspace_root = std::env::current_dir()
         .expect("repo current_dir should resolve")
         .join("target")
-        .join(format!("palyra-os-file-launch-root-{}", Ulid::new()));
+        .join(format!("palyra-os-file-launch-root-{}", Ulid::generate()));
     let scenario_dir = workspace_root.join("e2e-workflows").join("agent-file-terminal");
     fs::create_dir_all(scenario_dir.as_path()).expect("launch workspace should be created");
     let target_file = scenario_dir.join("agent_math_test.js");
@@ -19487,8 +19487,8 @@ async fn create_queued_flow_background_task(
     device_id: &str,
     channel: Option<&str>,
 ) -> String {
-    let task_id = Ulid::new().to_string();
-    let session_id = Ulid::new().to_string();
+    let task_id = Ulid::generate().to_string();
+    let session_id = Ulid::generate().to_string();
     state
         .journal_store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
@@ -19561,7 +19561,7 @@ async fn create_running_flow_for_background_task(
     channel: Option<&str>,
     task_id: String,
 ) -> String {
-    let session_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
     state
         .journal_store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
@@ -19610,7 +19610,7 @@ async fn corrupt_flow_dependencies_fail_closed_after_runtime_restart() {
         crate::config::FeatureRolloutsConfig::default(),
         default_test_tool_call_config(),
     );
-    let session_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
     first_state
         .journal_store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
@@ -19767,7 +19767,7 @@ async fn corrupt_flow_dependencies_do_not_suppress_cancellation() {
     );
     let task_id =
         create_queued_flow_background_task(&first_state, owner_principal, device_id, channel).await;
-    let session_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
     first_state
         .journal_store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
@@ -19881,7 +19881,7 @@ async fn corrupt_flow_dependencies_do_not_suppress_cancellation() {
         1
     );
 
-    let local_session_id = Ulid::new().to_string();
+    let local_session_id = Ulid::generate().to_string();
     restarted
         .journal_store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
@@ -20271,7 +20271,7 @@ async fn archived_objective_bound_cron_jobs_cannot_be_reenabled_or_created_enabl
     let state = build_test_runtime_state(false);
     let _registry = configure_test_routines_runtime(&state, "http://127.0.0.1:9".to_owned());
 
-    let update_job_id = Ulid::new().to_string();
+    let update_job_id = Ulid::generate().to_string();
     state
         .create_cron_job(test_cron_job_create_request(update_job_id.as_str(), false))
         .await
@@ -20295,7 +20295,7 @@ async fn archived_objective_bound_cron_jobs_cannot_be_reenabled_or_created_enabl
         "error should identify the objective lifecycle guard: {update_error}"
     );
 
-    let create_job_id = Ulid::new().to_string();
+    let create_job_id = Ulid::generate().to_string();
     seed_archived_objective_for_job(&state, create_job_id.as_str());
     let create_error = state
         .create_cron_job(test_cron_job_create_request(create_job_id.as_str(), true))
@@ -20312,7 +20312,7 @@ async fn archived_objective_bound_cron_jobs_cannot_be_reenabled_or_created_enabl
 async fn archived_objective_bound_dispatch_is_denied_before_orchestrator() {
     let state = build_test_runtime_state(false);
     let _registry = configure_test_routines_runtime(&state, "http://127.0.0.1:9".to_owned());
-    let job_id = Ulid::new().to_string();
+    let job_id = Ulid::generate().to_string();
     let job = state
         .create_cron_job(test_cron_job_create_request(job_id.as_str(), true))
         .await

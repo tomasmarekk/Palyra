@@ -646,7 +646,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 .map_err(|_| Status::invalid_argument("event.event_id must be a canonical ULID"))?;
             id
         } else {
-            Ulid::new().to_string()
+            Ulid::generate().to_string()
         };
         let session_id = canonical_id(event.session_id, "event.session_id")?;
         let run_id = canonical_id(event.run_id, "event.run_id")?;
@@ -890,7 +890,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             })?;
             value.ulid
         } else {
-            Ulid::new().to_string()
+            Ulid::generate().to_string()
         };
         let input = ChannelInboundMessage {
             envelope_id: envelope_id.clone(),
@@ -974,12 +974,12 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 );
                 match pairing_result {
                     PairingConsumeOutcome::Pending(pending) => {
-                        let session_id = Ulid::new().to_string();
-                        let run_id = Ulid::new().to_string();
+                        let session_id = Ulid::generate().to_string();
+                        let run_id = Ulid::generate().to_string();
                         let approval_record = self
                             .state
                             .create_approval_record(ApprovalCreateRequest {
-                                approval_id: Ulid::new().to_string(),
+                                approval_id: Ulid::generate().to_string(),
                                 session_id: session_id.clone(),
                                 run_id: run_id.clone(),
                                 principal: context.principal.clone(),
@@ -1144,8 +1144,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             self.state.channel_router.queue_depth() as u64,
                             Ordering::Relaxed,
                         );
-                        let session_id = Ulid::new().to_string();
-                        let run_id = Ulid::new().to_string();
+                        let session_id = Ulid::generate().to_string();
+                        let run_id = Ulid::generate().to_string();
                         let reason_label = reason.as_str().to_owned();
                         let _ = record_message_router_journal_event(
                             &self.state,
@@ -1229,8 +1229,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     .counters
                     .channel_router_queue_depth
                     .store(self.state.channel_router.queue_depth() as u64, Ordering::Relaxed);
-                let journal_session_id = Ulid::new().to_string();
-                let journal_run_id = Ulid::new().to_string();
+                let journal_session_id = Ulid::generate().to_string();
+                let journal_run_id = Ulid::generate().to_string();
                 let channel_turn_admission_input = build_channel_turn_admission_input(
                     &input,
                     &content,
@@ -1319,8 +1319,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     .counters
                     .channel_router_queue_depth
                     .store(self.state.channel_router.queue_depth() as u64, Ordering::Relaxed);
-                let journal_session_id = Ulid::new().to_string();
-                let journal_run_id = Ulid::new().to_string();
+                let journal_session_id = Ulid::generate().to_string();
+                let journal_run_id = Ulid::generate().to_string();
                 let channel_turn_admission_input = build_channel_turn_admission_input(
                     &input,
                     &content,
@@ -1453,8 +1453,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             &command_scope,
                             &command_runtime,
                         );
-                        let session_id = Ulid::new().to_string();
-                        let run_id = Ulid::new().to_string();
+                        let session_id = Ulid::generate().to_string();
+                        let run_id = Ulid::generate().to_string();
                         record_channel_turn_intake_events(
                             &self.state,
                             &context,
@@ -1552,8 +1552,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                                 .channel_messages_rejected
                                 .fetch_add(1, Ordering::Relaxed);
                         }
-                        let session_id = Ulid::new().to_string();
-                        let run_id = Ulid::new().to_string();
+                        let session_id = Ulid::generate().to_string();
+                        let run_id = Ulid::generate().to_string();
                         record_channel_turn_intake_events(
                             &self.state,
                             &context,
@@ -1647,8 +1647,8 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         .counters
                         .channel_router_queue_depth
                         .store(self.state.channel_router.queue_depth() as u64, Ordering::Relaxed);
-                    let session_id = Ulid::new().to_string();
-                    let run_id = Ulid::new().to_string();
+                    let session_id = Ulid::generate().to_string();
+                    let run_id = Ulid::generate().to_string();
                     record_channel_turn_intake_events(
                         &self.state,
                         &context,

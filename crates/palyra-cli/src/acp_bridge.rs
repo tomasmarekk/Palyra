@@ -100,10 +100,10 @@ impl AcpDaemonControl {
                 ]
             },
             "command": {
-                "request_id": format!("acp_req_{}", ulid::Ulid::new()),
+                "request_id": format!("acp_req_{}", ulid::Ulid::generate()),
                 "command": command,
                 "params": params,
-                "idempotency_key": format!("acp_idem_{}", ulid::Ulid::new())
+                "idempotency_key": format!("acp_idem_{}", ulid::Ulid::generate())
             }
         });
         let client = self.client.lock().await;
@@ -780,7 +780,7 @@ impl acp::Agent for PalyraAcpAgent {
         arguments: acp::NewSessionRequest,
     ) -> acp::Result<acp::NewSessionResponse> {
         let overrides = Self::session_overrides(&arguments.meta)?;
-        let requested_session_key = format!("agent:main:{}", ulid::Ulid::new());
+        let requested_session_key = format!("agent:main:{}", ulid::Ulid::generate());
         let mut binding = self
             .resolve_gateway_session(
                 overrides
@@ -1166,7 +1166,7 @@ fn map_list_sessions_response(
                     .session_id
                     .as_ref()
                     .map(|value| value.ulid.clone())
-                    .unwrap_or_else(|| format!("session-{}", ulid::Ulid::new()))
+                    .unwrap_or_else(|| format!("session-{}", ulid::Ulid::generate()))
             } else {
                 session.session_key
             };

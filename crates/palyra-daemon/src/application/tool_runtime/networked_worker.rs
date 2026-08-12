@@ -333,7 +333,7 @@ impl NetworkedWorkerRemoteDispatcher for NodeRuntimeNetworkedWorkerDispatcher {
 
         let capability = Self::required_capability(&request);
         let timeout_ms = bounded_dispatch_timeout_ms(self.dispatch_timeout_ms, &request);
-        let request_id = Ulid::new().to_string();
+        let request_id = Ulid::generate().to_string();
         let claim_request = crate::journal::NetworkedWorkerDispatchClaimCreateRequest {
             remote_request_id: request.request_id.clone(),
             node_request_id: request_id.clone(),
@@ -1682,7 +1682,7 @@ async fn persist_computer_use_evidence(
             .map_err(|_| "computer-use screenshot base64 is invalid".to_owned())?;
         let artifact = runtime_state
             .create_tool_result_artifact(ToolResultArtifactCreateRequest {
-                artifact_id: Ulid::new().to_string(),
+                artifact_id: Ulid::generate().to_string(),
                 session_id: context.session_id.to_owned(),
                 run_id: context.run_id.to_owned(),
                 proposal_id: proposal_id.to_owned(),
@@ -1718,7 +1718,7 @@ async fn persist_computer_use_evidence(
     }
     let action_trace_artifact = runtime_state
         .create_tool_result_artifact(ToolResultArtifactCreateRequest {
-            artifact_id: Ulid::new().to_string(),
+            artifact_id: Ulid::generate().to_string(),
             session_id: context.session_id.to_owned(),
             run_id: context.run_id.to_owned(),
             proposal_id: proposal_id.to_owned(),
@@ -2271,7 +2271,7 @@ fn build_worker_remote_tool_request(
     let mut request = WorkerRemoteToolRequestEnvelope {
         protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
         schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
-        request_id: Ulid::new().to_string(),
+        request_id: Ulid::generate().to_string(),
         proposal_id: proposal_id.to_owned(),
         tool_name: tool_name.to_owned(),
         tool_kind,
@@ -2790,7 +2790,7 @@ fn build_worker_lease_request(
     let ttl_ms = runtime_state.config.networked_workers.lease_ttl_ms;
     let ttl_ms_i64 = i64::try_from(ttl_ms)
         .map_err(|_| "networked worker lease ttl exceeds the supported range".to_owned())?;
-    let grant_id = Ulid::new().to_string();
+    let grant_id = Ulid::generate().to_string();
     let read_only = WorkerRemoteToolKind::from_tool_name(tool_name)
         .is_none_or(remote_tool_kind_uses_read_only_workspace);
     let tool_kind = WorkerRemoteToolKind::from_tool_name(tool_name)

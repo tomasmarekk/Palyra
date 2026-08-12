@@ -70,7 +70,7 @@ impl ContextCompactionPlanV2 {
     ) -> Self {
         Self {
             schema_version: CONTEXT_COMPACTION_PLAN_SCHEMA_VERSION,
-            plan_id: Ulid::new().to_string(),
+            plan_id: Ulid::generate().to_string(),
             owner: ContextCompactionOwner::Host,
             generation,
             context_projection_epoch,

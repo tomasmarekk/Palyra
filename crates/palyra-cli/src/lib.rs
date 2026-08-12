@@ -729,7 +729,7 @@ fn resolve_init_state_root() -> Result<PathBuf> {
 }
 
 fn generate_admin_token() -> String {
-    format!("palyra_admin_{}_{}", Ulid::new(), Ulid::new())
+    format!("palyra_admin_{}_{}", Ulid::generate(), Ulid::generate())
 }
 
 const DEFAULT_ADMIN_BOUND_PRINCIPAL: &str = "admin:local";
@@ -6700,7 +6700,7 @@ pub(crate) fn resolve_optional_canonical_id(
 }
 
 fn generate_canonical_ulid() -> String {
-    Ulid::new().to_string()
+    Ulid::generate().to_string()
 }
 
 fn resolve_grpc_url(explicit: Option<String>) -> Result<String> {
@@ -11081,7 +11081,8 @@ fn write_file_atomically(path: &Path, payload: &[u8]) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
     }
-    let temporary_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), Ulid::new()));
+    let temporary_path =
+        path.with_extension(format!("tmp.{}.{}", std::process::id(), Ulid::generate()));
     fs::write(temporary_path.as_path(), payload)
         .with_context(|| format!("failed to write temporary file {}", temporary_path.display()))?;
 
@@ -11114,7 +11115,7 @@ fn write_file_atomically(path: &Path, payload: &[u8]) -> Result<()> {
         // handles, AV scanners), so stage the original as a backup first and
         // restore it if the swap fails.
         let backup_path =
-            path.with_extension(format!("bak.{}.{}", std::process::id(), Ulid::new()));
+            path.with_extension(format!("bak.{}.{}", std::process::id(), Ulid::generate()));
         fs::rename(path, backup_path.as_path()).with_context(|| {
             format!(
                 "failed to stage original file {} into backup {}",
@@ -11181,7 +11182,7 @@ fn install_verified_skill_artifact(
     fs::create_dir_all(skill_root.as_path())
         .with_context(|| format!("failed to create skill root {}", skill_root.display()))?;
 
-    let staging = skill_root.join(format!(".tmp-install-{}", Ulid::new()));
+    let staging = skill_root.join(format!(".tmp-install-{}", Ulid::generate()));
     fs::create_dir_all(staging.as_path()).with_context(|| {
         format!("failed to create skill staging directory {}", staging.display())
     })?;

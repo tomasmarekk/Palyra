@@ -21,9 +21,9 @@ fn fixture() -> CompletionFixture {
     let root = tempfile::tempdir().expect("temporary journal root should create");
     let db_path = root.path().join("journal.db");
     let store = open_store(db_path.clone());
-    let parent_session_id = Ulid::new().to_string();
-    let parent_run_id = Ulid::new().to_string();
-    let child_session_id = Ulid::new().to_string();
+    let parent_session_id = Ulid::generate().to_string();
+    let parent_run_id = Ulid::generate().to_string();
+    let child_session_id = Ulid::generate().to_string();
     store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
             session_id: parent_session_id.clone(),
@@ -50,13 +50,13 @@ fn fixture() -> CompletionFixture {
         .expect("parent run should enter progress");
     let task = store
         .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
-            task_id: Ulid::new().to_string(),
+            task_id: Ulid::generate().to_string(),
             task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
             session_id: parent_session_id.clone(),
             child_session_id: Some(child_session_id.clone()),
             parent_run_id: Some(parent_run_id.clone()),
             target_run_id: None,
-            planned_child_run_id: Some(Ulid::new().to_string()),
+            planned_child_run_id: Some(Ulid::generate().to_string()),
             queued_input_id: None,
             owner_principal: "user:child-completion".to_owned(),
             device_id: "device-child-completion".to_owned(),
@@ -281,7 +281,7 @@ fn nested_child_defers_parent_announcement_without_budget_growth() {
     fixture
         .store
         .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
-            task_id: Ulid::new().to_string(),
+            task_id: Ulid::generate().to_string(),
             task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
             session_id: fixture.child_session_id.clone(),
             child_session_id: None,

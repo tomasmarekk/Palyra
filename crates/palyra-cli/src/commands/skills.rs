@@ -2772,7 +2772,7 @@ mod tests {
     }
 
     fn temp_procedure_root() -> PathBuf {
-        std::env::temp_dir().join(format!("palyra-procedure-skills-{}", Ulid::new()))
+        std::env::temp_dir().join(format!("palyra-procedure-skills-{}", Ulid::generate()))
     }
 
     fn assert_e2e_reporter_fixture_trust_store_allows_audit(state_root: &Path) -> Result<()> {

@@ -283,7 +283,7 @@ impl ContextRecoveryController {
             plan: ContextRecoveryPlan {
                 schema_version: CONTEXT_RECOVERY_SCHEMA_VERSION,
                 event_type: CONTEXT_RECOVERY_EVENT.to_owned(),
-                plan_id: Ulid::new().to_string(),
+                plan_id: Ulid::generate().to_string(),
                 generation,
                 input_sha256,
                 initial_tokens,
@@ -371,7 +371,7 @@ impl ContextRecoveryController {
         }
         let ordinal = u8::try_from(self.plan.steps.len().saturating_add(1)).unwrap_or(u8::MAX);
         let step = ContextRecoveryStep {
-            step_id: Ulid::new().to_string(),
+            step_id: Ulid::generate().to_string(),
             generation: self.plan.generation,
             ordinal,
             action,

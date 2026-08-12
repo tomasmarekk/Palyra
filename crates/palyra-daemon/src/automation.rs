@@ -253,7 +253,7 @@ pub(crate) fn create_automation_suggestion(
     }
     let actor = actor_from_source(input.source);
     let record = AutomationSuggestionRecord {
-        suggestion_id: Ulid::new().to_string(),
+        suggestion_id: Ulid::generate().to_string(),
         source: input.source,
         candidate_type: input.candidate_type,
         proposed_spec,

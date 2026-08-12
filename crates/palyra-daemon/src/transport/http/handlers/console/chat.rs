@@ -332,7 +332,7 @@ pub(crate) async fn console_chat_message_stream_handler(
             "failed to read system clock: {error}"
         )))
     })?;
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let audio_rollout_enabled = state.runtime.config.feature_rollouts.audio_pipeline.enabled;
     let audio_destination_scope_sha256 = crate::sha256_hex(
         format!(
@@ -795,7 +795,7 @@ pub(crate) async fn console_chat_attachment_upload_handler(
     let task = state
         .runtime
         .create_orchestrator_background_task(journal::OrchestratorBackgroundTaskCreateRequest {
-            task_id: Ulid::new().to_string(),
+            task_id: Ulid::generate().to_string(),
             task_kind: AuxiliaryTaskKind::AttachmentDerivation.as_str().to_owned(),
             session_id: session_id.clone(),
             child_session_id: None,
@@ -1133,7 +1133,7 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
     let task = state
         .runtime
         .create_orchestrator_background_task(journal::OrchestratorBackgroundTaskCreateRequest {
-            task_id: Ulid::new().to_string(),
+            task_id: Ulid::generate().to_string(),
             task_kind: AuxiliaryTaskKind::AttachmentRecompute.as_str().to_owned(),
             session_id: session_id.clone(),
             child_session_id: None,
@@ -2014,7 +2014,7 @@ pub(crate) async fn console_chat_checkpoint_create_handler(
     let checkpoint = state
         .runtime
         .create_orchestrator_checkpoint(journal::OrchestratorCheckpointCreateRequest {
-            checkpoint_id: Ulid::new().to_string(),
+            checkpoint_id: Ulid::generate().to_string(),
             session_id: session_record.session_id.clone(),
             run_id: session_record
                 .last_run_id
@@ -2581,7 +2581,7 @@ pub(crate) async fn console_chat_background_task_create_handler(
     let task = state
         .runtime
         .create_orchestrator_background_task(journal::OrchestratorBackgroundTaskCreateRequest {
-            task_id: Ulid::new().to_string(),
+            task_id: Ulid::generate().to_string(),
             task_kind,
             session_id: session_record.session_id.clone(),
             child_session_id: None,
@@ -3190,7 +3190,7 @@ pub(crate) async fn console_chat_queue_handler(
         queue_decision.reason = "session_queue_paused".to_owned();
         queue_decision.delivery_boundary = QueuedInputDeliveryBoundary::BacklogSummary;
     }
-    let queued_input_id = Ulid::new().to_string();
+    let queued_input_id = Ulid::generate().to_string();
     let pending_group_inputs = existing_queued_inputs
         .iter()
         .filter(|queued| {
@@ -4191,7 +4191,7 @@ pub(crate) async fn console_chat_queue_collect_summary_handler(
         .reason
         .and_then(trim_to_option)
         .unwrap_or_else(|| "operator_forced_collect_summary".to_owned());
-    let queued_input_id = Ulid::new().to_string();
+    let queued_input_id = Ulid::generate().to_string();
     let summary_ref = format!("queue-summary:{queued_input_id}");
     let collect_summary = build_queue_collect_summary(
         summary_ref.clone(),
@@ -4768,7 +4768,7 @@ pub(crate) async fn console_chat_pin_create_handler(
     let pin = state
         .runtime
         .create_orchestrator_session_pin(journal::OrchestratorSessionPinCreateRequest {
-            pin_id: Ulid::new().to_string(),
+            pin_id: Ulid::generate().to_string(),
             session_id: session_record.session_id.clone(),
             run_id: payload.run_id,
             tape_seq: payload.tape_seq,
@@ -6964,7 +6964,7 @@ async fn index_derived_artifact_targets(
             manual_override: false,
         })
         .await?;
-    let memory_id = record.memory_item_id.clone().unwrap_or_else(|| Ulid::new().to_string());
+    let memory_id = record.memory_item_id.clone().unwrap_or_else(|| Ulid::generate().to_string());
     let _memory_item = state
         .runtime
         .ingest_memory_item(journal::MemoryItemCreateRequest {
@@ -7025,7 +7025,7 @@ fn build_console_chat_message_envelope(
 ) -> common_v1::MessageEnvelope {
     common_v1::MessageEnvelope {
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
-        envelope_id: Some(common_v1::CanonicalId { ulid: Ulid::new().to_string() }),
+        envelope_id: Some(common_v1::CanonicalId { ulid: Ulid::generate().to_string() }),
         timestamp_unix_ms,
         origin: Some(common_v1::EnvelopeOrigin {
             r#type: common_v1::envelope_origin::OriginType::Web as i32,

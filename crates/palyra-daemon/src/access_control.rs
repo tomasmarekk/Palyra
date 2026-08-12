@@ -1042,7 +1042,7 @@ impl AccessRegistry {
         }
         let scopes = normalize_scopes(request.scopes, role.permissions());
         let token = mint_access_token_secret();
-        let token_id = Ulid::new().to_string();
+        let token_id = Ulid::generate().to_string();
         let record = ApiTokenRecord {
             token_id: token_id.clone(),
             label,
@@ -1338,8 +1338,8 @@ impl AccessRegistry {
         let team_name = normalize_required_text(request.team_name.as_str(), "team_name")?;
         let workspace_name =
             normalize_required_text(request.workspace_name.as_str(), "workspace_name")?;
-        let team_id = Ulid::new().to_string();
-        let workspace_id = Ulid::new().to_string();
+        let team_id = Ulid::generate().to_string();
+        let workspace_id = Ulid::generate().to_string();
         let team = TeamRecord {
             team_id: team_id.clone(),
             slug: slugify(team_name.as_str()),
@@ -1360,7 +1360,7 @@ impl AccessRegistry {
             updated_at_unix_ms: now,
         };
         let membership = MembershipRecord {
-            membership_id: Ulid::new().to_string(),
+            membership_id: Ulid::generate().to_string(),
             workspace_id: workspace_id.clone(),
             principal: actor_principal.to_owned(),
             role: WorkspaceRole::Owner,
@@ -1461,7 +1461,7 @@ impl AccessRegistry {
         }
         let token = mint_access_token_secret();
         let invitation = InvitationRecord {
-            invitation_id: Ulid::new().to_string(),
+            invitation_id: Ulid::generate().to_string(),
             workspace_id: request.workspace_id,
             invited_identity,
             role,
@@ -1535,7 +1535,7 @@ impl AccessRegistry {
             record.accepted_by_principal = Some(actor_principal.to_owned());
         }
         let membership = MembershipRecord {
-            membership_id: Ulid::new().to_string(),
+            membership_id: Ulid::generate().to_string(),
             workspace_id: invitation.workspace_id.clone(),
             principal: actor_principal.to_owned(),
             role: invitation.role,
@@ -1757,7 +1757,7 @@ impl AccessRegistry {
             return Ok(updated);
         }
         let share = ResourceShareRecord {
-            share_id: Ulid::new().to_string(),
+            share_id: Ulid::generate().to_string(),
             resource_kind,
             resource_id,
             workspace_id: request.workspace_id,
@@ -1931,7 +1931,7 @@ impl AccessRegistry {
         now: i64,
     ) {
         self.data.telemetry.push(TelemetryEventRecord {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             feature_key: feature_key.to_owned(),
             category: category.to_owned(),
             outcome: outcome.to_owned(),
@@ -2263,7 +2263,7 @@ fn slugify(raw: &str) -> String {
     }
     let normalized = slug.trim_matches('-').to_owned();
     if normalized.is_empty() {
-        Ulid::new().to_string().to_ascii_lowercase()
+        Ulid::generate().to_string().to_ascii_lowercase()
     } else {
         normalized
     }

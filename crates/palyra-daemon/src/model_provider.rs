@@ -915,7 +915,7 @@ impl ProviderAttemptAdmission for UnrestrictedProviderAttemptAdmission {
             }
         })?;
         Ok(ProviderAttemptBinding {
-            attempt_id: RuntimeAttemptId::parse(Ulid::new().to_string().as_str()).map_err(
+            attempt_id: RuntimeAttemptId::parse(Ulid::generate().to_string().as_str()).map_err(
                 |_| ProviderAttemptAdmissionError::RuntimeAuthority {
                     safe_message: "provider attempt identity is invalid".to_owned(),
                     reason_code: "provider_attempt_identity_invalid".to_owned(),
@@ -5101,7 +5101,7 @@ impl OpenAiCompatibleProvider {
                     )
                 })?;
             tool_events.push(ProviderEvent::ToolProposal {
-                proposal_id: tool_call.id.unwrap_or_else(|| Ulid::new().to_string()),
+                proposal_id: tool_call.id.unwrap_or_else(|| Ulid::generate().to_string()),
                 tool_name: function.name,
                 input_json,
             });
@@ -5772,7 +5772,7 @@ fn openai_codex_provider_response(
                     proposal_id: item
                         .call_id
                         .or(item.id)
-                        .unwrap_or_else(|| Ulid::new().to_string()),
+                        .unwrap_or_else(|| Ulid::generate().to_string()),
                     tool_name,
                     input_json,
                 });
@@ -6671,7 +6671,7 @@ impl AnthropicProvider {
                         )
                     })?;
                     tool_events.push(ProviderEvent::ToolProposal {
-                        proposal_id: block.id.unwrap_or_else(|| Ulid::new().to_string()),
+                        proposal_id: block.id.unwrap_or_else(|| Ulid::generate().to_string()),
                         tool_name,
                         input_json,
                     });
@@ -9331,7 +9331,7 @@ turns:
             model_id: &str,
         ) -> Result<ProviderAttemptBinding, ProviderAttemptAdmissionError> {
             Ok(ProviderAttemptBinding {
-                attempt_id: RuntimeAttemptId::parse(Ulid::new().to_string().as_str())
+                attempt_id: RuntimeAttemptId::parse(Ulid::generate().to_string().as_str())
                     .expect("test provider attempt identity should be valid"),
                 provider_id: provider_id.to_owned(),
                 credential_id: credential_id.to_owned(),
@@ -9440,7 +9440,7 @@ turns:
             model_id: &str,
         ) -> ProviderAttemptBinding {
             ProviderAttemptBinding {
-                attempt_id: RuntimeAttemptId::parse(Ulid::new().to_string().as_str())
+                attempt_id: RuntimeAttemptId::parse(Ulid::generate().to_string().as_str())
                     .expect("test provider attempt identity should be valid"),
                 provider_id: provider_id.to_owned(),
                 credential_id: credential_id.to_owned(),
@@ -10305,7 +10305,7 @@ turns:
             model_id: &str,
         ) -> Result<ProviderAttemptBinding, ProviderAttemptAdmissionError> {
             Ok(ProviderAttemptBinding {
-                attempt_id: RuntimeAttemptId::parse(Ulid::new().to_string().as_str())
+                attempt_id: RuntimeAttemptId::parse(Ulid::generate().to_string().as_str())
                     .expect("test provider attempt identity should be valid"),
                 provider_id: provider_id.to_owned(),
                 credential_id: credential_id.to_owned(),

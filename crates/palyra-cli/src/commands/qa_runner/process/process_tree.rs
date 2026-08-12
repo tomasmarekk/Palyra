@@ -98,7 +98,7 @@ pub(super) fn configure_daemon_process_tree(
         .ok_or_else(|| anyhow::anyhow!("qa.runner.daemon_process_baseline_deadline_invalid"))?;
     let preexisting_processes = unix_process_baseline(baseline_deadline)
         .context("qa.runner.daemon_process_baseline_failed")?;
-    let containment_marker = format!("{}-{}", Ulid::new(), Ulid::new());
+    let containment_marker = format!("{}-{}", Ulid::generate(), Ulid::generate());
     // Keep the potentially expensive system-wide baseline outside this section. Until root
     // registration completes, no other managed launch may race marker discovery. Linux creates
     // its pipe with CLOEXEC atomically; the Darwin parent never creates a writer.

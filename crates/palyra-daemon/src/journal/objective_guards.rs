@@ -702,7 +702,7 @@ pub(super) fn objective_guard_reset_for_session_tx(
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
             params![
-                Ulid::new().to_string(),
+                Ulid::generate().to_string(),
                 objective_id,
                 session_id,
                 u64_to_sqlite(next_epoch, "progress_epoch")?,

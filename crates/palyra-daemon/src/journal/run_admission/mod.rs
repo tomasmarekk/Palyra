@@ -1433,7 +1433,7 @@ fn resolve_orchestrator_session_tx(
                 .unwrap_or_else(|| "<unspecified>".to_owned()),
         });
     }
-    let session_id = requested_id.unwrap_or_else(|| Ulid::new().to_string());
+    let session_id = requested_id.unwrap_or_else(|| Ulid::generate().to_string());
     let session_key = requested_key.unwrap_or_else(|| session_id.clone());
     connection.execute(
         r#"
@@ -1564,7 +1564,7 @@ fn insert_run_tx(
     append_run_lifecycle_event_tx(
         connection,
         &RunLifecycleEventAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             run_id: start.run_id.clone(),
             session_id: start.session_id.clone(),
             from_state: None,

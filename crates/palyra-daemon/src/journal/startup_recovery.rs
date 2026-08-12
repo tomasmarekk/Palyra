@@ -150,7 +150,7 @@ pub(super) fn materialize_startup_recovery_action_tx(
         return Ok(existing);
     }
 
-    let lease_id = Ulid::new().to_string();
+    let lease_id = Ulid::generate().to_string();
     let reconstruction_state = json!({
         "schema_version": 1,
         "recovered_from_run_id": candidate.run_id,
@@ -166,8 +166,8 @@ pub(super) fn materialize_startup_recovery_action_tx(
 
     let (actuation_kind, continuation, confirmation_id) = match decision.decision {
         ResumeDecisionKind::SafeToResume => {
-            let continuation_run_id = Ulid::new().to_string();
-            let continuation_task_id = Ulid::new().to_string();
+            let continuation_run_id = Ulid::generate().to_string();
+            let continuation_task_id = Ulid::generate().to_string();
             connection.execute(
                 r#"
                     INSERT INTO orchestrator_background_tasks (
@@ -225,7 +225,7 @@ pub(super) fn materialize_startup_recovery_action_tx(
             )
         }
         ResumeDecisionKind::NeedsUserConfirmation => {
-            let approval_id = Ulid::new().to_string();
+            let approval_id = Ulid::generate().to_string();
             connection.execute(
                 r#"
                     INSERT INTO approvals (

@@ -495,7 +495,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             None
         };
 
-        let session_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
         let now = Instant::now();
         let idle_ttl = if payload.idle_ttl_ms == 0 {
             self.runtime.default_idle_ttl
@@ -1190,7 +1190,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         prune_profiles_for_principal(&mut registry, principal.as_str());
         let now = current_unix_ms();
         let mut profile = BrowserProfileRecord {
-            profile_id: Ulid::new().to_string(),
+            profile_id: Ulid::generate().to_string(),
             principal: principal.clone(),
             name,
             theme_color: theme,

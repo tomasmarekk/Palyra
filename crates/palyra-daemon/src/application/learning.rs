@@ -1178,7 +1178,7 @@ pub(crate) async fn schedule_post_run_reflection(
 
     let task = runtime_state
         .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
-            task_id: Ulid::new().to_string(),
+            task_id: Ulid::generate().to_string(),
             task_kind: REFLECTION_TASK_KIND.to_owned(),
             session_id: session_id.to_owned(),
             child_session_id: None,
@@ -2199,7 +2199,7 @@ fn build_compaction_learning_candidates(
             candidate.sensitivity.clone()
         };
         candidates.push(LearningCandidateCreateRequest {
-            candidate_id: Ulid::new().to_string(),
+            candidate_id: Ulid::generate().to_string(),
             candidate_kind: mapped_kind.to_owned(),
             session_id: session_id.to_owned(),
             run_id: Some(run_id.to_owned()),
@@ -2273,7 +2273,7 @@ fn build_preference_candidates(
         }
         let confidence = 0.83;
         candidates.push(LearningCandidateCreateRequest {
-            candidate_id: Ulid::new().to_string(),
+            candidate_id: Ulid::generate().to_string(),
             candidate_kind: "preference".to_owned(),
             session_id: session_id.to_owned(),
             run_id: Some(run_id.to_owned()),
@@ -2475,7 +2475,7 @@ fn build_procedure_candidates(
                 sensitivity,
             );
             LearningCandidateCreateRequest {
-                candidate_id: Ulid::new().to_string(),
+                candidate_id: Ulid::generate().to_string(),
                 candidate_kind: "procedure".to_owned(),
                 session_id: session_id.to_owned(),
                 run_id: Some(run_id.to_owned()),
@@ -2827,7 +2827,7 @@ fn build_patch_candidates(
         let mut provenance = vec![proposal.provenance, result.provenance.clone()];
         provenance.extend(run_evidence.message_evidence.iter().cloned());
         candidates.push(LearningCandidateCreateRequest {
-            candidate_id: Ulid::new().to_string(),
+            candidate_id: Ulid::generate().to_string(),
             candidate_kind: candidate_kind.to_owned(),
             session_id: session_id.to_owned(),
             run_id: Some(run_id.to_owned()),
@@ -3383,8 +3383,10 @@ fn stage_patch_candidate(
     patch_document: &str,
     limits: &WorkspacePatchLimits,
 ) -> Result<Value, Status> {
-    let staging_root = std::env::temp_dir()
-        .join(format!("palyra-learning-stage-{}", Ulid::new().to_string().to_ascii_lowercase()));
+    let staging_root = std::env::temp_dir().join(format!(
+        "palyra-learning-stage-{}",
+        Ulid::generate().to_string().to_ascii_lowercase()
+    ));
     create_patch_learning_staging_root(staging_root.as_path())?;
     let response = (|| {
         let max_root_index = files

@@ -655,7 +655,7 @@ fn create_temp_exec_output_file(label: &str) -> std::io::Result<(PathBuf, fs::Fi
 }
 
 fn temp_output_path(label: &str) -> PathBuf {
-    env::temp_dir().join(format!("palyra-secret-ref-{}-{label}.tmp", Ulid::new()))
+    env::temp_dir().join(format!("palyra-secret-ref-{}-{label}.tmp", Ulid::generate()))
 }
 
 fn render_exit_status(status: ExitStatus) -> String {
@@ -760,7 +760,7 @@ mod tests {
 
     #[test]
     fn resolves_env_source() {
-        let key = format!("PALYRA_SECRET_REF_TEST_{}", Ulid::new());
+        let key = format!("PALYRA_SECRET_REF_TEST_{}", Ulid::generate());
         std::env::set_var(key.as_str(), "env-secret-value");
         let temp = TempDir::new().expect("temp dir should initialize");
         let resolver = SecretResolver::with_working_dir(None, temp.path());

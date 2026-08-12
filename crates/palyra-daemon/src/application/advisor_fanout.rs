@@ -541,7 +541,7 @@ fn build_runtime_plan(
     let total_token_reserve = advisor_token_reserve.saturating_add(effective_aggregator_tokens);
     AdvisorRuntimePlan {
         schema_version: ADVISOR_RUNTIME_SCHEMA_VERSION,
-        plan_id: Ulid::new().to_string(),
+        plan_id: Ulid::generate().to_string(),
         run_id_sha256: crate::sha256_hex(run_id.as_bytes()),
         session_id_sha256: crate::sha256_hex(session_id.as_bytes()),
         mode: selection.mode,
@@ -1057,7 +1057,7 @@ async fn execute_advisor_invocation(
         let result = execute_auxiliary_task_with_policy(
             runtime_state,
             AuxiliaryExecutionRequest {
-                task_id: Ulid::new().to_string(),
+                task_id: Ulid::generate().to_string(),
                 session_id: session_id.clone(),
                 run_id: Some(run_id.clone()),
                 context: context.clone(),
@@ -1197,7 +1197,7 @@ async fn persist_advisor_raw_output(
     let bounded = raw_output.chars().take(ADVISOR_TEXT_LIMIT * 4).collect::<String>();
     let artifact = runtime_state
         .create_tool_result_artifact(ToolResultArtifactCreateRequest {
-            artifact_id: Ulid::new().to_string(),
+            artifact_id: Ulid::generate().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             proposal_id: plan_id.to_owned(),
@@ -1364,7 +1364,7 @@ async fn execute_aggregator(
     let task = execute_auxiliary_task_with_policy(
         runtime_state,
         AuxiliaryExecutionRequest {
-            task_id: Ulid::new().to_string(),
+            task_id: Ulid::generate().to_string(),
             session_id: request.session_id.clone(),
             run_id: Some(request.run_id.clone()),
             context: request.context.clone(),
@@ -1625,7 +1625,7 @@ async fn persist_advisor_artifact<T: Serialize>(
     }
     let artifact = runtime_state
         .create_tool_result_artifact(ToolResultArtifactCreateRequest {
-            artifact_id: Ulid::new().to_string(),
+            artifact_id: Ulid::generate().to_string(),
             session_id: request.session_id.clone(),
             run_id: request.run_id.clone(),
             proposal_id: plan_id.to_owned(),

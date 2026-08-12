@@ -3514,7 +3514,7 @@ impl JournalStore {
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
             params![
-                Ulid::new().to_string(),
+                Ulid::generate().to_string(),
                 health.component_id.as_str(),
                 previous.as_ref().map(|value| value.state.as_str()),
                 health.state.as_str(),
@@ -4205,8 +4205,8 @@ impl JournalStore {
         request_sha256: &str,
         observed_at_unix_ms: i64,
     ) -> Result<NetworkedWorkerDispatchBeginOutcome, JournalError> {
-        let delivery_attempt_id = Ulid::new().to_string();
-        let delivery_token = format!("{}{}", Ulid::new(), Ulid::new());
+        let delivery_attempt_id = Ulid::generate().to_string();
+        let delivery_token = format!("{}{}", Ulid::generate(), Ulid::generate());
         let reservation =
             self.reserve_networked_worker_delivery(&NetworkedWorkerDeliveryReservationRequest {
                 remote_request_id: remote_request_id.to_owned(),
@@ -7406,7 +7406,7 @@ fn advance_provider_configuration_epoch_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             previous.map(runtime_generation_sql).transpose()?,
             runtime_generation_sql(epoch)?,
             if previous.is_some() {
@@ -7637,7 +7637,7 @@ pub(super) fn activate_or_refresh_generation_tx(
         None => RuntimeGeneration::new(1)
             .map_err(|error| JournalError::InvalidArgument(error.to_string()))?,
     };
-    let lease_id = Ulid::new().to_string();
+    let lease_id = Ulid::generate().to_string();
     let expires_at_unix_ms = now.saturating_add(ttl_ms);
     connection.execute(
         r#"
@@ -7675,7 +7675,7 @@ pub(super) fn activate_or_refresh_generation_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             session_id,
             run_id,
             lane.as_str(),
@@ -7739,7 +7739,7 @@ fn supersede_active_provider_lanes_tx(
                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, 1)
             "#,
             params![
-                Ulid::new().to_string(),
+                Ulid::generate().to_string(),
                 session_id,
                 run_id,
                 RuntimeGenerationLane::Provider.as_str(),
@@ -7768,7 +7768,7 @@ fn record_provider_attempt_stale_diagnostic_tx(
     reason_code: &str,
     now: i64,
 ) -> Result<(), JournalError> {
-    let diagnostic_id = Ulid::new().to_string();
+    let diagnostic_id = Ulid::generate().to_string();
     connection.execute(
         r#"
             INSERT INTO runtime_stale_event_diagnostics (
@@ -7821,7 +7821,7 @@ pub(super) fn record_runtime_stale_event_diagnostic_tx(
     now: i64,
 ) -> Result<(), JournalError> {
     validate_runtime_stale_event_diagnostic_request(request)?;
-    let diagnostic_id = Ulid::new().to_string();
+    let diagnostic_id = Ulid::generate().to_string();
     connection.execute(
         r#"
             INSERT INTO runtime_stale_event_diagnostics (
@@ -7975,7 +7975,7 @@ pub(super) fn append_runtime_event_tx(
         },
     };
     if !check.permits_mutation() {
-        let diagnostic_id = Ulid::new().to_string();
+        let diagnostic_id = Ulid::generate().to_string();
         connection.execute(
             r#"
                 INSERT INTO runtime_stale_event_diagnostics (
@@ -8233,7 +8233,7 @@ pub(super) fn invalidate_runtime_generation_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             request.session_id,
             request.run_id,
             request.lane.as_str(),
@@ -8650,7 +8650,7 @@ fn activate_runtime_health_component_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             activation.component_id.as_str(),
             previous.as_ref().map(|health| health.state.as_str()),
             health.state.as_str(),
@@ -9652,7 +9652,7 @@ fn persist_component_health_update_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             health.component_id.as_str(),
             expected_state.as_str(),
             health.state.as_str(),
@@ -9854,7 +9854,7 @@ fn append_fence_event_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             fence.operation_id.as_str(),
             from.map(|state| state.as_str()),
             fence.state.as_str(),
@@ -9936,7 +9936,7 @@ fn append_side_effect_runtime_event_tx(
         lane: RuntimeGenerationLane::Run,
         envelope: RuntimeEventEnvelopeV2 {
             schema_version: 2,
-            event_id: RuntimeEventId::parse(format!("tool_effect:{}", Ulid::new()).as_str())
+            event_id: RuntimeEventId::parse(format!("tool_effect:{}", Ulid::generate()).as_str())
                 .map_err(|error| JournalError::InvalidArgument(error.to_string()))?,
             identities,
             sequence: 0,
@@ -10114,8 +10114,10 @@ fn append_operator_side_effect_runtime_event_tx(
     )?;
     let envelope = RuntimeEventEnvelopeV2 {
         schema_version: 2,
-        event_id: RuntimeEventId::parse(format!("tool_effect_resolution:{}", Ulid::new()).as_str())
-            .map_err(|error| JournalError::InvalidArgument(error.to_string()))?,
+        event_id: RuntimeEventId::parse(
+            format!("tool_effect_resolution:{}", Ulid::generate()).as_str(),
+        )
+        .map_err(|error| JournalError::InvalidArgument(error.to_string()))?,
         identities,
         sequence,
         causal_parent_event_id: None,
@@ -10240,7 +10242,7 @@ fn persist_quarantine_finding(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             finding.contract,
             finding.record_ref_sha256,
             finding.observed_schema_version.map(i64::from),

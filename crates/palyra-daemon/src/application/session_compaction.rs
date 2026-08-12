@@ -1110,10 +1110,10 @@ pub(crate) async fn apply_session_compaction(
     let write_inputs =
         build_write_inputs(effective_candidates.as_slice(), workspace_documents.as_slice())?;
 
-    let artifact_id = Ulid::new().to_string();
-    let pair_id = Ulid::new().to_string();
-    let pre_checkpoint_id = Ulid::new().to_string();
-    let post_checkpoint_id = Ulid::new().to_string();
+    let artifact_id = Ulid::generate().to_string();
+    let pair_id = Ulid::generate().to_string();
+    let pre_checkpoint_id = Ulid::generate().to_string();
+    let post_checkpoint_id = Ulid::generate().to_string();
     let planned_checkpoint_pair =
         build_pre_post_compaction_checkpoints(PrePostCompactionCheckpointBuildInput {
             session: request.session,

@@ -295,7 +295,7 @@ pub(crate) async fn execute_image_observe_tool(
         }
     }
 
-    let task_id = Ulid::new().to_string();
+    let task_id = Ulid::generate().to_string();
     let request_context = RequestContext {
         principal: context.principal.to_owned(),
         device_id: context.device_id.to_owned(),

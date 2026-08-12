@@ -827,7 +827,7 @@ fn resolve_log_level(root: &RootOptions) -> LogLevelArg {
 }
 
 fn new_cli_trace_id() -> String {
-    format!("cli:{}", Ulid::new())
+    format!("cli:{}", Ulid::generate())
 }
 
 fn resolve_output_format_from_raw_args(args: &[OsString]) -> OutputFormatArg {

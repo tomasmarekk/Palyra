@@ -503,7 +503,7 @@ pub(crate) async fn console_routine_upsert_handler(
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
     let routine_id = match payload.routine_id.as_deref().map(str::trim) {
-        Some("") | None => Ulid::new().to_string(),
+        Some("") | None => Ulid::generate().to_string(),
         Some(value) => {
             validate_canonical_id(value).map_err(|_| {
                 runtime_status_response(tonic::Status::invalid_argument(
@@ -1743,9 +1743,9 @@ async fn ensure_routine_approval_requested(
     let record = state
         .runtime
         .create_approval_record(ApprovalCreateRequest {
-            approval_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            approval_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             principal: principal.to_owned(),
             device_id: ROUTINE_APPROVAL_DEVICE_ID.to_owned(),
             channel: channel.map(ToOwned::to_owned),
@@ -2468,7 +2468,7 @@ async fn register_terminal_routine_run(
     state: &AppState,
     request: TerminalRoutineRunRequest<'_>,
 ) -> Result<Value, Response> {
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let delivery_preview = routine_delivery_preview(&request.delivery);
     let error_kind = cron::routine_gate_error_kind(request.skip_reason.as_deref()).to_owned();
     state
@@ -3716,7 +3716,7 @@ mod tests {
     #[test]
     fn routine_schedule_resolution_builds_file_watch_poll_schedule() {
         let watched_path =
-            std::env::temp_dir().join(format!("palyra-file-watch-{}.txt", Ulid::new()));
+            std::env::temp_dir().join(format!("palyra-file-watch-{}.txt", Ulid::generate()));
         fs::write(watched_path.as_path(), "baseline").expect("watched fixture should write");
         let mut payload = schedule_upsert_payload();
         payload.trigger_kind = "file_watch".to_owned();

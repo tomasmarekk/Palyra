@@ -4974,7 +4974,7 @@ pub(crate) fn create_support_bundle_job(
     state: &AppState,
     retain_jobs: usize,
 ) -> Result<control_plane::SupportBundleJob, Response> {
-    let job_id = Ulid::new().to_string();
+    let job_id = Ulid::generate().to_string();
     let requested_at_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
@@ -5119,7 +5119,7 @@ pub(crate) fn create_doctor_job(
             return Ok(existing.clone());
         }
     }
-    let job_id = Ulid::new().to_string();
+    let job_id = Ulid::generate().to_string();
     let job = control_plane::DoctorRecoveryJob {
         job_id: job_id.clone(),
         state: control_plane::DoctorRecoveryJobState::Queued,
@@ -6871,7 +6871,7 @@ mod doctor_job_security_tests {
 
     #[test]
     fn doctor_rollback_run_id_accepts_only_canonical_ulids() {
-        let run_id = Ulid::new().to_string();
+        let run_id = Ulid::generate().to_string();
 
         assert!(is_canonical_doctor_recovery_run_id(run_id.as_str()));
         assert!(!is_canonical_doctor_recovery_run_id(run_id.to_ascii_lowercase().as_str()));

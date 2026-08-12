@@ -85,7 +85,7 @@ impl memory_v1::memory_service_server::MemoryService for MemoryServiceImpl {
         let created = self
             .state
             .ingest_memory_item(MemoryItemCreateRequest {
-                memory_id: Ulid::new().to_string(),
+                memory_id: Ulid::generate().to_string(),
                 principal: context.principal,
                 channel,
                 session_id,

@@ -1837,13 +1837,14 @@ fn bind_provider_attempt(
             operator_action_required: true,
         }
     })?;
-    let attempt_id = RuntimeAttemptId::parse(Ulid::new().to_string().as_str()).map_err(|_| {
-        ProviderAttemptAdmissionError::RuntimeAuthority {
-            safe_message: "provider attempt identity is invalid".to_owned(),
-            reason_code: "provider_attempt_identity_invalid".to_owned(),
-            retryable: false,
-        }
-    })?;
+    let attempt_id =
+        RuntimeAttemptId::parse(Ulid::generate().to_string().as_str()).map_err(|_| {
+            ProviderAttemptAdmissionError::RuntimeAuthority {
+                safe_message: "provider attempt identity is invalid".to_owned(),
+                reason_code: "provider_attempt_identity_invalid".to_owned(),
+                retryable: false,
+            }
+        })?;
     Ok(ProviderAttemptBinding {
         attempt_id,
         provider_id: provider_id.to_owned(),
@@ -4604,7 +4605,7 @@ impl GatewayRuntimeState {
         .expect("default deterministic model provider should initialize");
         let default_vault = build_test_vault();
         let tool_posture_root =
-            std::env::temp_dir().join(format!("palyra-tool-posture-{}", Ulid::new()));
+            std::env::temp_dir().join(format!("palyra-tool-posture-{}", Ulid::generate()));
         let tool_posture_registry = ToolPostureRegistry::open(tool_posture_root.as_path())
             .expect("test tool posture registry should initialize");
         #[rustfmt::skip]
@@ -6488,7 +6489,7 @@ impl GatewayRuntimeState {
         let now_unix_ms = unix_ms_now_for_status()?;
         let canvas_id = match requested_canvas_id {
             Some(value) => normalize_canvas_identifier(value.as_str(), "canvas_id")?,
-            None => Ulid::new().to_string(),
+            None => Ulid::generate().to_string(),
         };
         let state_version = if initial_state_version == 0 { 1 } else { initial_state_version };
         ensure_canvas_version_fits_sqlite("state_version", state_version)?;
@@ -7479,7 +7480,7 @@ impl GatewayRuntimeState {
             session_id: session_id.to_owned(),
             issued_at_unix_ms,
             expires_at_unix_ms,
-            nonce: Ulid::new().to_string(),
+            nonce: Ulid::generate().to_string(),
         };
         let payload_json = serde_json::to_vec(&payload).map_err(|error| {
             Status::internal(format!("failed to serialize canvas token payload: {error}"))
@@ -8882,7 +8883,7 @@ impl GatewayRuntimeState {
         let now = current_unix_ms();
         let lease = HealthProbeLeaseV1 {
             schema_version: HEALTH_PROBE_LEASE_SCHEMA_VERSION,
-            lease_id: RuntimeLeaseId::parse(format!("health-probe:{}", Ulid::new()).as_str())
+            lease_id: RuntimeLeaseId::parse(format!("health-probe:{}", Ulid::generate()).as_str())
                 .map_err(|error| {
                     Status::internal(format!("managed health probe lease invalid: {error}"))
                 })?,
@@ -8981,9 +8982,9 @@ impl GatewayRuntimeState {
             .as_ref()
             .map(|lease| hex::encode(sha2::Sha256::digest(lease.lease_id.as_str().as_bytes())));
         let probe_evidence_sha256 = clear.probe_evidence_sha256.clone();
-        let session_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
         let audit_event = JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: session_id.clone(),
             run_id: session_id,
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
@@ -10004,10 +10005,10 @@ impl GatewayRuntimeState {
         let now = current_unix_ms();
         let lease = HealthProbeLeaseV1 {
             schema_version: HEALTH_PROBE_LEASE_SCHEMA_VERSION,
-            lease_id: RuntimeLeaseId::parse(format!("provider-probe:{}", Ulid::new()).as_str())
-                .map_err(|error| {
-                    Status::internal(format!("provider probe lease invalid: {error}"))
-                })?,
+            lease_id: RuntimeLeaseId::parse(
+                format!("provider-probe:{}", Ulid::generate()).as_str(),
+            )
+            .map_err(|error| Status::internal(format!("provider probe lease invalid: {error}")))?,
             component_id: authority.component_id.clone(),
             expected_generation: authority.generation,
             authority_class: health.authority_class,
@@ -12686,7 +12687,7 @@ impl GatewayRuntimeState {
         let expected_active_generation = i64::try_from(active_generation.get()).map_err(|_| {
             Status::failed_precondition("runtime generation exceeds the journal integer range")
         })?;
-        let queued_input_id = Ulid::new().to_string();
+        let queued_input_id = Ulid::generate().to_string();
         let queued_state = if !queue_decision.accepted {
             QueuedInputState::Overflowed
         } else if queue_decision.decision == QueueDecision::Defer {
@@ -12852,7 +12853,8 @@ impl GatewayRuntimeState {
             Status::failed_precondition("runtime generation exceeds the journal integer range")
         })?;
         let timestamp_unix_ms = current_unix_ms();
-        let queued_input_id = request.queued_input_id.unwrap_or_else(|| Ulid::new().to_string());
+        let queued_input_id =
+            request.queued_input_id.unwrap_or_else(|| Ulid::generate().to_string());
         let queued_state = if !decision.accepted {
             QueuedInputState::Overflowed
         } else if decision.decision == QueueDecision::Defer {
@@ -13006,7 +13008,7 @@ impl GatewayRuntimeState {
         outcome: &str,
     ) -> Result<TurnControlAuditEventRecord, Status> {
         let append_request = TurnControlAuditEventAppendRequest {
-            event_id: ulid::Ulid::new().to_string(),
+            event_id: ulid::Ulid::generate().to_string(),
             event_type: event_type.to_owned(),
             operation: decision.operation.as_str().to_owned(),
             actor_principal: decision.actor_principal.clone(),
@@ -13113,7 +13115,7 @@ impl GatewayRuntimeState {
             actor_principal.to_owned()
         };
         let append_request = TurnControlAuditEventAppendRequest {
-            event_id: ulid::Ulid::new().to_string(),
+            event_id: ulid::Ulid::generate().to_string(),
             event_type: event_type.to_owned(),
             operation: "queue_steering".to_owned(),
             actor_principal,
@@ -17569,9 +17571,9 @@ impl GatewayRuntimeState {
         record: &SkillStatusRecord,
     ) -> Result<(), Status> {
         self.record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
@@ -17607,9 +17609,9 @@ impl GatewayRuntimeState {
         details: Value,
     ) -> Result<(), Status> {
         self.record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
@@ -17638,7 +17640,7 @@ impl GatewayRuntimeState {
         payload: RuntimeDecisionPayload,
     ) -> Result<(), Status> {
         self.append_runtime_decision_event_with_id(
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             principal,
             device_id,
             channel,
@@ -17660,7 +17662,7 @@ impl GatewayRuntimeState {
         run_id: Option<String>,
         payload: RuntimeDecisionPayload,
     ) -> Result<(), Status> {
-        let session_id = session_id.unwrap_or_else(|| Ulid::new().to_string());
+        let session_id = session_id.unwrap_or_else(|| Ulid::generate().to_string());
         let run_id = run_id.unwrap_or_else(|| session_id.clone());
         let request = JournalAppendRequest {
             event_id,
@@ -18488,7 +18490,7 @@ impl GatewayRuntimeState {
         events: &[(WorkerLifecycleEvent, Value)],
         revocations: &[crate::journal::NetworkedWorkerLeaseRevocation],
     ) -> Result<Option<JournalError>, Status> {
-        let transition_id = Ulid::new().to_string();
+        let transition_id = Ulid::generate().to_string();
         let evidence = events
             .iter()
             .map(|(event, details)| {
@@ -18714,7 +18716,7 @@ impl GatewayRuntimeState {
                     "networked worker lease assignment failed: {error}"
                 ))
             })?;
-        let transition_id = Ulid::new().to_string();
+        let transition_id = Ulid::generate().to_string();
         let evidence = [self.prepare_networked_worker_lifecycle_evidence(
             transition_id.as_str(),
             &event,
@@ -24530,7 +24532,7 @@ pub(crate) mod tests {
         let root = std::env::temp_dir().join(format!(
             "{prefix}-{}-{}",
             std::process::id(),
-            ulid::Ulid::new()
+            ulid::Ulid::generate()
         ));
         std::fs::create_dir_all(root.as_path()).expect("test runtime temp root should exist");
         root

@@ -339,7 +339,7 @@ pub(super) fn copy_live_secret(
             .get_secret(&source.scope, source.key.as_str())
             .context("qa.runner.live_secret_unavailable")?,
     )?;
-    let key = format!("qa_live_{label}_{}", Ulid::new().to_string().to_ascii_lowercase());
+    let key = format!("qa_live_{label}_{}", Ulid::generate().to_string().to_ascii_lowercase());
     scoped_vault
         .put_secret(scope, key.as_str(), secret.as_slice())
         .context("qa.runner.live_secret_projection_failed")?;
@@ -382,7 +382,7 @@ pub(super) fn prepare_fault_context(
 pub(super) fn prepare_fault_launch(
     context: &QaRunnerFaultContext,
 ) -> Result<QaPreparedFaultLaunch> {
-    let launch_id = Ulid::new().to_string();
+    let launch_id = Ulid::generate().to_string();
     let launch_file_name = format!("launch-{launch_id}.json");
     let capability_file_name = format!("capability-{launch_id}.txt");
     let launch_relative_path = PathBuf::from(QA_FAULT_DIRECTORY).join(launch_file_name.as_str());

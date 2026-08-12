@@ -119,7 +119,7 @@ pub(super) async fn execute_workspace_patch_mutation(
         checkpoint_root_mappings,
         planned_outcome,
     } = request;
-    let mutation_id = Ulid::new().to_string();
+    let mutation_id = Ulid::generate().to_string();
     let risk = assess_workspace_mutation_risk(
         planned_outcome.files_touched.as_slice(),
         risk_path_prefixes,
@@ -853,7 +853,7 @@ async fn record_project_facts_journal_projection(
     };
     if let Err(error) = runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: projection.session_id,
             run_id: projection.run_id,
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
@@ -895,7 +895,7 @@ async fn record_verification_journal_projection(
     };
     if let Err(error) = runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: projection.session_id,
             run_id: projection.run_id,
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
@@ -1087,7 +1087,7 @@ async fn record_code_intel_journal_payload(
 ) {
     if let Err(error) = runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,

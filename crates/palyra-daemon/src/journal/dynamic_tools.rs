@@ -1437,10 +1437,10 @@ mod tests {
 
     fn authority() -> DynamicToolReviewAuthority {
         DynamicToolReviewAuthority {
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             principal: "user:operator".to_owned(),
-            device_id: Ulid::new().to_string(),
+            device_id: Ulid::generate().to_string(),
             channel: Some("console".to_owned()),
             host_policy_sha256: "d".repeat(64),
         }
@@ -1474,7 +1474,7 @@ mod tests {
                 current_unix_ms().expect("clock should be available"),
             )
             .expect("proposal should persist");
-        let approval_id = Ulid::new().to_string();
+        let approval_id = Ulid::generate().to_string();
         store
             .create_approval(&dynamic_tool_approval_request(
                 approval_id.clone(),
@@ -1672,7 +1672,7 @@ mod tests {
             .consume_approval_once(policy_approval_id.as_str(), "policy-drift consumption probe",)
             .expect("policy-drift approval consumption lookup should succeed"));
 
-        let bad_approval_id = Ulid::new().to_string();
+        let bad_approval_id = Ulid::generate().to_string();
         let mut request = dynamic_tool_approval_request(
             bad_approval_id.clone(),
             &artifact,

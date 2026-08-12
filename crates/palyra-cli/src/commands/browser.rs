@@ -986,7 +986,7 @@ fn set_browserd_auth_token(command: &mut Command, auth_token: &str) {
 }
 
 fn generate_browser_auth_token() -> String {
-    format!("palyra_browser_{}_{}", Ulid::new(), Ulid::new())
+    format!("palyra_browser_{}_{}", Ulid::generate(), Ulid::generate())
 }
 
 fn generate_browser_state_key() -> Result<String> {

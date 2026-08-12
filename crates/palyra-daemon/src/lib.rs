@@ -4016,7 +4016,7 @@ fn write_installed_skills_index_atomically(path: &FsPath, payload: &[u8]) -> std
         )
     })?;
     fs::create_dir_all(parent)?;
-    let suffix = Ulid::new().to_string().to_ascii_lowercase();
+    let suffix = Ulid::generate().to_string().to_ascii_lowercase();
     let temporary_path = parent.join(format!(".installed-index.{suffix}.tmp"));
     let write_result = (|| {
         let mut temporary =
@@ -4040,7 +4040,7 @@ fn write_new_skill_artifact_atomically(path: &FsPath, payload: &[u8]) -> std::io
         )
     })?;
     fs::create_dir_all(parent)?;
-    let suffix = Ulid::new().to_string().to_ascii_lowercase();
+    let suffix = Ulid::generate().to_string().to_ascii_lowercase();
     let temporary_path = parent.join(format!(".skill-artifact.{suffix}.tmp"));
     let write_result = (|| {
         let mut temporary =
@@ -5276,9 +5276,9 @@ fn record_secret_access_journal_event(
 ) -> Result<()> {
     journal_store
         .append(&JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: gateway::proto::palyra::common::v1::journal_event::EventKind::ToolExecuted as i32,
             actor: gateway::proto::palyra::common::v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: unix_ms_now()?,

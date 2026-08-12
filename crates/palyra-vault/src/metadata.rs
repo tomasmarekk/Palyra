@@ -158,7 +158,7 @@ pub(crate) fn read_metadata(root: &Path) -> Result<MetadataFile, VaultError> {
 pub(crate) fn write_metadata(root: &Path, metadata: &MetadataFile) -> Result<(), VaultError> {
     let root = canonicalize_existing_dir(root, "vault root directory")?;
     let path = root.join(METADATA_FILE);
-    let tmp_path = path.with_extension(format!("tmp.{}", Ulid::new()));
+    let tmp_path = path.with_extension(format!("tmp.{}", Ulid::generate()));
     ensure_path_within_root(root.as_path(), path.as_path(), "vault metadata path")?;
     ensure_path_within_root(root.as_path(), tmp_path.as_path(), "vault metadata temporary path")?;
     let payload = serde_json::to_vec_pretty(metadata).map_err(|error| {

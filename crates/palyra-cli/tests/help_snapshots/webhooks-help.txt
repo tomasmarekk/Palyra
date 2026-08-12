@@ -9,7 +9,7 @@ Commands:
   enable
   disable
   remove
-  test     [aliases: verify]
+  test     [alias: verify]
 
 Options:
   -h, --help

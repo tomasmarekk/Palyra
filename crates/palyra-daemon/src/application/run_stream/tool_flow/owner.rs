@@ -932,7 +932,7 @@ fn runtime_operation_id(
     prefix: &str,
 ) -> Result<palyra_common::runtime_contracts::RuntimeOperationId, Status> {
     palyra_common::runtime_contracts::RuntimeOperationId::parse(
-        format!("{prefix}:{}", Ulid::new()).as_str(),
+        format!("{prefix}:{}", Ulid::generate()).as_str(),
     )
     .map_err(|error| Status::internal(format!("failed to allocate runtime operation id: {error}")))
 }
@@ -940,7 +940,7 @@ fn runtime_operation_id(
 fn runtime_execution_id() -> Result<palyra_common::runtime_contracts::RuntimeToolExecutionId, Status>
 {
     palyra_common::runtime_contracts::RuntimeToolExecutionId::parse(
-        format!("tool-execution:{}", Ulid::new()).as_str(),
+        format!("tool-execution:{}", Ulid::generate()).as_str(),
     )
     .map_err(|error| Status::internal(format!("failed to allocate tool execution id: {error}")))
 }

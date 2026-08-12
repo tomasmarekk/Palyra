@@ -650,7 +650,7 @@ impl ProductionServiceBundle {
 }
 
 fn new_ref(domain: &str, material: &[u8]) -> (RuntimeOperationId, [u8; 32]) {
-    let id = RuntimeOperationId::parse(Ulid::new().to_string().as_str())
+    let id = RuntimeOperationId::parse(Ulid::generate().to_string().as_str())
         .expect("generated ULID must be a valid runtime operation identity");
     let mut hasher = Sha256::new();
     hasher.update(domain.as_bytes());
@@ -660,6 +660,6 @@ fn new_ref(domain: &str, material: &[u8]) -> (RuntimeOperationId, [u8; 32]) {
 }
 
 fn new_projection_id() -> RuntimeContextProjectionId {
-    RuntimeContextProjectionId::parse(Ulid::new().to_string().as_str())
+    RuntimeContextProjectionId::parse(Ulid::generate().to_string().as_str())
         .expect("generated ULID must be a valid context projection identity")
 }

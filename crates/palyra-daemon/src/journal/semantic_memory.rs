@@ -1836,7 +1836,7 @@ impl JournalStore {
                 )
             "#,
             params![
-                Ulid::new().to_string(),
+                Ulid::generate().to_string(),
                 proposed.candidate.candidate_id,
                 f64::from(proposed.candidate.quality_eval.consolidated_usefulness_basis_points)
                     / 10_000.0,
@@ -2582,7 +2582,7 @@ fn accept_learning_candidate_tx(
             ) VALUES (?1, ?2, 'accepted', ?3, 'semantic_memory.activated', ?4, ?5)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             candidate_id,
             principal,
             json!({
@@ -2607,7 +2607,7 @@ fn accept_learning_candidate_tx(
             )
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             candidate_id,
             digest_text(record.memory_id.as_str()),
             json!({"record_sha256": previous_record_sha256}).to_string(),
@@ -2650,7 +2650,7 @@ fn record_learning_rollout_event_tx(
             )
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             event.candidate_id,
             lifecycle_str(event.record.lifecycle),
             digest_text(event.record.memory_id.as_str()),

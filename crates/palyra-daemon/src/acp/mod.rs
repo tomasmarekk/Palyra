@@ -563,7 +563,7 @@ impl AcpRuntime {
         let binding_id = existing
             .and_then(|position| index.session_bindings.get(position))
             .map(|entry| entry.binding_id.clone())
-            .unwrap_or_else(|| format!("acpbind_{}", Ulid::new()));
+            .unwrap_or_else(|| format!("acpbind_{}", Ulid::generate()));
         let record = AcpSessionBindingRecord {
             schema_version: ACP_BINDINGS_LAYOUT_VERSION,
             binding_id,
@@ -853,7 +853,7 @@ impl AcpRuntime {
         );
         let record = AcpEventLedgerRecord {
             schema_version: ACP_BINDINGS_LAYOUT_VERSION,
-            event_id: format!("acpevt_{}", Ulid::new()),
+            event_id: format!("acpevt_{}", Ulid::generate()),
             kind: request.kind,
             sequence,
             acp_client_id,
@@ -914,7 +914,7 @@ impl AcpRuntime {
         let binding_id = existing
             .and_then(|position| index.conversation_bindings.get(position))
             .map(|entry| entry.binding_id.clone())
-            .unwrap_or_else(|| format!("convbind_{}", Ulid::new()));
+            .unwrap_or_else(|| format!("convbind_{}", Ulid::generate()));
         let record = ConversationBindingRecord {
             schema_version: ACP_BINDINGS_LAYOUT_VERSION,
             binding_id,

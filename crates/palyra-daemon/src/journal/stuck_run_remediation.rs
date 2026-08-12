@@ -250,8 +250,8 @@ impl JournalStore {
                 "stuck-run-requeue",
                 format!("{run_id}:{}", authority.generation).as_str(),
             ),
-            continuation_task_id: Ulid::new().to_string(),
-            continuation_run_id: Ulid::new().to_string(),
+            continuation_task_id: Ulid::generate().to_string(),
+            continuation_run_id: Ulid::generate().to_string(),
             created_at_unix_ms: now,
             schema_version: 2,
         };
@@ -630,7 +630,7 @@ fn append_decision_event(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             decision.incident_id,
             event_type,
             decision.reason_code,
@@ -721,7 +721,7 @@ mod tests {
     use crate::journal::JournalConfig;
 
     fn temp_db_path() -> PathBuf {
-        std::env::temp_dir().join(format!("palyra-stuck-run-{}.sqlite3", Ulid::new()))
+        std::env::temp_dir().join(format!("palyra-stuck-run-{}.sqlite3", Ulid::generate()))
     }
 
     fn open_store(path: PathBuf) -> JournalStore {

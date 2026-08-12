@@ -134,8 +134,8 @@ async fn propose_signed_dynamic_tool(
         return Err(failed_precondition("dynamic_tool.rollback_pointer_mismatch"));
     }
     let authority = DynamicToolReviewAuthority {
-        session_id: Ulid::new().to_string(),
-        run_id: Ulid::new().to_string(),
+        session_id: Ulid::generate().to_string(),
+        run_id: Ulid::generate().to_string(),
         principal: session.context.principal.clone(),
         device_id: session.context.device_id.clone(),
         channel: session.context.channel.clone(),
@@ -173,7 +173,7 @@ async fn propose_signed_dynamic_tool(
             current_unix_ms(),
         )
         .map_err(internal)?;
-    let approval_id = Ulid::new().to_string();
+    let approval_id = Ulid::generate().to_string();
     let approval_request =
         dynamic_tool_approval_request(approval_id, artifact, &context, &eval_report, &authority);
     let approval =
@@ -834,8 +834,8 @@ mod tests {
             .dynamic_tool_activation_context(artifact.proposal.tool_name.as_str())
             .expect("activation context should load");
         let authority = DynamicToolReviewAuthority {
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             principal: "user:operator".to_owned(),
             device_id: "device:console".to_owned(),
             channel: Some("console".to_owned()),
@@ -859,7 +859,7 @@ mod tests {
                 current_unix_ms(),
             )
             .expect("inert proposal should persist");
-        let approval_id = Ulid::new().to_string();
+        let approval_id = Ulid::generate().to_string();
         runtime
             .journal_store
             .create_approval(&dynamic_tool_approval_request(

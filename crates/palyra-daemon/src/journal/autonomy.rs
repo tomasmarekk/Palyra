@@ -278,7 +278,7 @@ impl JournalStore {
         let checkpoint_sha256 = hex::encode(Sha256::digest(checkpoint_json.as_slice()));
         let checkpoint_ref =
             format!("orchestrator_tape:{}:{}", request.parent_run_id, tape_seq.max(0));
-        let suspension_id = Ulid::new().to_string();
+        let suspension_id = Ulid::generate().to_string();
         let deadline_unix_ms = now.saturating_add(request.timeout_ms);
         transaction.execute(
             r#"
@@ -322,7 +322,7 @@ impl JournalStore {
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, 1, ?7, ?7)
                 "#,
                 params![
-                    Ulid::new().to_string(),
+                    Ulid::generate().to_string(),
                     suspension_id,
                     child.task_id,
                     child.child_run_id,
@@ -335,7 +335,7 @@ impl JournalStore {
         wait_coordinator::register_wait_barrier_tx(
             &transaction,
             &wait_coordinator::WaitBarrierCreateRequest {
-                barrier_id: Ulid::new().to_string(),
+                barrier_id: Ulid::generate().to_string(),
                 owner_kind: "parent_suspension".to_owned(),
                 owner_id: suspension_id.clone(),
                 session_id: request.parent_session_id.clone(),
@@ -385,7 +385,7 @@ impl JournalStore {
         append_run_lifecycle_event_tx(
             &transaction,
             &RunLifecycleEventAppendRequest {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 run_id: request.parent_run_id.clone(),
                 session_id: request.parent_session_id.clone(),
                 from_state: Some(RunLifecyclePhase::Running),
@@ -625,7 +625,7 @@ impl JournalStore {
                 append_run_lifecycle_event_tx(
                     &transaction,
                     &RunLifecycleEventAppendRequest {
-                        event_id: Ulid::new().to_string(),
+                        event_id: Ulid::generate().to_string(),
                         run_id: parent_run_id,
                         session_id: parent_session_id,
                         from_state: Some(RunLifecyclePhase::Paused),
@@ -1128,9 +1128,9 @@ fn satisfy_parent_suspension_tx(
         },
     )?;
 
-    let wake_intent_id = Ulid::new().to_string();
-    let continuation_task_id = Ulid::new().to_string();
-    let continuation_run_id = Ulid::new().to_string();
+    let wake_intent_id = Ulid::generate().to_string();
+    let continuation_task_id = Ulid::generate().to_string();
+    let continuation_run_id = Ulid::generate().to_string();
     connection.execute(
         r#"
             INSERT INTO parent_wake_intents_v1 (
@@ -1234,7 +1234,7 @@ fn satisfy_parent_suspension_tx(
     append_run_lifecycle_event_tx(
         connection,
         &RunLifecycleEventAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             run_id: suspension.parent_run_id.clone(),
             session_id: suspension.parent_session_id.clone(),
             from_state: Some(RunLifecyclePhase::Paused),
@@ -1330,8 +1330,8 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary journal root should create");
         let db_path = root.path().join("journal.db");
         let store = open_store(db_path.clone());
-        let session_id = Ulid::new().to_string();
-        let parent_run_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
+        let parent_run_id = Ulid::generate().to_string();
         store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
                 session_id: session_id.clone(),
@@ -1362,7 +1362,7 @@ mod tests {
             .expect("parent run should enter progress");
         let task = store
             .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
-                task_id: Ulid::new().to_string(),
+                task_id: Ulid::generate().to_string(),
                 task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
                 session_id: session_id.clone(),
                 child_session_id: None,
@@ -1400,10 +1400,10 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary journal root should create");
         let db_path = root.path().join("journal.db");
         let store = open_store(db_path.clone());
-        let root_session_id = Ulid::new().to_string();
-        let root_run_id = Ulid::new().to_string();
-        let child_session_id = Ulid::new().to_string();
-        let delegated_run_id = Ulid::new().to_string();
+        let root_session_id = Ulid::generate().to_string();
+        let root_run_id = Ulid::generate().to_string();
+        let child_session_id = Ulid::generate().to_string();
+        let delegated_run_id = Ulid::generate().to_string();
         store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
                 session_id: root_session_id.clone(),
@@ -1471,7 +1471,7 @@ mod tests {
         };
         let authority_task = store
             .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
-                task_id: Ulid::new().to_string(),
+                task_id: Ulid::generate().to_string(),
                 task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
                 session_id: root_session_id.clone(),
                 child_session_id: Some(child_session_id.clone()),
@@ -1529,7 +1529,7 @@ mod tests {
             .expect("delegated parent run should enter progress");
         let task = store
             .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
-                task_id: Ulid::new().to_string(),
+                task_id: Ulid::generate().to_string(),
                 task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
                 session_id: child_session_id.clone(),
                 child_session_id: None,
@@ -1640,7 +1640,7 @@ mod tests {
         assert_eq!(suspension.state, PARENT_SUSPENSION_WAITING_STATE);
         assert_eq!(suspension.parent_generation, 1);
 
-        let next_user_run_id = Ulid::new().to_string();
+        let next_user_run_id = Ulid::generate().to_string();
         fixture
             .store
             .start_orchestrator_run(&OrchestratorRunStartRequest {

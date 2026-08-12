@@ -4,8 +4,8 @@ Usage: palyra sessions [OPTIONS] <COMMAND>
 
 Commands:
   list                   List known chat sessions
-  history                Search or summarize session history [aliases: search]
-  show                   Show one session by id or key [aliases: resume]
+  history                Search or summarize session history [alias: search]
+  show                   Show one session by id or key [alias: resume]
   status                 Show a public session status snapshot
   resolve                Resolve a session selector into a concrete session
   rename                 Rename a session label

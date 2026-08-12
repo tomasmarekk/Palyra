@@ -9101,7 +9101,7 @@ fn append_session_write_lease_event_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             lease.map(|record| record.session_id.as_str()).unwrap_or(request.session_id.as_str()),
             lease.map(|record| record.lease_id.as_str()),
             event_type,
@@ -9138,7 +9138,7 @@ fn append_session_write_lease_release_event_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             lease.session_id.as_str(),
             lease.lease_id.as_str(),
             event_type,
@@ -9267,7 +9267,7 @@ fn acquire_session_write_lease_tx(
 
     let lease = SessionWriteLeaseRecord {
         session_id,
-        lease_id: Ulid::new().to_string(),
+        lease_id: Ulid::generate().to_string(),
         owner_process_id: request.owner_process_id,
         owner_label,
         reason,
@@ -9945,7 +9945,7 @@ fn append_compat_response_event_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             record.response_id,
             record.session_id,
             record.run_id,
@@ -10302,7 +10302,7 @@ fn record_tool_result_artifact_read(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             request.artifact_id,
             request.session_id,
             request.run_id,
@@ -11926,7 +11926,7 @@ impl JournalStore {
             return Err(JournalError::SessionNotFound { selector });
         }
 
-        let session_id = requested_session_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
+        let session_id = requested_session_id.unwrap_or_else(|| ulid::Ulid::generate().to_string());
         let session_key = requested_session_key.unwrap_or_else(|| session_id.clone());
         let session_label = requested_session_label;
 
@@ -12941,7 +12941,7 @@ impl JournalStore {
                         append_run_lifecycle_event_tx(
                             &transaction,
                             &RunLifecycleEventAppendRequest {
-                                event_id: Ulid::new().to_string(),
+                                event_id: Ulid::generate().to_string(),
                                 run_id: request.run_id.clone(),
                                 session_id: request.session_id.clone(),
                                 from_state: None,
@@ -13111,7 +13111,7 @@ impl JournalStore {
         append_run_lifecycle_event_tx(
             &guard,
             &RunLifecycleEventAppendRequest {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 run_id: run_id.to_owned(),
                 session_id: session_id.clone(),
                 from_state: RunLifecyclePhase::parse(previous_state.as_str()),
@@ -13356,7 +13356,7 @@ impl JournalStore {
         append_run_lifecycle_event_tx(
             &transaction,
             &RunLifecycleEventAppendRequest {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 run_id: request.run_id.clone(),
                 session_id: session_id.clone(),
                 from_state: Some(canonical_run_lifecycle_phase(current_state)),
@@ -13742,7 +13742,7 @@ impl JournalStore {
             append_run_lifecycle_event_tx(
                 &transaction,
                 &RunLifecycleEventAppendRequest {
-                    event_id: Ulid::new().to_string(),
+                    event_id: Ulid::generate().to_string(),
                     run_id: candidate.run_id.clone(),
                     session_id: candidate.session_id.clone(),
                     from_state: RunLifecyclePhase::parse(candidate.previous_state.as_str()),
@@ -13786,7 +13786,7 @@ impl JournalStore {
             let mut runtime_event_envelope = RuntimeEventEnvelopeV2 {
                 schema_version: 2,
                 event_id: RuntimeEventId::parse(
-                    format!("run_recovery_terminal:{}", Ulid::new()).as_str(),
+                    format!("run_recovery_terminal:{}", Ulid::generate()).as_str(),
                 )
                 .map_err(|error| JournalError::InvalidArgument(error.to_string()))?,
                 identities,
@@ -19732,7 +19732,7 @@ impl JournalStore {
         insert_flow_event(
             &transaction,
             FlowEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 flow_id: request.flow_id.as_str(),
                 step_id: None,
                 event_type: "flow.created",
@@ -19747,7 +19747,7 @@ impl JournalStore {
         insert_flow_revision(
             &transaction,
             FlowRevisionInsert {
-                revision_id: Ulid::new().to_string(),
+                revision_id: Ulid::generate().to_string(),
                 flow_id: request.flow_id.as_str(),
                 revision: 1,
                 parent_revision: None,
@@ -20080,7 +20080,7 @@ impl JournalStore {
         insert_flow_event(
             &transaction,
             FlowEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 flow_id: request.flow_id.as_str(),
                 step_id: None,
                 event_type: request.event_type.as_str(),
@@ -20095,7 +20095,7 @@ impl JournalStore {
         insert_flow_revision(
             &transaction,
             FlowRevisionInsert {
-                revision_id: Ulid::new().to_string(),
+                revision_id: Ulid::generate().to_string(),
                 flow_id: request.flow_id.as_str(),
                 revision: next_revision,
                 parent_revision: Some(previous_revision),
@@ -20228,7 +20228,7 @@ impl JournalStore {
         insert_flow_event(
             &transaction,
             FlowEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 flow_id: request.flow_id.as_str(),
                 step_id: Some(request.step_id.as_str()),
                 event_type: request.event_type.as_str(),
@@ -20243,7 +20243,7 @@ impl JournalStore {
         insert_flow_revision(
             &transaction,
             FlowRevisionInsert {
-                revision_id: Ulid::new().to_string(),
+                revision_id: Ulid::generate().to_string(),
                 flow_id: request.flow_id.as_str(),
                 revision: next_revision,
                 parent_revision: Some(previous_revision),
@@ -20491,7 +20491,7 @@ impl JournalStore {
         insert_flow_event(
             &transaction,
             FlowEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 flow_id: request.flow_id.as_str(),
                 step_id: None,
                 event_type: "flow.dependencies_invalid",
@@ -20506,7 +20506,7 @@ impl JournalStore {
         insert_flow_revision(
             &transaction,
             FlowRevisionInsert {
-                revision_id: Ulid::new().to_string(),
+                revision_id: Ulid::generate().to_string(),
                 flow_id: request.flow_id.as_str(),
                 revision: next_revision,
                 parent_revision: Some(actual_revision),
@@ -20655,7 +20655,7 @@ impl JournalStore {
         insert_flow_event(
             &transaction,
             FlowEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 flow_id: request.flow_id.as_str(),
                 step_id: None,
                 event_type: "flow.dependencies_repaired",
@@ -20670,7 +20670,7 @@ impl JournalStore {
         insert_flow_revision(
             &transaction,
             FlowRevisionInsert {
-                revision_id: Ulid::new().to_string(),
+                revision_id: Ulid::generate().to_string(),
                 flow_id: request.flow_id.as_str(),
                 revision: next_revision,
                 parent_revision: Some(actual_revision),
@@ -20791,7 +20791,7 @@ impl JournalStore {
         insert_work_item_event(
             &transaction,
             WorkItemEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 work_item_id: request.work_item_id.as_str(),
                 event_type: "work_item.created",
                 actor_principal: request.actor_principal.as_str(),
@@ -20965,7 +20965,7 @@ impl JournalStore {
         insert_work_item_event(
             &transaction,
             WorkItemEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 work_item_id: request.work_item_id.as_str(),
                 event_type: request.event_type.as_str(),
                 actor_principal: request.actor_principal.as_str(),
@@ -21248,7 +21248,7 @@ impl JournalStore {
         insert_commitment_source(
             &transaction,
             CommitmentSourceInsert {
-                source_id: Ulid::new().to_string(),
+                source_id: Ulid::generate().to_string(),
                 commitment_id: request.commitment_id.as_str(),
                 source_kind: request.source_kind.as_str(),
                 session_id: request.session_id.as_deref(),
@@ -21265,7 +21265,7 @@ impl JournalStore {
         insert_commitment_event(
             &transaction,
             CommitmentEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 commitment_id: request.commitment_id.as_str(),
                 event_type: "commitment.extracted",
                 actor_principal: request.actor_principal.as_str(),
@@ -21394,7 +21394,7 @@ impl JournalStore {
         insert_commitment_event(
             &transaction,
             CommitmentEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 commitment_id: request.commitment_id.as_str(),
                 event_type: request.event_type.as_str(),
                 actor_principal: request.actor_principal.as_str(),
@@ -21669,7 +21669,7 @@ impl JournalStore {
         insert_agent_plan_event(
             &transaction,
             AgentPlanEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 plan_item_id: request.plan_item_id.as_str(),
                 session_id: request.session_id.as_str(),
                 run_id: request.run_id.as_deref(),
@@ -21861,7 +21861,7 @@ impl JournalStore {
         insert_agent_plan_event(
             &transaction,
             AgentPlanEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 plan_item_id: request.plan_item_id.as_str(),
                 session_id: existing.session_id.as_str(),
                 run_id: existing.run_id.as_deref(),
@@ -22198,7 +22198,7 @@ impl JournalStore {
                 progress_draft_update_event_type(request.state.as_str()),
             )
         } else {
-            let draft_id = Ulid::new().to_string();
+            let draft_id = Ulid::generate().to_string();
             let completed_at_unix_ms =
                 is_terminal_progress_draft_state(request.state.as_str()).then_some(now);
             match transaction.execute(
@@ -22267,7 +22267,7 @@ impl JournalStore {
         insert_progress_draft_event(
             &transaction,
             ProgressDraftEventInsert {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 draft_id: draft_id.as_str(),
                 session_id: scope.session_id.as_str(),
                 run_id: request.run_id.as_str(),
@@ -22815,7 +22815,7 @@ impl JournalStore {
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
             params![
-                Ulid::new().to_string(),
+                Ulid::generate().to_string(),
                 request.candidate_id.as_str(),
                 request.status.as_str(),
                 request.reviewed_by_principal.as_str(),
@@ -22958,7 +22958,7 @@ impl JournalStore {
         ensure_nonempty_field(request.actor_principal.as_str(), "actor_principal")?;
         ensure_nonempty_field(request.policy_decision.as_str(), "policy_decision")?;
         ensure_json_field(request.evidence_refs_json.as_str(), "evidence_refs_json")?;
-        let eval_id = request.eval_id.clone().unwrap_or_else(|| Ulid::new().to_string());
+        let eval_id = request.eval_id.clone().unwrap_or_else(|| Ulid::generate().to_string());
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         if load_learning_candidate_by_id(&guard, request.candidate_id.as_str())?.is_none() {
@@ -23061,7 +23061,7 @@ impl JournalStore {
         ensure_json_field(request.activated_version_json.as_str(), "activated_version_json")?;
         ensure_json_field(request.telemetry_json.as_str(), "telemetry_json")?;
         ensure_json_field(request.evidence_refs_json.as_str(), "evidence_refs_json")?;
-        let rollout_id = request.rollout_id.clone().unwrap_or_else(|| Ulid::new().to_string());
+        let rollout_id = request.rollout_id.clone().unwrap_or_else(|| Ulid::generate().to_string());
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         if load_learning_candidate_by_id(&guard, request.candidate_id.as_str())?.is_none() {
@@ -23168,7 +23168,7 @@ impl JournalStore {
         let now = current_unix_ms()?;
         let confidence = request.confidence.clamp(0.0, 1.0);
         let preference_id =
-            request.preference_id.clone().unwrap_or_else(|| Ulid::new().to_string());
+            request.preference_id.clone().unwrap_or_else(|| Ulid::generate().to_string());
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         guard.execute(
             r#"
@@ -26650,7 +26650,7 @@ impl JournalStore {
             )
         } else {
             let document_id =
-                request.document_id.clone().unwrap_or_else(|| Ulid::new().to_string());
+                request.document_id.clone().unwrap_or_else(|| Ulid::generate().to_string());
             let insert_result = transaction.execute(
                 r#"
                     INSERT INTO workspace_documents (
@@ -27932,7 +27932,7 @@ fn reindex_workspace_document_chunks_tx(
     let chunks = workspace_text_chunks(args.content_text);
     let chunk_count = chunks.len();
     for (chunk_index, chunk_text) in chunks.iter().enumerate() {
-        let chunk_ulid = Ulid::new().to_string();
+        let chunk_ulid = Ulid::generate().to_string();
         let vector = normalize_embedding_dimensions(
             embedding_provider.embed_text(chunk_text.as_str()),
             args.embedding_dims,
@@ -33797,7 +33797,7 @@ fn sync_memory_embedding_jobs_for_pending_targets(
                     END
             "#,
             params![
-                Ulid::new().to_string(),
+                Ulid::generate().to_string(),
                 memory_id,
                 content_hash,
                 target_model_id,
@@ -39498,7 +39498,7 @@ mod tests {
             .commit_networked_worker_lifecycle_with_revocations(
                 &[NetworkedWorkerLifecycleCommit {
                     request: JournalAppendRequest {
-                        event_id: format!("worker-test-authority:{}", Ulid::new()),
+                        event_id: format!("worker-test-authority:{}", Ulid::generate()),
                         session_id,
                         run_id: run_id.to_owned(),
                         kind: 0,
@@ -43322,7 +43322,7 @@ mod tests {
                 remote_request_id: request.remote_request_id.clone(),
                 node_request_id: request.node_request_id.clone(),
                 request_sha256: request.request_sha256.clone(),
-                delivery_attempt_id: ulid::Ulid::new().to_string(),
+                delivery_attempt_id: ulid::Ulid::generate().to_string(),
                 delivery_token_sha256: super::sha256_hex(b"claim-abort-delivery-token"),
                 observed_at_unix_ms: now_unix_ms.saturating_add(1),
             })
@@ -47359,7 +47359,7 @@ mod tests {
                 probe_evidence_sha256,
             },
             audit_event: JournalAppendRequest {
-                event_id: format!("runtime-health-clear:{}", Ulid::new()),
+                event_id: format!("runtime-health-clear:{}", Ulid::generate()),
                 session_id: "runtime-health-admin-session".to_owned(),
                 run_id: "runtime-health-admin-run".to_owned(),
                 kind: 1,

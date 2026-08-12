@@ -1101,7 +1101,7 @@ fn launch_admitted_session(
         process.take_stderr().map_err(|error| ProcessSupervisorError::Spawn(error.message))?;
     let stdin =
         process.take_stdin().map_err(|error| ProcessSupervisorError::Spawn(error.message))?;
-    let process_session_id = format!("process_{}", ulid::Ulid::new());
+    let process_session_id = format!("process_{}", ulid::Ulid::generate());
     let created_at_unix_ms = unix_time_ms();
     let deadline_delta = i64::try_from(spec.timeout.as_millis()).unwrap_or(i64::MAX);
     let no_output_deadline_at_unix_ms = spec.no_output_timeout.map(|timeout| {

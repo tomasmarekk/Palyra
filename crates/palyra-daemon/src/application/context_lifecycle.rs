@@ -178,7 +178,7 @@ impl ContextEngineBindingV2 {
     fn new(descriptor: &ContextEngineDescriptor) -> Self {
         Self {
             schema_version: CONTEXT_ENGINE_BINDING_SCHEMA_VERSION,
-            binding_id: Ulid::new().to_string(),
+            binding_id: Ulid::generate().to_string(),
             engine_id: descriptor.engine_id.clone(),
             engine_version: descriptor.version.clone(),
             projection_epoch: 1,
@@ -190,7 +190,7 @@ impl ContextEngineBindingV2 {
     fn safe_builtin(projection_epoch: u64, health: ContextEngineHealth) -> Self {
         Self {
             schema_version: CONTEXT_ENGINE_BINDING_SCHEMA_VERSION,
-            binding_id: Ulid::new().to_string(),
+            binding_id: Ulid::generate().to_string(),
             engine_id: DEFAULT_CONTEXT_ENGINE_ID.to_owned(),
             engine_version: DEFAULT_CONTEXT_ENGINE_VERSION.to_owned(),
             projection_epoch: projection_epoch.max(1),

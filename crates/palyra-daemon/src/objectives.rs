@@ -796,7 +796,7 @@ fn attach_contract_audit_event(
         return Ok(());
     };
     record.contract_history.push(ObjectiveContractAuditRecord {
-        event_id: Ulid::new().to_string(),
+        event_id: Ulid::generate().to_string(),
         event_type: event_type.to_owned(),
         actor_principal: record.owner_principal.clone(),
         reason_code: record.contract.reason_code.clone(),
@@ -1267,14 +1267,14 @@ mod tests {
     use ulid::Ulid;
 
     fn temp_state_root() -> PathBuf {
-        let path = env::temp_dir().join(format!("palyra-objective-tests-{}", Ulid::new()));
+        let path = env::temp_dir().join(format!("palyra-objective-tests-{}", Ulid::generate()));
         fs::create_dir_all(&path).expect("temp state root should be created");
         path
     }
 
     fn sample_record() -> ObjectiveRecord {
         ObjectiveRecord {
-            objective_id: Ulid::new().to_string(),
+            objective_id: Ulid::generate().to_string(),
             kind: ObjectiveKind::Objective,
             state: ObjectiveState::Draft,
             name: "Ship objective board".to_owned(),
@@ -1303,7 +1303,7 @@ mod tests {
                 related_session_ids: vec!["01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()],
             },
             automation: ObjectiveAutomationBinding {
-                routine_id: Some(Ulid::new().to_string()),
+                routine_id: Some(Ulid::generate().to_string()),
                 enabled: false,
                 trigger_kind: RoutineTriggerKind::Manual,
                 schedule_type: "at".to_owned(),
@@ -1316,8 +1316,8 @@ mod tests {
                 template_id: None,
             },
             last_attempt: Some(ObjectiveAttemptRecord {
-                attempt_id: Ulid::new().to_string(),
-                run_id: Some(Ulid::new().to_string()),
+                attempt_id: Ulid::generate().to_string(),
+                run_id: Some(Ulid::generate().to_string()),
                 session_id: None,
                 status: "scheduled".to_owned(),
                 outcome_kind: Some("success_with_output".to_owned()),
@@ -1329,14 +1329,14 @@ mod tests {
             }),
             attempt_history: vec![],
             approach_history: vec![ObjectiveApproachRecord {
-                entry_id: Ulid::new().to_string(),
+                entry_id: Ulid::generate().to_string(),
                 kind: ObjectiveApproachKind::Attempted,
                 summary: "Started from the routines surface.".to_owned(),
                 run_id: None,
                 created_at_unix_ms: 5,
             }],
             lifecycle_history: vec![ObjectiveLifecycleRecord {
-                event_id: Ulid::new().to_string(),
+                event_id: Ulid::generate().to_string(),
                 action: "created".to_owned(),
                 from_state: None,
                 to_state: ObjectiveState::Draft,
@@ -1344,7 +1344,7 @@ mod tests {
                 run_id: None,
                 occurred_at_unix_ms: 1,
             }],
-            linked_run_ids: vec![Ulid::new().to_string()],
+            linked_run_ids: vec![Ulid::generate().to_string()],
             linked_artifact_paths: vec!["projects/objectives/demo.md".to_owned()],
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,

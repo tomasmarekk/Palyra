@@ -1053,7 +1053,7 @@ impl ManagedStdioProcess {
         }
         CleanupReportV1 {
             schema_version: RUNTIME_HANDLE_SCHEMA_VERSION,
-            report_id: format!("cleanup_{}", ulid::Ulid::new()),
+            report_id: format!("cleanup_{}", ulid::Ulid::generate()),
             instance_id: self.lease.instance_id.clone(),
             lease_id: Some(self.lease.lease_id.clone()),
             outcome: if cleanup_failed {
@@ -1361,9 +1361,9 @@ fn spawn_prepared_managed_stdio_process(
     let duration_ms = i64::try_from(config.lease_duration.as_millis()).unwrap_or(i64::MAX);
     let lease = ProcessLeaseV1 {
         schema_version: RUNTIME_HANDLE_SCHEMA_VERSION,
-        lease_id: RuntimeLeaseId::parse(&format!("lease_{}", ulid::Ulid::new()))
+        lease_id: RuntimeLeaseId::parse(&format!("lease_{}", ulid::Ulid::generate()))
             .map_err(|_| managed_stdio_error("failed to issue process lease identity"))?,
-        instance_id: RuntimeInstanceId::parse(&format!("instance_{}", ulid::Ulid::new()))
+        instance_id: RuntimeInstanceId::parse(&format!("instance_{}", ulid::Ulid::generate()))
             .map_err(|_| managed_stdio_error("failed to issue runtime instance identity"))?,
         generation: RuntimeGeneration::new(config.generation)
             .map_err(|_| managed_stdio_error("failed to issue runtime generation"))?,

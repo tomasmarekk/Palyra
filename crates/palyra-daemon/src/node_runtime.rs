@@ -978,7 +978,7 @@ impl NodeRuntimeState {
         _timeout_ms: Option<u64>,
     ) -> Result<(String, CapabilityExecutionReceiver), Status> {
         let now = current_unix_ms()?;
-        let request_id = Ulid::new().to_string();
+        let request_id = Ulid::generate().to_string();
         let dispatch = CapabilityDispatchRecord {
             request_id: request_id.clone(),
             capability: capability.to_owned(),
@@ -1215,7 +1215,7 @@ impl NodeRuntimeState {
                         }
                         Some("networked worker queued payload digest mismatch")
                     } else {
-                        let delivery_attempt_id = Ulid::new().to_string();
+                        let delivery_attempt_id = Ulid::generate().to_string();
                         let fetch_token = mint_networked_worker_delivery_token();
                         let reservation_request = NetworkedWorkerDeliveryReservationRequest {
                             remote_request_id: remote_request_id.clone(),
@@ -2142,12 +2142,12 @@ fn generate_pairing_code(method: PairingCodeMethod) -> String {
             // Six digits derived by hashing a fresh random ULID; the modulo
             // bias of 2^32 % 1_000_000 is negligible for a short-lived,
             // single-use code that still requires operator approval.
-            let digest = sha2::Sha256::digest(Ulid::new().to_string().as_bytes());
+            let digest = sha2::Sha256::digest(Ulid::generate().to_string().as_bytes());
             let value =
                 u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
             format!("{value:06}")
         }
-        PairingCodeMethod::Qr => Ulid::new().to_string(),
+        PairingCodeMethod::Qr => Ulid::generate().to_string(),
     }
 }
 
@@ -2642,12 +2642,12 @@ mod tests {
         let now = super::current_unix_ms().expect("clock should be available");
         crate::journal::NetworkedWorkerDispatchClaim {
             schema_version: 3,
-            remote_request_id: Ulid::new().to_string(),
-            node_request_id: Ulid::new().to_string(),
+            remote_request_id: Ulid::generate().to_string(),
+            node_request_id: Ulid::generate().to_string(),
             worker_id: worker_id.to_owned(),
-            lease_id: Ulid::new().to_string(),
-            session_id: Some(Ulid::new().to_string()),
-            run_id: Ulid::new().to_string(),
+            lease_id: Ulid::generate().to_string(),
+            session_id: Some(Ulid::generate().to_string()),
+            run_id: Ulid::generate().to_string(),
             run_generation: Some(
                 RuntimeGeneration::new(1).expect("test generation should be valid"),
             ),

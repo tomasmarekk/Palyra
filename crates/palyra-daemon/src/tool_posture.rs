@@ -426,7 +426,7 @@ impl ToolPostureRegistry {
             append_audit_event(
                 &mut document.audit_events,
                 ToolPostureAuditEventRecord {
-                    audit_id: Ulid::new().to_string(),
+                    audit_id: Ulid::generate().to_string(),
                     scope_kind: request.scope_kind,
                     scope_id: normalized_scope_id.clone(),
                     tool_name: Some(request.tool_name.clone()),
@@ -458,7 +458,7 @@ impl ToolPostureRegistry {
             append_audit_event(
                 &mut document.audit_events,
                 ToolPostureAuditEventRecord {
-                    audit_id: Ulid::new().to_string(),
+                    audit_id: Ulid::generate().to_string(),
                     scope_kind: record.scope_kind,
                     scope_id: record.scope_id.clone(),
                     tool_name: Some(record.tool_name.clone()),
@@ -530,7 +530,7 @@ impl ToolPostureRegistry {
             append_audit_event(
                 &mut document.audit_events,
                 ToolPostureAuditEventRecord {
-                    audit_id: Ulid::new().to_string(),
+                    audit_id: Ulid::generate().to_string(),
                     scope_kind: request.scope_kind,
                     scope_id: normalized_scope_id,
                     tool_name: Some(request.tool_name),
@@ -582,7 +582,7 @@ impl ToolPostureRegistry {
             append_audit_event(
                 &mut document.audit_events,
                 ToolPostureAuditEventRecord {
-                    audit_id: Ulid::new().to_string(),
+                    audit_id: Ulid::generate().to_string(),
                     scope_kind: request.scope_kind,
                     scope_id: normalized_scope_id.clone(),
                     tool_name: Some(record.tool_name.clone()),
@@ -630,7 +630,7 @@ impl ToolPostureRegistry {
             append_audit_event(
                 &mut document.audit_events,
                 ToolPostureAuditEventRecord {
-                    audit_id: Ulid::new().to_string(),
+                    audit_id: Ulid::generate().to_string(),
                     scope_kind: request.scope_kind,
                     scope_id: normalized_scope_id.clone(),
                     tool_name: None,
@@ -660,7 +660,7 @@ impl ToolPostureRegistry {
         append_audit_event(
             &mut document.audit_events,
             ToolPostureAuditEventRecord {
-                audit_id: Ulid::new().to_string(),
+                audit_id: Ulid::generate().to_string(),
                 scope_kind: request.scope_kind,
                 scope_id: record.scope_id.clone(),
                 tool_name: None,
@@ -1715,7 +1715,7 @@ fn replace_registry_file(temp_path: &Path, path: &Path) -> Result<(), std::io::E
 
 fn registry_sidecar_path(path: &Path, kind: &str) -> PathBuf {
     let mut sidecar_name = path.as_os_str().to_os_string();
-    sidecar_name.push(format!(".{kind}.{}.{}", std::process::id(), Ulid::new()));
+    sidecar_name.push(format!(".{kind}.{}.{}", std::process::id(), Ulid::generate()));
     PathBuf::from(sidecar_name)
 }
 
@@ -1793,7 +1793,7 @@ mod tests {
     impl TempStateRoot {
         fn new() -> Self {
             let path =
-                std::env::temp_dir().join(format!("palyra-tool-posture-test-{}", Ulid::new()));
+                std::env::temp_dir().join(format!("palyra-tool-posture-test-{}", Ulid::generate()));
             fs::create_dir_all(&path).expect("temp state root should be created");
             Self { path }
         }
@@ -1811,7 +1811,7 @@ mod tests {
         decision: Option<ApprovalDecision>,
     ) -> ApprovalRecord {
         ApprovalRecord {
-            approval_id: format!("approval-{}", Ulid::new()),
+            approval_id: format!("approval-{}", Ulid::generate()),
             session_id: session_id.to_owned(),
             run_id: "run-1".to_owned(),
             principal: "operator".to_owned(),

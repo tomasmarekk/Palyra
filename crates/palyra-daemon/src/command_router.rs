@@ -168,7 +168,7 @@ async fn run_create(
     })?;
     let run_id = optional_str(&envelope.params, "run_id")
         .map(str::to_owned)
-        .unwrap_or_else(|| Ulid::new().to_string());
+        .unwrap_or_else(|| Ulid::generate().to_string());
     validate_canonical_id(run_id.as_str()).map_err(|_| {
         stable_error(
             "command/invalid_run_id",
@@ -569,7 +569,7 @@ async fn node_capability_grant(
         .node_runtime
         .set_node_capability_availability(device_id, capability, true)
         .map_err(stable_error_from_status)?;
-    let grant_id = Ulid::new().to_string();
+    let grant_id = Ulid::generate().to_string();
     state
         .runtime
         .record_console_event(
@@ -947,7 +947,7 @@ fn publish_command_event(
     let _ = router.publish(RealtimeEventEnvelope {
         schema_version: 1,
         sequence: 0,
-        event_id: Ulid::new().to_string(),
+        event_id: Ulid::generate().to_string(),
         topic,
         sensitivity: RealtimeEventSensitivity::Internal,
         owner_principal: Some(context.request_context.principal.clone()),

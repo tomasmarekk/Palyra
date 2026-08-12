@@ -1368,7 +1368,7 @@ pub(super) fn write_artifact_bytes(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow::anyhow!("qa.runner.artifact_path_invalid"))?;
-    let temporary_path = path.with_file_name(format!(".{file_name}.{}.tmp", Ulid::new()));
+    let temporary_path = path.with_file_name(format!(".{file_name}.{}.tmp", Ulid::generate()));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

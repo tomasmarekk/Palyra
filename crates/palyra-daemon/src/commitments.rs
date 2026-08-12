@@ -485,7 +485,7 @@ fn build_commitment_create_request(
         source_sha256: selection.source_sha256.clone(),
     };
     CommitmentCreateRequest {
-        commitment_id: Ulid::new().to_string(),
+        commitment_id: Ulid::generate().to_string(),
         owner_principal: input.owner_principal.clone(),
         device_id: input.device_id.clone(),
         channel: input.channel.clone(),

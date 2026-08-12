@@ -3012,7 +3012,7 @@ fn assign_worker_record(
         return Err(WorkerLifecycleError::NoAvailableWorker);
     }
     let lease = WorkerLease {
-        lease_id: Ulid::new().to_string(),
+        lease_id: Ulid::generate().to_string(),
         worker_id: worker_id.to_owned(),
         run_id: request.run_id.clone(),
         expires_at_unix_ms,

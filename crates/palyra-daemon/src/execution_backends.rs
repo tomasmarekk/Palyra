@@ -2210,7 +2210,7 @@ fn materialize_docker_vault_env_file(
             ),
         });
     };
-    let path = env::temp_dir().join(format!("palyra-docker-env-{}.env", Ulid::new()));
+    let path = env::temp_dir().join(format!("palyra-docker-env-{}.env", Ulid::generate()));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -2734,7 +2734,8 @@ impl DockerEngine for DockerCliEngine {
             }
             let (run_plan, writeback_capture) = prepare_docker_run_plan(&plan)?;
             reap_expired_docker_containers(crate::gateway::current_unix_ms()).await?;
-            let container_name = format!("palyra-{}", Ulid::new().to_string().to_ascii_lowercase());
+            let container_name =
+                format!("palyra-{}", Ulid::generate().to_string().to_ascii_lowercase());
             let cleanup_deadline_unix_ms = crate::gateway::current_unix_ms()
                 .saturating_add(i64::try_from(run_plan.execution_timeout_ms).unwrap_or(i64::MAX))
                 .saturating_add(30_000);
@@ -5416,7 +5417,7 @@ fn build_ssh_worker_rpc_request(
     Ok(SshWorkerRpcRequestEnvelope {
         protocol: SSH_WORKER_RPC_PROTOCOL.to_owned(),
         schema_version: SSH_WORKER_RPC_SCHEMA_VERSION,
-        request_id: Ulid::new().to_string(),
+        request_id: Ulid::generate().to_string(),
         proposal_id: proposal_id.to_owned(),
         profile_id: profile.profile_id.clone(),
         tunnel_endpoint_sha256: sha256_hex(profile.tunnel_endpoint.as_bytes()),
@@ -9217,7 +9218,8 @@ mod tests {
             serde_json::from_slice(&cpu_outcome.output_json).expect("Docker CPU output JSON");
         assert_eq!(cpu_payload["cleanup"]["container_removed"], true);
 
-        let orphan_name = format!("palyra-orphan-{}", Ulid::new().to_string().to_ascii_lowercase());
+        let orphan_name =
+            format!("palyra-orphan-{}", Ulid::generate().to_string().to_ascii_lowercase());
         let docker_user = current_docker_user();
         let orphan = tokio::process::Command::new("docker")
             .args([

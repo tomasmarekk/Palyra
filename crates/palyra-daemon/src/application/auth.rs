@@ -412,11 +412,11 @@ pub(crate) async fn record_auth_profile_saved_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             // Auth profile administration is not tied to a chat session or
             // run, so fresh ULIDs satisfy the journal's non-empty id fields.
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
@@ -456,9 +456,9 @@ pub(crate) async fn record_auth_profile_deleted_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
@@ -503,9 +503,9 @@ pub(crate) async fn record_auth_refresh_journal_event(
     let redacted_reason = crate::model_provider::sanitize_remote_error(outcome.reason.as_str());
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),
@@ -541,9 +541,9 @@ pub(crate) async fn record_auth_runtime_operation_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: current_unix_ms(),

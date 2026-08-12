@@ -115,7 +115,7 @@ pub(crate) async fn console_semantic_memory_proposal_handler(
     let approval = state
         .runtime
         .create_approval_record(semantic_memory_approval_request(
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             &proposed,
             &authority,
         ))
@@ -393,7 +393,7 @@ pub(crate) async fn console_semantic_memory_rollback_proposal_handler(
     let approval = state
         .runtime
         .create_approval_record(semantic_memory_approval_request(
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             &proposed,
             &authority,
         ))
@@ -519,7 +519,7 @@ fn new_review_authority(
         .session;
     Ok(SemanticMemoryReviewAuthority {
         session_id: session.session_id,
-        run_id: Ulid::new().to_string(),
+        run_id: Ulid::generate().to_string(),
         principal: context.principal.clone(),
         device_id: context.device_id.clone(),
         channel: context.channel.clone(),

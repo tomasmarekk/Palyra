@@ -317,7 +317,7 @@ impl LspDocumentCoordinator {
                 .collect::<Result<Vec<_>, LspDocumentSyncError>>()?
         };
         artifact_documents.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        let baseline_id = format!("baseline_{}", ulid::Ulid::new());
+        let baseline_id = format!("baseline_{}", ulid::Ulid::generate());
         let created_at_unix_ms = unix_time_ms();
         let payload = BaselineArtifactV2 {
             schema_version: LSP_DOCUMENT_SYNC_SCHEMA_VERSION,

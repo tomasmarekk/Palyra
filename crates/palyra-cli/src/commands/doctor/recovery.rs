@@ -2063,7 +2063,7 @@ fn apply_repair_plans(
         });
     }
 
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let manager = DoctorRecoveryRunWriter::new(environment, run_id.as_str())?;
     let mut applied_steps = Vec::new();
     for plan in plans {
@@ -2148,7 +2148,7 @@ fn apply_repair_plan(
             set_value_at_path(
                 &mut document,
                 "tool_call.browser_service.auth_token",
-                TomlValue::String(format!("browser-{}", Ulid::new())),
+                TomlValue::String(format!("browser-{}", Ulid::generate())),
             )?;
             let encoded = serialize_document_pretty(&document)?;
             manager.write_string(plan.step.id.as_str(), path.as_path(), encoded.as_str(), true)?;
@@ -2829,7 +2829,7 @@ impl DoctorRecoveryRunWriter {
         let backup_path = backup_dir.join(format!(
             "{}-{}-{}",
             sanitize_file_component(step_id),
-            Ulid::new(),
+            Ulid::generate(),
             path.file_name().and_then(|value| value.to_str()).unwrap_or("backup.bin")
         ));
         write_bytes_atomic(backup_path.as_path(), snapshot.bytes.as_slice(), secret_aware)?;
@@ -2911,13 +2911,13 @@ fn write_bytes_atomic(path: &Path, content: &[u8], secret_aware: bool) -> Result
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create parent dir {}", parent.display()))?;
     }
-    let tmp_path = path.with_extension(format!("{}.tmp", Ulid::new()));
+    let tmp_path = path.with_extension(format!("{}.tmp", Ulid::generate()));
     write_atomic_temp_file(tmp_path.as_path(), content, secret_aware)?;
     if path.exists() {
         // Windows rename fails when the destination exists, so stage the
         // current file aside first and restore it if installing the new bytes
         // fails partway through.
-        let rollback_path = path.with_extension(format!("{}.rollback", Ulid::new()));
+        let rollback_path = path.with_extension(format!("{}.rollback", Ulid::generate()));
         fs::rename(path, rollback_path.as_path()).with_context(|| {
             format!("failed to stage existing file {} for atomic write", path.display())
         })?;
@@ -3788,7 +3788,7 @@ fn auth_registry_quarantine_path(path: &Path) -> PathBuf {
 
 fn quarantine_path(path: &Path) -> PathBuf {
     let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("quarantine");
-    path.with_file_name(format!("{file_name}.quarantine-{}", Ulid::new()))
+    path.with_file_name(format!("{file_name}.quarantine-{}", Ulid::generate()))
 }
 
 fn empty_auth_registry_document() -> Result<String> {
@@ -4019,7 +4019,7 @@ remote_base_url = "https://dashboard.example.test/"
         fs::create_dir_all(&state_root)?;
         let environment =
             DoctorEnvironment { state_root, config_path: None, generated_at_unix_ms: 100 };
-        let run_id = Ulid::new().to_string();
+        let run_id = Ulid::generate().to_string();
         let writer = DoctorRecoveryRunWriter::new(&environment, run_id.as_str())?;
         let outside_target = temp.path().join("outside.txt");
         fs::write(&outside_target, b"outside")?;
@@ -4057,7 +4057,7 @@ remote_base_url = "https://dashboard.example.test/"
             config_path: None,
             generated_at_unix_ms: 100,
         };
-        let run_id = Ulid::new().to_string();
+        let run_id = Ulid::generate().to_string();
         let writer = DoctorRecoveryRunWriter::new(&environment, run_id.as_str())?;
         let target = state_root.join("target.txt");
         let outside_backup = temp.path().join("outside-backup.txt");

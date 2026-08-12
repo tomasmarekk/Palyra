@@ -672,7 +672,7 @@ fn coalesce_wake_intent_tx(
     event: &WakeEventRequest,
     decision: WakeDecision,
 ) -> Result<WakeIntentV1, JournalError> {
-    let intent_id = Ulid::new().to_string();
+    let intent_id = Ulid::generate().to_string();
     let generation = u64_to_sqlite(barrier.attempt_generation, "attempt_generation")?;
     connection.execute(
         r#"
@@ -737,7 +737,7 @@ fn append_barrier_event_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             barrier.barrier_id,
             intent_id,
             event_type,

@@ -904,7 +904,7 @@ pub(crate) async fn console_learning_curator_report_handler(
         .await
         .map_err(runtime_status_response)?;
     let report = LearningCurator.curate(LearningCuratorInput {
-        report_id: Ulid::new().to_string(),
+        report_id: Ulid::generate().to_string(),
         generated_at_unix_ms: current_unix_ms(),
         stale_after_ms,
         candidates: candidates.as_slice(),
@@ -2248,7 +2248,7 @@ fn build_recall_preview_artifact_request(
     preview: &RecallPreviewEnvelope,
 ) -> RecallArtifactCreateRequest {
     RecallArtifactCreateRequest {
-        artifact_id: Ulid::new().to_string(),
+        artifact_id: Ulid::generate().to_string(),
         artifact_kind: RECALL_ARTIFACT_KIND_PREVIEW.to_owned(),
         principal: context.principal.clone(),
         device_id: context.device_id.clone(),
@@ -2294,7 +2294,7 @@ fn build_session_search_artifact_request(
 ) -> RecallArtifactCreateRequest {
     let source_refs_projection = session_search_source_refs_projection(outcome);
     RecallArtifactCreateRequest {
-        artifact_id: Ulid::new().to_string(),
+        artifact_id: Ulid::generate().to_string(),
         artifact_kind: RECALL_ARTIFACT_KIND_SESSION_SEARCH.to_owned(),
         principal: context.principal.clone(),
         device_id: context.device_id.clone(),

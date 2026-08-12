@@ -328,7 +328,7 @@ pub(crate) async fn console_objective_upsert_handler(
     let objective_id = existing
         .as_ref()
         .map(|entry| entry.objective_id.clone())
-        .unwrap_or_else(|| Ulid::new().to_string());
+        .unwrap_or_else(|| Ulid::generate().to_string());
     let workspace_document_path = existing
         .as_ref()
         .map(|entry| entry.workspace.workspace_document_path.clone())
@@ -420,7 +420,7 @@ pub(crate) async fn console_objective_upsert_handler(
     // so the audit trail reflects explicit lifecycle actions only.
     if is_new_objective {
         lifecycle_history.push(ObjectiveLifecycleRecord {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             action: "created".to_owned(),
             from_state: None,
             to_state: initial_state,
@@ -640,7 +640,7 @@ pub(crate) async fn console_objective_attempt_handler(
         load_objective_record(&state, objective_id.as_str(), session.context.principal.as_str())?;
     let now_unix_ms = unix_ms_now().map_err(internal_console_error)?;
     let attempt = ObjectiveAttemptRecord {
-        attempt_id: Ulid::new().to_string(),
+        attempt_id: Ulid::generate().to_string(),
         run_id: normalize_optional_text(payload.run_id.as_deref()),
         session_id: normalize_optional_text(payload.session_id.as_deref()),
         status: payload.status,
@@ -697,7 +697,7 @@ pub(crate) async fn console_objective_approach_handler(
     let mut objective =
         load_objective_record(&state, objective_id.as_str(), session.context.principal.as_str())?;
     objective.approach_history.push(ObjectiveApproachRecord {
-        entry_id: Ulid::new().to_string(),
+        entry_id: Ulid::generate().to_string(),
         kind: parse_approach_kind(payload.kind.as_str())?,
         summary: payload.summary,
         run_id: normalize_optional_text(payload.run_id.as_deref()),
@@ -1455,7 +1455,7 @@ async fn apply_fire_action(
     if let Some(run_id) = outcome.get("run_id").and_then(Value::as_str) {
         objective.linked_run_ids.push(run_id.to_owned());
         let attempt = ObjectiveAttemptRecord {
-            attempt_id: Ulid::new().to_string(),
+            attempt_id: Ulid::generate().to_string(),
             run_id: Some(run_id.to_owned()),
             session_id: None,
             status: outcome.get("status").and_then(Value::as_str).unwrap_or("scheduled").to_owned(),
@@ -1474,7 +1474,7 @@ async fn apply_fire_action(
         objective.attempt_history.push(attempt);
     }
     objective.lifecycle_history.push(ObjectiveLifecycleRecord {
-        event_id: Ulid::new().to_string(),
+        event_id: Ulid::generate().to_string(),
         action: "fire".to_owned(),
         from_state: Some(from_state),
         to_state: ObjectiveState::Active,
@@ -1497,7 +1497,7 @@ async fn apply_pause_action(
     objective.automation.enabled = false;
     set_objective_job_enabled(state, objective, false).await?;
     objective.lifecycle_history.push(ObjectiveLifecycleRecord {
-        event_id: Ulid::new().to_string(),
+        event_id: Ulid::generate().to_string(),
         action: "pause".to_owned(),
         from_state: Some(from_state),
         to_state: ObjectiveState::Paused,
@@ -1525,7 +1525,7 @@ async fn apply_resume_action(
     objective.automation.enabled = true;
     set_objective_job_enabled(state, objective, true).await?;
     objective.lifecycle_history.push(ObjectiveLifecycleRecord {
-        event_id: Ulid::new().to_string(),
+        event_id: Ulid::generate().to_string(),
         action: "resume".to_owned(),
         from_state: Some(from_state),
         to_state: ObjectiveState::Active,
@@ -1559,7 +1559,7 @@ async fn apply_cancel_action(
             .await;
     }
     objective.lifecycle_history.push(ObjectiveLifecycleRecord {
-        event_id: Ulid::new().to_string(),
+        event_id: Ulid::generate().to_string(),
         action: "cancel".to_owned(),
         from_state: Some(from_state),
         to_state: ObjectiveState::Cancelled,
@@ -1589,7 +1589,7 @@ async fn apply_archive_action(
     objective.archived_at_unix_ms = Some(now_unix_ms);
     disable_objective_job_for_archive(state, objective).await?;
     objective.lifecycle_history.push(ObjectiveLifecycleRecord {
-        event_id: Ulid::new().to_string(),
+        event_id: Ulid::generate().to_string(),
         action: "archive".to_owned(),
         from_state: Some(from_state),
         to_state: ObjectiveState::Archived,
@@ -2550,7 +2550,7 @@ mod tests {
 
     fn sample_objective() -> ObjectiveRecord {
         ObjectiveRecord {
-            objective_id: Ulid::new().to_string(),
+            objective_id: Ulid::generate().to_string(),
             kind: ObjectiveKind::Heartbeat,
             state: ObjectiveState::Active,
             name: "Daily heartbeat".to_owned(),
@@ -2575,7 +2575,7 @@ mod tests {
                 related_session_ids: vec![],
             },
             automation: ObjectiveAutomationBinding {
-                routine_id: Some(Ulid::new().to_string()),
+                routine_id: Some(Ulid::generate().to_string()),
                 enabled: true,
                 trigger_kind: RoutineTriggerKind::Schedule,
                 schedule_type: "every".to_owned(),
@@ -2785,9 +2785,9 @@ mod tests {
     #[test]
     fn objective_view_reconciles_running_attempt_with_terminal_run() {
         let mut objective = sample_objective();
-        let run_id = Ulid::new().to_string();
+        let run_id = Ulid::generate().to_string();
         let attempt = ObjectiveAttemptRecord {
-            attempt_id: Ulid::new().to_string(),
+            attempt_id: Ulid::generate().to_string(),
             run_id: Some(run_id.clone()),
             session_id: None,
             status: "running".to_owned(),
@@ -2824,9 +2824,9 @@ mod tests {
     #[test]
     fn archive_snapshot_preserves_terminal_attempt_as_last_run() {
         let mut objective = sample_objective();
-        let run_id = Ulid::new().to_string();
+        let run_id = Ulid::generate().to_string();
         let attempt = ObjectiveAttemptRecord {
-            attempt_id: Ulid::new().to_string(),
+            attempt_id: Ulid::generate().to_string(),
             run_id: Some(run_id.clone()),
             session_id: None,
             status: "running".to_owned(),
@@ -2923,7 +2923,7 @@ mod tests {
     fn archive_projection_disables_automation_without_losing_routine_history_link() {
         let mut objective = sample_objective();
         let routine_id = objective.automation.routine_id.clone();
-        let run_id = Ulid::new().to_string();
+        let run_id = Ulid::generate().to_string();
         objective.linked_run_ids.push(run_id.clone());
         apply_lifecycle_workspace_projection("archive", &mut objective)
             .expect("archive projection should succeed");

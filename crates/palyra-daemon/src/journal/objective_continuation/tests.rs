@@ -14,8 +14,8 @@ fn fixture() -> AttemptFixture {
     let root = tempfile::tempdir().expect("temporary journal root should create");
     let db_path = root.path().join("journal.db");
     let store = open_store(db_path.clone());
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
             session_id: session_id.clone(),
@@ -42,14 +42,14 @@ fn fixture() -> AttemptFixture {
         db_path,
         store,
         request: ObjectiveAttemptReserveRequest {
-            attempt_id: Ulid::new().to_string(),
-            objective_id: Ulid::new().to_string(),
-            routine_id: Some(Ulid::new().to_string()),
+            attempt_id: Ulid::generate().to_string(),
+            objective_id: Ulid::generate().to_string(),
+            routine_id: Some(Ulid::generate().to_string()),
             session_id,
             root_run_id: run_id.clone(),
             source_run_id: run_id,
             source_run_generation: 1,
-            judge_task_id: Ulid::new().to_string(),
+            judge_task_id: Ulid::generate().to_string(),
             owner_principal: "user:objective".to_owned(),
             device_id: "device-objective".to_owned(),
             channel: Some("cli".to_owned()),
@@ -188,7 +188,7 @@ fn continuation_task_reservation_survives_restart_without_duplication() {
             guard: guard_request(&fixture, ObjectiveContinuationDecision::Continue),
         })
         .expect("decision should settle");
-    let continuation_task_id = Ulid::new().to_string();
+    let continuation_task_id = Ulid::generate().to_string();
     let reserved = fixture
         .store
         .reserve_objective_continuation_task(
@@ -243,7 +243,7 @@ fn pending_user_input_preempts_continuation_reservation_atomically() {
     fixture
         .store
         .create_orchestrator_queued_input(&OrchestratorQueuedInputCreateRequest {
-            queued_input_id: Ulid::new().to_string(),
+            queued_input_id: Ulid::generate().to_string(),
             run_id: fixture.request.source_run_id.clone(),
             session_id: fixture.request.session_id.clone(),
             state: QueuedInputState::Pending.as_str().to_owned(),
@@ -269,7 +269,7 @@ fn pending_user_input_preempts_continuation_reservation_atomically() {
         .store
         .reserve_objective_continuation_task(
             fixture.request.attempt_id.as_str(),
-            Ulid::new().to_string().as_str(),
+            Ulid::generate().to_string().as_str(),
             "objective.continuation.task_reserved",
         )
         .expect("preemption should be a typed outcome");

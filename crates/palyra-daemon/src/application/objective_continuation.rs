@@ -409,8 +409,8 @@ async fn reserve_and_enqueue_judge(
                 "objective source run is missing persisted generation authority",
             )
         })?;
-    let attempt_id = Ulid::new().to_string();
-    let judge_task_id = Ulid::new().to_string();
+    let attempt_id = Ulid::generate().to_string();
+    let judge_task_id = Ulid::generate().to_string();
     let request = ObjectiveAttemptReserveRequest {
         attempt_id,
         objective_id: objective.objective_id.clone(),
@@ -665,7 +665,7 @@ async fn ensure_continuation_task(
             objective.name
         )
     });
-    let planned_run_id = Ulid::new().to_string();
+    let planned_run_id = Ulid::generate().to_string();
     let budget_tokens = objective
         .budget
         .max_tokens

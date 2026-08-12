@@ -648,7 +648,7 @@ fn unique_temp_state_root_dir() -> PathBuf {
 }
 
 fn generate_canonical_ulid() -> String {
-    Ulid::new().to_string()
+    Ulid::generate().to_string()
 }
 
 fn resolve_palyrad_binary_path() -> Result<PathBuf> {

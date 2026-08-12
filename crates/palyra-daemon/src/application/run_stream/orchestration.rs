@@ -4338,12 +4338,12 @@ async fn process_run_stream_message_inner(
                 );
                 let outcome = RunAdmissionController::new(&runtime_state.journal_store)
                     .admit(RunAdmissionCommand::from_verified(
-                        Ulid::new().to_string(),
+                        Ulid::generate().to_string(),
                         format!("run_stream:{session_id}"),
                         run_id.clone(),
-                        Ulid::new().to_string(),
+                        Ulid::generate().to_string(),
                         run_id.clone(),
-                        Ulid::new().to_string(),
+                        Ulid::generate().to_string(),
                         JournalRunAdmissionSessionSelector {
                             session_id: Some(session_id.clone()),
                             session_key: None,

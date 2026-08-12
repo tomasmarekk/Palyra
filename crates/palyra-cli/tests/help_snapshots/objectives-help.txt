@@ -7,7 +7,7 @@ Commands:
   list
   show
   summary
-  upsert   [aliases: apply]
+  upsert   [alias: apply]
   fire
   pause
   resume

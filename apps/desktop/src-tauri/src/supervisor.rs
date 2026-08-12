@@ -1825,7 +1825,7 @@ impl DesktopInstanceLock {
 }
 
 fn publish_initialized_instance_lock(path: &Path) -> std::io::Result<()> {
-    let staging_path = path.with_file_name(format!(".instance.lock.{}.tmp", ulid::Ulid::new()));
+    let staging_path = path.with_file_name(format!(".instance.lock.{}.tmp", ulid::Ulid::generate()));
     let mut staging_file =
         fs::OpenOptions::new().write(true).create_new(true).open(staging_path.as_path())?;
     let initialization =
@@ -2166,7 +2166,7 @@ mod tests {
     #[test]
     fn runtime_secrets_with_config_overrides_prefers_cli_visible_tokens() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-token-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-token-test-{}", ulid::Ulid::generate()));
         fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
         let config_path = fixture.join("palyra.toml");
         fs::write(
@@ -2201,7 +2201,7 @@ auth_token = "config-browser-token"
     #[test]
     fn runtime_secrets_with_config_overrides_falls_back_when_tokens_are_missing() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-token-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-token-test-{}", ulid::Ulid::generate()));
         fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
         let config_path = fixture.join("palyra.toml");
         fs::write(config_path.as_path(), "version = 1\n")
@@ -2225,7 +2225,7 @@ auth_token = "config-browser-token"
     #[test]
     fn runtime_auth_with_config_overrides_reads_browser_state_key_vault_ref() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-browser-key-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-browser-key-test-{}", ulid::Ulid::generate()));
         fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
         let identity_root = fixture.join("identity");
         let vault_root = fixture.join("vault");
@@ -2281,7 +2281,7 @@ state_key_vault_ref = "global/browser_state_key"
     #[test]
     fn browserd_env_values_include_resolved_profile_state_key() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-browser-env-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-browser-env-test-{}", ulid::Ulid::generate()));
         let browser_state_key =
             BrowserStateEncryptionKey::parse(TEST_BROWSER_STATE_KEY, "fixture browser state key")
                 .expect("fixture browser state key should parse");
@@ -2300,7 +2300,7 @@ state_key_vault_ref = "global/browser_state_key"
     #[test]
     fn runtime_config_with_config_overrides_uses_configured_ports() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-port-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-port-test-{}", ulid::Ulid::generate()));
         fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
         let config_path = fixture.join("palyra.toml");
         fs::write(
@@ -2339,7 +2339,7 @@ health_base_url = "http://127.0.0.1:7313"
     #[test]
     fn runtime_auth_with_config_overrides_uses_config_principal_binding() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-auth-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-auth-test-{}", ulid::Ulid::generate()));
         fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
         let config_path = fixture.join("palyra.toml");
         fs::write(
@@ -2375,7 +2375,7 @@ bound_principal = "admin:local"
     #[test]
     fn runtime_auth_with_missing_config_keeps_desktop_principal_binding() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-auth-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-auth-test-{}", ulid::Ulid::generate()));
         fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
         let config_path = fixture.join("missing-palyra.toml");
         let fallback = DesktopRuntimeSecrets {
@@ -2400,7 +2400,7 @@ bound_principal = "admin:local"
     #[test]
     fn runtime_auth_with_existing_config_keeps_desktop_principal_binding() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-auth-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-auth-test-{}", ulid::Ulid::generate()));
         fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
         let config_path = fixture.join("palyra.toml");
         fs::write(
@@ -2425,7 +2425,7 @@ bound_principal = "admin:local"
     #[test]
     fn config_reload_watch_treats_first_config_creation_as_change() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-config-watch-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-config-watch-test-{}", ulid::Ulid::generate()));
         fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
         let config_path = fixture.join("palyra.toml");
         let mut profile = implicit_profile("desktop-local");
@@ -2446,7 +2446,7 @@ bound_principal = "admin:local"
     #[test]
     fn config_reload_watch_uses_existing_config_as_startup_baseline() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-config-watch-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-config-watch-test-{}", ulid::Ulid::generate()));
         fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
         let config_path = fixture.join("palyra.toml");
         fs::write(config_path.as_path(), "version = 1\n")
@@ -2462,7 +2462,7 @@ bound_principal = "admin:local"
     #[test]
     fn config_reload_watch_ignores_supervisor_owned_config_write() {
         let fixture =
-            env::temp_dir().join(format!("palyra-desktop-config-watch-test-{}", ulid::Ulid::new()));
+            env::temp_dir().join(format!("palyra-desktop-config-watch-test-{}", ulid::Ulid::generate()));
         fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
         let config_path = fixture.join("palyra.toml");
         fs::write(config_path.as_path(), "version = 1\n")

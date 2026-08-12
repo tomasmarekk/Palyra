@@ -584,7 +584,7 @@ pub(crate) async fn plan_usage_routing(
     let _ = request
         .runtime_state
         .create_usage_routing_decision(UsageRoutingDecisionCreateRequest {
-            decision_id: Ulid::new().to_string(),
+            decision_id: Ulid::generate().to_string(),
             run_id: request.run_id.to_owned(),
             session_id: request.session_id.to_owned(),
             principal: request.request_context.principal.clone(),
@@ -1792,8 +1792,9 @@ pub(crate) async fn request_usage_budget_override(
 
     // Approval records require non-empty ids; synthesized ULIDs keep an override
     // request without a session/run from ever matching another context's approval.
-    let session_id = session_id.map(ToOwned::to_owned).unwrap_or_else(|| Ulid::new().to_string());
-    let run_id = run_id.map(ToOwned::to_owned).unwrap_or_else(|| Ulid::new().to_string());
+    let session_id =
+        session_id.map(ToOwned::to_owned).unwrap_or_else(|| Ulid::generate().to_string());
+    let run_id = run_id.map(ToOwned::to_owned).unwrap_or_else(|| Ulid::generate().to_string());
     let request_summary =
         if let Some(reason) = requested_reason.filter(|value| !value.trim().is_empty()) {
             format!("Budget override requested for policy {}: {}", policy.policy_id, reason.trim())
@@ -1803,7 +1804,7 @@ pub(crate) async fn request_usage_budget_override(
 
     runtime_state
         .create_approval_record(ApprovalCreateRequest {
-            approval_id: Ulid::new().to_string(),
+            approval_id: Ulid::generate().to_string(),
             session_id,
             run_id,
             principal: request_context.principal.clone(),

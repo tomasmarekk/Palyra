@@ -577,9 +577,9 @@ async fn ensure_channel_message_approval(
     state
         .runtime
         .create_approval_record(ApprovalCreateRequest {
-            approval_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            approval_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             principal: context.principal.clone(),
             device_id: context.device_id.clone(),
             channel: context

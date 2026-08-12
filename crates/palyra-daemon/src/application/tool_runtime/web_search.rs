@@ -665,7 +665,7 @@ async fn persist_search_source_artifact(
     provenance: &SearchFetchProvenance<'_>,
     result: &WebSearchResultV1,
 ) -> Result<CitationSourceRef, tonic::Status> {
-    let artifact_id = Ulid::new().to_string();
+    let artifact_id = Ulid::generate().to_string();
     let citation_id = format!("web-source-{}", result.rank);
     let content = serde_json::to_vec(&json!({
         "schema_version": WEB_SEARCH_SCHEMA_VERSION,

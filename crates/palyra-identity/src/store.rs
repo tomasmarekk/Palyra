@@ -231,7 +231,7 @@ impl FilesystemSecretStore {
 
             let path = self.key_path(key)?;
             let tmp_path = loop {
-                let candidate = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
+                let candidate = path.with_extension(format!("tmp.{}", ulid::Ulid::generate()));
                 if !candidate.exists() {
                     break candidate;
                 }
@@ -267,7 +267,7 @@ impl FilesystemSecretStore {
 
             let path = self.key_path(key)?;
             let tmp_path = loop {
-                let candidate = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
+                let candidate = path.with_extension(format!("tmp.{}", ulid::Ulid::generate()));
                 if !candidate.exists() {
                     break candidate;
                 }
@@ -459,7 +459,7 @@ fn write_store_encryption_key_if_absent(
     let encoded = raw_key.to_vec();
 
     let tmp_path = loop {
-        let candidate = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
+        let candidate = path.with_extension(format!("tmp.{}", ulid::Ulid::generate()));
         if !candidate.exists() {
             break candidate;
         }

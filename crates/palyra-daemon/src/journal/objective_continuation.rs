@@ -856,7 +856,7 @@ fn append_objective_transition_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             attempt_id,
             from_state,
             to_state,

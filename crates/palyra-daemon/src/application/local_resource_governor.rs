@@ -430,7 +430,7 @@ impl LocalResourceGovernor {
         let duration_ms = i64::try_from(request.duration.as_millis()).unwrap_or(i64::MAX);
         let lease = ResourceLeaseV1 {
             schema_version: RESOURCE_LEASE_SCHEMA_VERSION,
-            lease_id: format!("resource_{}", ulid::Ulid::new()),
+            lease_id: format!("resource_{}", ulid::Ulid::generate()),
             owner_id: request.owner_id,
             generation: request.generation,
             service: request.service,

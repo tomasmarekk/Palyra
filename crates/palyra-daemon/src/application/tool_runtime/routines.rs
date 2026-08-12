@@ -865,7 +865,7 @@ async fn upsert_routine(
                 .map_err(|_| "routine_id must be a canonical ULID when provided".to_owned())?;
             value
         }
-        None => Ulid::new().to_string(),
+        None => Ulid::generate().to_string(),
     };
     let owner_principal = normalize_owner_principal(
         optional_string_field(payload, "owner_principal").as_deref(),
@@ -1682,7 +1682,7 @@ async fn register_terminal_routine_run(
     registry: &Arc<RoutineRegistry>,
     request: TerminalRoutineRunRequest<'_>,
 ) -> Result<Value, String> {
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let delivery_preview = routine_delivery_preview(&request.delivery);
     let error_kind = cron::routine_gate_error_kind(request.skip_reason.as_deref()).to_owned();
     runtime_state
@@ -2176,9 +2176,9 @@ async fn ensure_routine_approval_requested(
     let prompt = routine_approval_prompt(job, mode, subject_id.clone(), details_json);
     let record = runtime_state
         .create_approval_record(ApprovalCreateRequest {
-            approval_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            approval_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             principal: principal.to_owned(),
             device_id: ROUTINE_APPROVAL_DEVICE_ID.to_owned(),
             channel: channel.map(ToOwned::to_owned),
@@ -3239,7 +3239,7 @@ fn routines_tool_execution_outcome(
         output_json,
         error,
         attestation: ToolAttestation {
-            attestation_id: Ulid::new().to_string(),
+            attestation_id: Ulid::generate().to_string(),
             execution_sha256,
             executed_at_unix_ms,
             timed_out: false,
@@ -3479,7 +3479,7 @@ mod tests {
     fn resolve_routine_schedule_builds_file_watch_poll_schedule() {
         let _env_guard = crate::test_env::lock();
         let watched_path =
-            std::env::temp_dir().join(format!("palyra-tool-file-watch-{}.txt", Ulid::new()));
+            std::env::temp_dir().join(format!("palyra-tool-file-watch-{}.txt", Ulid::generate()));
         fs::write(watched_path.as_path(), "baseline").expect("watch fixture should write");
         let payload = json!({
             "trigger_payload": {

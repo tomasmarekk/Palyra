@@ -474,7 +474,7 @@ pub(crate) fn publish_maintenance_realtime_event(
     let _ = router.publish(RealtimeEventEnvelope {
         schema_version: 1,
         sequence: 0,
-        event_id: ulid::Ulid::new().to_string(),
+        event_id: ulid::Ulid::generate().to_string(),
         topic: RealtimeEventTopic::System,
         sensitivity: RealtimeEventSensitivity::Internal,
         owner_principal,

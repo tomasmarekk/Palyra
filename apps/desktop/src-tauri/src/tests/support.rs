@@ -22,7 +22,7 @@ pub(super) struct TempFixtureDir {
 
 impl TempFixtureDir {
     pub(super) fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("palyra-desktop-fixture-{}", Ulid::new()));
+        let root = std::env::temp_dir().join(format!("palyra-desktop-fixture-{}", Ulid::generate()));
         std::fs::create_dir_all(root.as_path()).expect("fixture directory should be created");
         Self { root }
     }
@@ -85,8 +85,8 @@ pub(super) fn build_test_control_center(root: &Path) -> ControlCenter {
     let config_reload_watch = DesktopConfigReloadWatchState::from_profile(&active_profile);
     let profile_catalog = DesktopProfileCatalog::load(root).expect("profile catalog should load");
     let runtime_secret_fallbacks = DesktopRuntimeSecrets {
-        admin_token: format!("test-admin-{}", Ulid::new()),
-        browser_auth_token: format!("test-browser-{}", Ulid::new()),
+        admin_token: format!("test-admin-{}", Ulid::generate()),
+        browser_auth_token: format!("test-browser-{}", Ulid::generate()),
         browser_state_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
     };
     ControlCenter {

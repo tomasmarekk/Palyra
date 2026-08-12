@@ -39,7 +39,7 @@ fn build_pending_pairing_session(
 ) -> IdentityResult<(String, PairingSession, ActivePairingSession)> {
     validate_pairing_method(&method)?;
 
-    let session_id = ulid::Ulid::new().to_string();
+    let session_id = ulid::Ulid::generate().to_string();
     let gateway_secret_bytes = secure_random_array()?;
     let gateway_ephemeral_secret = StaticSecret::from(gateway_secret_bytes);
     let gateway_ephemeral_public = X25519PublicKey::from(&gateway_ephemeral_secret).to_bytes();

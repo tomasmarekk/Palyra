@@ -367,7 +367,7 @@ async fn create_sessions_spawn(
     input: &SessionsSpawnInput,
     child_task_parent_context: Option<&CancellationContextV1>,
 ) -> Result<Value, Status> {
-    let child_run_id = Ulid::new().to_string();
+    let child_run_id = Ulid::generate().to_string();
     let return_mode = input.return_mode.unwrap_or_default();
     let request = sessions_spawn_delegation_spawn_request(input, child_run_id.clone())?;
     let task =
@@ -461,10 +461,10 @@ async fn create_delegation_background_task(
 
     runtime
         .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
-            task_id: Ulid::new().to_string(),
+            task_id: Ulid::generate().to_string(),
             task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
             session_id: context.session_id.to_owned(),
-            child_session_id: Some(Ulid::new().to_string()),
+            child_session_id: Some(Ulid::generate().to_string()),
             parent_run_id: Some(parent_run_id),
             target_run_id: None,
             planned_child_run_id: request.preallocated_child_run_id,
@@ -518,10 +518,10 @@ fn derive_child_task_cancellation_context(
             .deadline_unix_ms
             .map_or(requested_deadline, |deadline| deadline.min(requested_deadline)),
     );
-    let scope_id = RuntimeOperationId::parse(format!("child_task:{}", Ulid::new()).as_str())
+    let scope_id = RuntimeOperationId::parse(format!("child_task:{}", Ulid::generate()).as_str())
         .map_err(|error| {
-            Status::internal(format!("child task scope identity is invalid: {error}"))
-        })?;
+        Status::internal(format!("child task scope identity is invalid: {error}"))
+    })?;
     parent
         .derive_child(
             scope_id,

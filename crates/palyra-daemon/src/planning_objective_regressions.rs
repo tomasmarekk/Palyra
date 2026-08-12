@@ -47,9 +47,9 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn completed_plan_objective_judge_and_final_answer_contract_align_on_evidence() {
     let journal = test_journal_store();
     let plan_store = AgentPlanStore::new(&journal);
-    let objective_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
-    let session_id = Ulid::new().to_string();
+    let objective_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
+    let session_id = Ulid::generate().to_string();
     start_test_run(&journal, &session_id, &run_id);
     let plan = create_plan_item(&plan_store, &session_id, &run_id, &objective_id);
     let completed = plan_store
@@ -157,9 +157,9 @@ fn completed_plan_objective_judge_and_final_answer_contract_align_on_evidence() 
 fn blocked_plan_and_missing_evidence_keep_objective_loop_open() {
     let journal = test_journal_store();
     let plan_store = AgentPlanStore::new(&journal);
-    let objective_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
-    let session_id = Ulid::new().to_string();
+    let objective_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
+    let session_id = Ulid::generate().to_string();
     start_test_run(&journal, &session_id, &run_id);
     let plan = create_plan_item(&plan_store, &session_id, &run_id, &objective_id);
     let blocked = plan_store
@@ -250,7 +250,7 @@ fn create_plan_item(
 ) -> crate::application::plan_state::AgentPlanItem {
     store
         .create_item(AgentPlanCreateCommand {
-            plan_item_id: Some(Ulid::new().to_string()),
+            plan_item_id: Some(Ulid::generate().to_string()),
             session_id: session_id.to_owned(),
             run_id: Some(run_id.to_owned()),
             parent_run_id: None,

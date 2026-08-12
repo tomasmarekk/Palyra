@@ -200,7 +200,7 @@ impl JournalStore {
             }
         }
 
-        let command_id = Ulid::new().to_string();
+        let command_id = Ulid::generate().to_string();
         let superseded_command_id = if request.command_kind.coalesces_pending() {
             supersede_pending_session_command_tx(&transaction, request, command_id.as_str(), now)?
         } else {
@@ -785,10 +785,10 @@ mod tests {
             max_events: 10_000,
         })
         .expect("journal store should open");
-        let parent_session_id = Ulid::new().to_string();
-        let parent_run_id = Ulid::new().to_string();
-        let child_session_id = Ulid::new().to_string();
-        let child_run_id = Ulid::new().to_string();
+        let parent_session_id = Ulid::generate().to_string();
+        let parent_run_id = Ulid::generate().to_string();
+        let child_session_id = Ulid::generate().to_string();
+        let child_run_id = Ulid::generate().to_string();
         store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
                 session_id: parent_session_id.clone(),
@@ -834,7 +834,7 @@ mod tests {
         };
         let task = store
             .create_orchestrator_background_task(&OrchestratorBackgroundTaskCreateRequest {
-                task_id: Ulid::new().to_string(),
+                task_id: Ulid::generate().to_string(),
                 task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
                 session_id: parent_session_id.clone(),
                 child_session_id: Some(child_session_id.clone()),
@@ -992,7 +992,7 @@ mod tests {
         assert!(error.to_string().contains("different parameters"));
 
         let mut invalid = request(&fixture, "send-2", SessionModelCommandKind::Send);
-        invalid.ownership_task_id = Ulid::new().to_string();
+        invalid.ownership_task_id = Ulid::generate().to_string();
         let error = fixture
             .store
             .reserve_session_model_command(&invalid)

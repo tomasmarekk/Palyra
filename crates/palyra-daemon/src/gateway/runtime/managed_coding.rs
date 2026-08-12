@@ -79,7 +79,7 @@ impl CodingWakeBridge for GatewayCodingWakeBridge {
         let barrier = state
             .journal_store
             .register_wait_barrier(&WaitBarrierCreateRequest {
-                barrier_id: Ulid::new().to_string(),
+                barrier_id: Ulid::generate().to_string(),
                 owner_kind: "coding_objective".to_owned(),
                 owner_id: context.objective_attempt_id.clone(),
                 session_id: context.session_id.clone(),
@@ -173,7 +173,7 @@ impl CodingWakeBridge for GatewayCodingWakeBridge {
         let barrier = state
             .journal_store
             .register_wait_barrier(&WaitBarrierCreateRequest {
-                barrier_id: Ulid::new().to_string(),
+                barrier_id: Ulid::generate().to_string(),
                 owner_kind: "coding_objective".to_owned(),
                 owner_id: context.objective_attempt_id.clone(),
                 session_id: context.session_id.clone(),
@@ -354,7 +354,7 @@ impl GatewayRuntimeState {
                 ));
             }
         };
-        let task_id = format!("coding_{}", Ulid::new());
+        let task_id = format!("coding_{}", Ulid::generate());
         runtime
             .begin_task(CodingTaskBeginRequestV2 {
                 task_id,

@@ -363,7 +363,7 @@ async fn process_candidate(
         last_known_good_sha256.as_str(),
     );
     let request = RestartRequest {
-        request_id: Ulid::new().to_string(),
+        request_id: Ulid::generate().to_string(),
         coalescing_key,
         config_sha256,
         source_identity_sha256: source_identity_sha256.to_owned(),
@@ -541,7 +541,7 @@ fn record_watch_event(
     watcher_generation: u64,
 ) {
     let event = ConfigWatchEventV1 {
-        event_id: Ulid::new().to_string(),
+        event_id: Ulid::generate().to_string(),
         kind,
         source_identity_sha256: source_identity_sha256.to_owned(),
         config_sha256: config_sha256.map(str::to_owned),

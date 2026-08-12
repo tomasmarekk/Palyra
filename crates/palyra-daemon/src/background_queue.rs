@@ -835,7 +835,7 @@ async fn dispatch_background_task(
         .target_run_id
         .clone()
         .or_else(|| task.planned_child_run_id.clone())
-        .unwrap_or_else(|| Ulid::new().to_string());
+        .unwrap_or_else(|| Ulid::generate().to_string());
     let task = claim_background_task(runtime, task, started_at_unix_ms).await?;
     if !admit_claimed_wake_task(runtime, &task).await? {
         return Ok(());
@@ -1779,7 +1779,7 @@ async fn run_background_task_stream(
         run_id: Some(common_v1::CanonicalId { ulid: run_id.to_owned() }),
         input: Some(common_v1::MessageEnvelope {
             v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
-            envelope_id: Some(common_v1::CanonicalId { ulid: Ulid::new().to_string() }),
+            envelope_id: Some(common_v1::CanonicalId { ulid: Ulid::generate().to_string() }),
             timestamp_unix_ms: crate::gateway::current_unix_ms(),
             origin: Some(common_v1::EnvelopeOrigin {
                 r#type: common_v1::envelope_origin::OriginType::System as i32,
@@ -4228,8 +4228,8 @@ mod tests {
     #[tokio::test]
     async fn background_auxiliary_provider_handover_succeeds_with_single_task_attempt() {
         let state = build_test_runtime_state(false);
-        let session_id = Ulid::new().to_string();
-        let task_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
+        let task_id = Ulid::generate().to_string();
         state
             .journal_store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
@@ -5284,10 +5284,10 @@ mod tests {
     #[tokio::test]
     async fn child_attachment_delivers_cancellation_requested_during_attach_window() {
         let state = build_test_runtime_state(false);
-        let session_id = Ulid::new().to_string();
-        let task_id = Ulid::new().to_string();
-        let child_run_id = Ulid::new().to_string();
-        let unrelated_run_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
+        let task_id = Ulid::generate().to_string();
+        let child_run_id = Ulid::generate().to_string();
+        let unrelated_run_id = Ulid::generate().to_string();
         state
             .journal_store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
@@ -5299,7 +5299,7 @@ mod tests {
                 channel: Some("test".to_owned()),
             })
             .expect("attach-window session should upsert");
-        let parent_run_id = Ulid::new().to_string();
+        let parent_run_id = Ulid::generate().to_string();
         state
             .start_orchestrator_run(OrchestratorRunStartRequest {
                 run_id: parent_run_id.clone(),
@@ -5549,9 +5549,9 @@ mod tests {
     #[tokio::test]
     async fn attached_child_with_invalid_contract_is_cancelled_without_detaching() {
         let state = build_test_runtime_state(false);
-        let session_id = Ulid::new().to_string();
-        let parent_run_id = Ulid::new().to_string();
-        let child_run_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
+        let parent_run_id = Ulid::generate().to_string();
+        let child_run_id = Ulid::generate().to_string();
         state
             .journal_store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
@@ -5576,7 +5576,7 @@ mod tests {
             })
             .await
             .expect("invalid-contract parent run should start");
-        let task_id = Ulid::new().to_string();
+        let task_id = Ulid::generate().to_string();
         let (_, generation) = state
             .runtime_generation_for_run(parent_run_id.clone())
             .await
@@ -5912,9 +5912,9 @@ mod tests {
     #[tokio::test]
     async fn admitted_child_is_cancelled_when_durable_attachment_fails() {
         let state = build_test_runtime_state(false);
-        let session_id = Ulid::new().to_string();
-        let parent_run_id = Ulid::new().to_string();
-        let child_run_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
+        let parent_run_id = Ulid::generate().to_string();
+        let child_run_id = Ulid::generate().to_string();
         state
             .journal_store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
@@ -5944,7 +5944,7 @@ mod tests {
             .await
             .expect("attachment-failure generation lookup should succeed")
             .expect("attachment-failure parent generation should be active");
-        let task_id = Ulid::new().to_string();
+        let task_id = Ulid::generate().to_string();
         let task = state
             .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
                 task_id: task_id.clone(),
@@ -6149,7 +6149,7 @@ mod tests {
         std::env::temp_dir().join(format!(
             "palyra-background-queue-{prefix}-{}-{}",
             std::process::id(),
-            Ulid::new()
+            Ulid::generate()
         ))
     }
 
@@ -6158,11 +6158,11 @@ mod tests {
         fixture_name: &str,
         deadline_unix_ms: i64,
     ) -> (OrchestratorBackgroundTaskRecord, String, String) {
-        let session_id = Ulid::new().to_string();
-        let parent_run_id = Ulid::new().to_string();
-        let child_run_id = Ulid::new().to_string();
-        let unrelated_run_id = Ulid::new().to_string();
-        let task_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
+        let parent_run_id = Ulid::generate().to_string();
+        let child_run_id = Ulid::generate().to_string();
+        let unrelated_run_id = Ulid::generate().to_string();
+        let task_id = Ulid::generate().to_string();
         state
             .journal_store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {

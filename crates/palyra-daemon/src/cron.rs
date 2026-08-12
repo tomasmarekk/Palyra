@@ -1936,7 +1936,7 @@ async fn record_misfire_review_required(
     recovery_plan: &CronMisfireRecoveryPlan,
     reference_unix_ms: i64,
 ) -> Result<(), Status> {
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let audit_payload = cron_misfire_audit_payload(job, recovery_plan, reference_unix_ms);
     let message = format!(
         "cron misfire requires review: action={}, operator_action={}, missed_runs={}, oldest_missed_at={:?}, reference={reference_unix_ms}",
@@ -2548,7 +2548,7 @@ async fn apply_objective_budget_exhaustion(
     objective.state = to_state;
     objective.automation.enabled = false;
     objective.lifecycle_history.push(ObjectiveLifecycleRecord {
-        event_id: Ulid::new().to_string(),
+        event_id: Ulid::generate().to_string(),
         action: OBJECTIVE_BUDGET_EXHAUSTED_ACTION.to_owned(),
         from_state: Some(from_state),
         to_state,
@@ -2720,9 +2720,9 @@ async fn ensure_scheduled_routine_approval_requested(
     let policy_hash = scheduled_routine_approval_policy_hash(details_json.as_str());
     state
         .create_approval_record(ApprovalCreateRequest {
-            approval_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            approval_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             principal: job.owner_principal.clone(),
             device_id: ROUTINE_APPROVAL_DEVICE_ID.to_owned(),
             channel: Some(job.channel.clone()),
@@ -3207,7 +3207,7 @@ async fn dispatch_job(
         }
     }
 
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let options = TriggerJobOptions {
         origin_kind: Some(options.origin_kind.unwrap_or_else(|| {
             if manual_trigger {
@@ -3342,7 +3342,7 @@ async fn register_terminal(
     error_kind: &str,
     message: &str,
 ) -> Result<DispatchOutcome, Status> {
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     state
         .start_cron_run(CronRunStartRequest {
             run_id: run_id.clone(),
@@ -3413,7 +3413,7 @@ async fn run_job_with_retries(
     let mut run_id = first_run_id;
     for attempt in 1..=max_attempts {
         if attempt > 1 {
-            run_id = Ulid::new().to_string();
+            run_id = Ulid::generate().to_string();
             state
                 .start_cron_run(CronRunStartRequest {
                     run_id: run_id.clone(),
@@ -4145,7 +4145,7 @@ async fn execute_single_job_attempt(
             )
             .await?;
     }
-    let orchestrator_run_id = Ulid::new().to_string();
+    let orchestrator_run_id = Ulid::generate().to_string();
     let origin_kind = effective.origin_kind.clone();
 
     state
@@ -4171,7 +4171,7 @@ async fn execute_single_job_attempt(
         v: 1,
         event: Some(common_v1::JournalEvent {
             v: 1,
-            event_id: Some(common_v1::CanonicalId { ulid: Ulid::new().to_string() }),
+            event_id: Some(common_v1::CanonicalId { ulid: Ulid::generate().to_string() }),
             session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
             run_id: Some(common_v1::CanonicalId { ulid: orchestrator_run_id.clone() }),
             kind: common_v1::journal_event::EventKind::MessageReceived as i32,
@@ -4208,7 +4208,7 @@ async fn execute_single_job_attempt(
         run_id: Some(common_v1::CanonicalId { ulid: orchestrator_run_id.clone() }),
         input: Some(common_v1::MessageEnvelope {
             v: 1,
-            envelope_id: Some(common_v1::CanonicalId { ulid: Ulid::new().to_string() }),
+            envelope_id: Some(common_v1::CanonicalId { ulid: Ulid::generate().to_string() }),
             timestamp_unix_ms: message_timestamp_unix_ms,
             origin: Some(common_v1::EnvelopeOrigin {
                 r#type: common_v1::envelope_origin::OriginType::System as i32,

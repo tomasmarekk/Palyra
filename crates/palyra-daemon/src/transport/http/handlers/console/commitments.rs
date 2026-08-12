@@ -360,7 +360,7 @@ pub(crate) async fn console_commitment_schedule_handler(
     let attempt = state
         .runtime
         .create_commitment_delivery_attempt(CommitmentDeliveryAttemptCreateRequest {
-            attempt_id: Ulid::new().to_string(),
+            attempt_id: Ulid::generate().to_string(),
             commitment_id: updated.commitment_id.clone(),
             delivery_intent_id: Some(format!("routine-bridge:{}", updated.commitment_id)),
             channel_binding_json: updated.channel_binding_json.clone(),

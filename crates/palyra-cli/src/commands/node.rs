@@ -902,7 +902,7 @@ fn default_node_host_config() -> NodeHostConfig {
         schema_version: NODE_HOST_CONFIG_SCHEMA_VERSION,
         grpc_url: resolve_node_rpc_grpc_url(None)
             .unwrap_or_else(|_| "https://127.0.0.1:7444".to_owned()),
-        device_id: Ulid::new().to_string(),
+        device_id: Ulid::generate().to_string(),
         poll_interval_ms: DEFAULT_NODE_POLL_INTERVAL_MS,
         identity_store_dir: identity_store_dir.display().to_string(),
         installed_at_unix_ms: now_unix_ms(),

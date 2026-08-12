@@ -3241,7 +3241,7 @@ async fn prepare_compat_run_from_context(
         })
         .await
         .map_err(runtime_status_response)?;
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let created_at_unix_ms = now;
     let (request_sender, request_receiver) = mpsc::channel::<common_v1::RunStreamRequest>(8);
     request_sender
@@ -3361,7 +3361,7 @@ async fn execute_compat_run(
                             .proposal_id
                             .as_ref()
                             .map(|value| value.ulid.clone())
-                            .unwrap_or_else(|| Ulid::new().to_string()),
+                            .unwrap_or_else(|| Ulid::generate().to_string()),
                         name: proposal.tool_name,
                         arguments: json_string_from_bytes(proposal.input_json.as_slice()),
                     });
@@ -4032,7 +4032,7 @@ fn build_compat_chat_streaming_response(
                                 .proposal_id
                                 .as_ref()
                                 .map(|value| value.ulid.clone())
-                                .unwrap_or_else(|| Ulid::new().to_string());
+                                .unwrap_or_else(|| Ulid::generate().to_string());
                             if !send_compat_chat_sse_data(
                                 &sender,
                                 &state,
@@ -4577,7 +4577,7 @@ fn build_compat_responses_streaming_response(
                                             .proposal_id
                                             .as_ref()
                                             .map(|value| value.ulid.clone())
-                                            .unwrap_or_else(|| Ulid::new().to_string()),
+                                            .unwrap_or_else(|| Ulid::generate().to_string()),
                                         name: proposal.tool_name,
                                         arguments: json_string_from_bytes(proposal.input_json.as_slice()),
                                         output_index: tool_calls.len().saturating_add(1) as u64,
@@ -5803,7 +5803,7 @@ fn derive_compat_session_key(
             return format!("compat:{}:{normalized}", token.token_id);
         }
     }
-    format!("compat:{}:{}", token.token_id, Ulid::new())
+    format!("compat:{}:{}", token.token_id, Ulid::generate())
 }
 
 fn build_compat_message_envelope(
@@ -5815,7 +5815,7 @@ fn build_compat_message_envelope(
 ) -> common_v1::MessageEnvelope {
     common_v1::MessageEnvelope {
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
-        envelope_id: Some(common_v1::CanonicalId { ulid: Ulid::new().to_string() }),
+        envelope_id: Some(common_v1::CanonicalId { ulid: Ulid::generate().to_string() }),
         timestamp_unix_ms,
         origin: Some(common_v1::EnvelopeOrigin {
             r#type: common_v1::envelope_origin::OriginType::Channel as i32,

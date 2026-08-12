@@ -6,7 +6,7 @@ Commands:
   list
   info
   check
-  bind     [aliases: install]
+  bind     [alias: install]
   enable
   disable
   remove

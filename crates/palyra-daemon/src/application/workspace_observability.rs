@@ -777,7 +777,7 @@ pub(crate) async fn restore_workspace_checkpoint(
     };
     let report = runtime_state
         .create_workspace_restore_report(WorkspaceRestoreReportCreateRequest {
-            report_id: Ulid::new().to_string(),
+            report_id: Ulid::generate().to_string(),
             checkpoint_id: request.checkpoint.checkpoint_id.clone(),
             session_id: request.target_session_id.to_owned(),
             run_id: request.checkpoint.run_id.clone(),
@@ -1665,7 +1665,7 @@ pub(crate) async fn capture_workspace_patch_checkpoint(
 
     let checkpoint = runtime_state
         .create_workspace_checkpoint(WorkspaceCheckpointCreateRequest {
-            checkpoint_id: Ulid::new().to_string(),
+            checkpoint_id: Ulid::generate().to_string(),
             session_id: input.session_id.to_owned(),
             run_id: input.run_id.to_owned(),
             source_kind: input.checkpoint_stage.source_kind().to_owned(),
@@ -1739,7 +1739,7 @@ fn build_post_change_checkpoint_file(
         summarize_workspace_content(content_type.as_str(), content_bytes.as_deref());
 
     Ok(WorkspaceCheckpointFileCreateRequest {
-        artifact_id: Ulid::new().to_string(),
+        artifact_id: Ulid::generate().to_string(),
         path: attestation.path.clone(),
         workspace_root_index: attestation.workspace_root_index as u32,
         moved_from_path: attestation.moved_from.clone(),
@@ -1956,7 +1956,7 @@ fn build_existing_checkpoint_file(
         summarize_workspace_content(content_type.as_str(), Some(captured_content.bytes.as_slice()));
 
     Ok(WorkspaceCheckpointFileCreateRequest {
-        artifact_id: Ulid::new().to_string(),
+        artifact_id: Ulid::generate().to_string(),
         path,
         workspace_root_index: workspace_root_index as u32,
         moved_from_path,
@@ -1981,7 +1981,7 @@ fn build_absent_checkpoint_file(
 ) -> WorkspaceCheckpointFileCreateRequest {
     let content_type = infer_content_type(path.as_str(), None);
     WorkspaceCheckpointFileCreateRequest {
-        artifact_id: Ulid::new().to_string(),
+        artifact_id: Ulid::generate().to_string(),
         path,
         workspace_root_index: workspace_root_index as u32,
         moved_from_path,

@@ -98,7 +98,7 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
         let job = self
             .state
             .create_cron_job(CronJobCreateRequest {
-                job_id: Ulid::new().to_string(),
+                job_id: Ulid::generate().to_string(),
                 name,
                 prompt,
                 owner_principal,

@@ -283,7 +283,7 @@ fn build_node_capability_approval_request(
     input_json: &Value,
     timeout_ms: u64,
 ) -> ApprovalCreateRequest {
-    let approval_id = Ulid::new().to_string();
+    let approval_id = Ulid::generate().to_string();
     let details_json = json!({
         "device_id": node.device_id,
         "platform": node.platform,

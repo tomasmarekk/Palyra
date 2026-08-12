@@ -295,7 +295,7 @@ pub(crate) struct BrowserSessionRecord {
 impl BrowserSessionRecord {
     /// Creates a fresh session with one empty tab and zeroed action counters.
     pub(crate) fn with_defaults(init: BrowserSessionInit) -> Self {
-        let initial_tab_id = Ulid::new().to_string();
+        let initial_tab_id = Ulid::generate().to_string();
         let mut tabs = HashMap::new();
         tabs.insert(initial_tab_id.clone(), BrowserTabRecord::new(initial_tab_id.clone()));
         Self {
@@ -337,7 +337,7 @@ impl BrowserSessionRecord {
     ///
     /// Does not enforce the tab budget; callers must check [`Self::can_create_tab`] first.
     pub(crate) fn create_tab(&mut self) -> String {
-        let tab_id = Ulid::new().to_string();
+        let tab_id = Ulid::generate().to_string();
         self.tabs.insert(tab_id.clone(), BrowserTabRecord::new(tab_id.clone()));
         self.tab_order.push(tab_id.clone());
         tab_id
@@ -422,7 +422,7 @@ impl BrowserSessionRecord {
             }
         }
         if tabs.is_empty() {
-            let initial_tab_id = Ulid::new().to_string();
+            let initial_tab_id = Ulid::generate().to_string();
             tabs.insert(initial_tab_id.clone(), BrowserTabRecord::new(initial_tab_id.clone()));
             self.tab_order = vec![initial_tab_id.clone()];
             self.active_tab_id = initial_tab_id;
@@ -441,7 +441,7 @@ impl BrowserSessionRecord {
             self.active_tab_id = if tabs.contains_key(snapshot.active_tab_id.as_str()) {
                 snapshot.active_tab_id
             } else {
-                tab_order.first().cloned().unwrap_or_else(|| Ulid::new().to_string())
+                tab_order.first().cloned().unwrap_or_else(|| Ulid::generate().to_string())
             };
             self.tab_order = tab_order;
         }

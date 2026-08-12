@@ -135,7 +135,7 @@ pub(crate) async fn console_skill_builder_candidate_create_handler(
         })?;
         BuilderSource::Prompt {
             prompt,
-            source_ref: format!("prompt:{}", Ulid::new().to_string().to_ascii_lowercase()),
+            source_ref: format!("prompt:{}", Ulid::generate().to_string().to_ascii_lowercase()),
         }
     };
 
@@ -1606,7 +1606,7 @@ fn write_skill_builder_scaffold(
         written_files.push(target.to_string_lossy().into_owned());
     }
 
-    let builder_candidate_id = Ulid::new().to_string().to_ascii_lowercase();
+    let builder_candidate_id = Ulid::generate().to_string().to_ascii_lowercase();
     Ok(GeneratedSkillScaffold {
         builder_candidate_id,
         skill_id: request.skill_id,

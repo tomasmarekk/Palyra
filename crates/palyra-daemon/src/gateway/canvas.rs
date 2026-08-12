@@ -334,7 +334,7 @@ pub(crate) fn normalize_canvas_identifier(
 pub(crate) fn normalize_canvas_bundle_identifier(raw: &str) -> Result<String, Status> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(format!("bundle-{}", Ulid::new().to_string().to_ascii_lowercase()));
+        return Ok(format!("bundle-{}", Ulid::generate().to_string().to_ascii_lowercase()));
     }
     if trimmed.len() > MAX_CANVAS_BUNDLE_ID_BYTES {
         return Err(Status::invalid_argument(format!(

@@ -341,7 +341,7 @@ pub(crate) async fn console_workboard_create_handler(
     let item = state
         .runtime
         .create_work_item(WorkItemCreateRequest {
-            work_item_id: Ulid::new().to_string(),
+            work_item_id: Ulid::generate().to_string(),
             owner_principal: session.context.principal.clone(),
             device_id: session.context.device_id.clone(),
             channel: session.context.channel.clone(),

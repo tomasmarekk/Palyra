@@ -115,7 +115,7 @@ impl RunFinalProjectionStore {
         active_process_state: Vec<FinalizationEvidenceRef>,
     ) -> Result<FinalProjectionRef, FinalizationHostError> {
         let id = palyra_common::runtime_contracts::RuntimeOperationId::parse(
-            Ulid::new().to_string().as_str(),
+            Ulid::generate().to_string().as_str(),
         )
         .map_err(|_| FinalizationHostError::InvalidDeliveryMetadata)?;
         let sha256 = digest_array(content);
@@ -142,7 +142,7 @@ impl RunFinalProjectionStore {
         active_process_state: Vec<FinalizationEvidenceRef>,
     ) -> Result<FinalProjectionRef, FinalizationHostError> {
         let id = palyra_common::runtime_contracts::RuntimeOperationId::parse(
-            Ulid::new().to_string().as_str(),
+            Ulid::generate().to_string().as_str(),
         )
         .map_err(|_| FinalizationHostError::InvalidDeliveryMetadata)?;
         let sha256 = digest_array(content);
@@ -166,7 +166,7 @@ impl RunFinalProjectionStore {
         reason_code: &str,
     ) -> Result<RedactedEvidenceRef, FinalizationHostError> {
         let id = palyra_common::runtime_contracts::RuntimeOperationId::parse(
-            Ulid::new().to_string().as_str(),
+            Ulid::generate().to_string().as_str(),
         )
         .map_err(|_| FinalizationHostError::InvalidDeliveryMetadata)?;
         Ok(RedactedEvidenceRef::from_host(id, digest_array(reason_code.as_bytes())))

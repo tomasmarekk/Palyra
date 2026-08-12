@@ -252,7 +252,7 @@ pub(crate) fn build_pending_tool_approval(
         ),
     };
     PendingToolApproval {
-        approval_id: Ulid::new().to_string(),
+        approval_id: Ulid::generate().to_string(),
         request_summary,
         policy_snapshot,
         prompt,
@@ -810,7 +810,7 @@ pub(crate) async fn record_approval_requested_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::ToolProposed as i32,
@@ -899,7 +899,7 @@ pub(crate) async fn record_approval_resolved_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,

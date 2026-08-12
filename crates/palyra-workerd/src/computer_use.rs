@@ -628,7 +628,7 @@ impl IsolatedComputerUseWorker {
         approval: Option<&ComputerUseApproval>,
         observed_at_unix_ms: i64,
     ) -> ActionReceipt {
-        let action_id = Ulid::new().to_string();
+        let action_id = Ulid::generate().to_string();
         let risk = self.risk_for_action(&action);
         let before = match self.observe(observed_at_unix_ms) {
             Ok(observation) => observation,

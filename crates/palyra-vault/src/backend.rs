@@ -154,7 +154,7 @@ pub(crate) fn select_backend(
         }
         BackendPreference::Auto => choose_auto_backend(root.as_path())?,
     };
-    let marker_tmp = marker_path.with_extension(format!("tmp.{}", Ulid::new()));
+    let marker_tmp = marker_path.with_extension(format!("tmp.{}", Ulid::generate()));
     fs::write(&marker_tmp, backend.kind().as_str().as_bytes()).map_err(|error| {
         VaultError::Io(format!("failed to write backend marker {}: {error}", marker_tmp.display()))
     })?;
@@ -350,7 +350,7 @@ impl EncryptedFileBackend {
                 MAX_OBJECTS_STORE_BYTES
             )));
         }
-        let tmp_path = store_root.join(format!("{}.tmp.{}", OBJECTS_STORE_FILE, Ulid::new()));
+        let tmp_path = store_root.join(format!("{}.tmp.{}", OBJECTS_STORE_FILE, Ulid::generate()));
         ensure_path_within_root(
             store_root.as_path(),
             tmp_path.as_path(),
@@ -889,7 +889,7 @@ impl BlobBackend for WindowsDpapiBackend {
     fn put_blob(&self, object_id: &str, payload: &[u8]) -> Result<(), VaultError> {
         let protected = dpapi_protect(payload)?;
         let path = self.object_path(object_id)?;
-        let tmp_path = path.with_extension(format!("tmp.{}", Ulid::new()));
+        let tmp_path = path.with_extension(format!("tmp.{}", Ulid::generate()));
         fs::write(&tmp_path, protected).map_err(|error| {
             VaultError::Io(format!("failed to write DPAPI object {}: {error}", tmp_path.display()))
         })?;

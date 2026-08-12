@@ -999,7 +999,7 @@ async fn run_desktop_node_enrollment(
         return Ok(ActionResult { ok: true, message: sanitize_log_line(status.detail.as_str()) });
     }
 
-    let device_id = status.device_id.unwrap_or_else(|| Ulid::new().to_string());
+    let device_id = status.device_id.unwrap_or_else(|| Ulid::generate().to_string());
     if repair && status.installed {
         let _ = run_palyra_json_command(runtime_root.as_path(), &["node", "uninstall", "--json"])
             .await

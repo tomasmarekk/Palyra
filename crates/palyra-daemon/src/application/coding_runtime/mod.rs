@@ -458,7 +458,7 @@ impl CodingRuntime {
             None
         };
         let ticket = CodingPatchVerificationTicketV2 {
-            ticket_id: format!("coding_patch_{}", ulid::Ulid::new()),
+            ticket_id: format!("coding_patch_{}", ulid::Ulid::generate()),
             task_id: task_id.to_owned(),
             relative_paths,
         };

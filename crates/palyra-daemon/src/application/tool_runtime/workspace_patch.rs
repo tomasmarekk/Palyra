@@ -1622,7 +1622,7 @@ fn workspace_patch_tool_execution_outcome(
         output_json,
         error,
         attestation: ToolAttestation {
-            attestation_id: Ulid::new().to_string(),
+            attestation_id: Ulid::generate().to_string(),
             execution_sha256,
             executed_at_unix_ms,
             timed_out: false,

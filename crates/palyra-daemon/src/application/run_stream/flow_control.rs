@@ -600,7 +600,7 @@ fn validated_policy(policy: BackpressurePolicy) -> Result<BackpressurePolicy, St
 }
 
 fn new_scope_id(prefix: &str) -> Result<RuntimeOperationId, Status> {
-    RuntimeOperationId::parse(format!("{prefix}:{}", Ulid::new()).as_str()).map_err(|error| {
+    RuntimeOperationId::parse(format!("{prefix}:{}", Ulid::generate()).as_str()).map_err(|error| {
         Status::internal(format!("cancellation scope identity is invalid: {error}"))
     })
 }

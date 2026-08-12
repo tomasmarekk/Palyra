@@ -148,7 +148,7 @@ impl ChannelPlatform {
             .map(ToOwned::to_owned);
 
         let outbound = OutboundMessageRequest {
-            envelope_id: Ulid::new().to_string(),
+            envelope_id: Ulid::generate().to_string(),
             connector_id: connector_id.to_owned(),
             conversation_id: target.clone(),
             reply_thread_id: thread_id,

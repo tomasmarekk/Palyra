@@ -7,12 +7,12 @@ Commands:
   list
   show
   add
-  update   [aliases: edit]
+  update   [alias: edit]
   enable
   disable
   run-now
-  delete   [aliases: rm]
-  logs     [aliases: runs]
+  delete   [alias: rm]
+  logs     [alias: runs]
 
 Options:
   -h, --help

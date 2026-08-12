@@ -222,7 +222,7 @@ fn provider_response(text: &str, provider_id: &str, model_id: &str) -> ProviderR
 
 fn route_input() -> ChannelInboundMessage {
     ChannelInboundMessage {
-        envelope_id: Ulid::new().to_string(),
+        envelope_id: Ulid::generate().to_string(),
         channel: "test".to_owned(),
         conversation_id: Some("route-provider-supersession".to_owned()),
         sender_handle: Some("user:test".to_owned()),
@@ -233,7 +233,7 @@ fn route_input() -> ChannelInboundMessage {
         max_payload_bytes: 16 * 1024,
         is_direct_message: true,
         requested_broadcast: false,
-        adapter_message_id: Some(Ulid::new().to_string()),
+        adapter_message_id: Some(Ulid::generate().to_string()),
         adapter_thread_id: None,
         retry_attempt: 0,
     }
@@ -298,7 +298,7 @@ fn pin_existing_legacy_route_session(
     plan: &ChannelRoutePlan,
     context: &RequestContext,
 ) {
-    let session_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
     state
         .journal_store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
@@ -390,7 +390,7 @@ async fn default_v2_admits_new_connector_route_messages() {
         )
         .expect("default V2 route authority should resolve");
     assert_eq!(authority_intent.selected_runtime(), Some(RuntimeAuthority::V2));
-    let run_id = Ulid::new().to_string();
+    let run_id = Ulid::generate().to_string();
     let outcome = admit_v2_route_message_run(
         &state,
         &context,

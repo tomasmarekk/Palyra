@@ -50,7 +50,7 @@ impl ChannelPlatform {
         &self,
         request: ConsoleChatAttachmentStoreRequestView<'_>,
     ) -> Result<MediaArtifactPayload, ChannelPlatformError> {
-        let attachment_id = Ulid::new().to_string();
+        let attachment_id = Ulid::generate().to_string();
         self.media_store
             .store_console_attachment(ConsoleAttachmentStoreRequest {
                 connector_id: "console_chat",

@@ -972,7 +972,7 @@ impl FlowCoordinator {
         let input = serde_json::from_value::<WorkGraphFlowInput>(parse_step_input(step)).map_err(
             |error| Status::invalid_argument(format!("invalid work graph input: {error}")),
         )?;
-        let graph_id = input.graph_id.unwrap_or_else(|| Ulid::new().to_string());
+        let graph_id = input.graph_id.unwrap_or_else(|| Ulid::generate().to_string());
         let snapshot = runtime
             .create_work_graph(WorkGraphCreateRequest {
                 graph_id: graph_id.clone(),
@@ -1057,7 +1057,7 @@ impl FlowCoordinator {
                 Status::failed_precondition("flow step dispatch requires a session_id")
             })?;
         let task_kind = resolve_background_task_kind(step.adapter.as_str(), &input)?;
-        let task_id = Ulid::new().to_string();
+        let task_id = Ulid::generate().to_string();
         let task = runtime
             .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
                 task_id: task_id.clone(),
@@ -1242,7 +1242,7 @@ pub(crate) fn build_flow_create_request(descriptor: FlowCreateDescriptor) -> Flo
     let owner_principal = descriptor.owner_principal;
     let acceptance = flow_acceptance_metadata(descriptor.steps.as_slice());
     FlowCreateRequest {
-        flow_id: Ulid::new().to_string(),
+        flow_id: Ulid::generate().to_string(),
         mode: descriptor.mode.as_str().to_owned(),
         state: FlowState::Pending.as_str().to_owned(),
         owner_principal: owner_principal.clone(),
@@ -1286,7 +1286,7 @@ pub(crate) fn build_flow_step(
     let acceptance = flow_step_acceptance_criteria(adapter, step_kind, title.as_str());
     let input_json = attach_acceptance_criteria(input_json, acceptance);
     FlowStepCreateRequest {
-        step_id: Ulid::new().to_string(),
+        step_id: Ulid::generate().to_string(),
         step_index,
         step_kind: step_kind.to_owned(),
         adapter: adapter.to_owned(),

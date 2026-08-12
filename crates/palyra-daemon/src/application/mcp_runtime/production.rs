@@ -1543,7 +1543,7 @@ impl McpElicitationExecutionPort for McpProductionElicitationPort {
             .runtime
             .upgrade()
             .ok_or_else(|| host_execution_error("mcp.runtime.elicitation.runtime_unavailable"))?;
-        let approval_id = Ulid::new().to_string();
+        let approval_id = Ulid::generate().to_string();
         let subject_digest = hex::encode(Sha256::digest(
             serde_json::to_vec(&json!({
                 "server_id": self.server_id,

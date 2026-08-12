@@ -902,7 +902,7 @@ async fn record_policy_decision_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::ToolProposed as i32,
@@ -966,7 +966,7 @@ async fn record_skill_execution_denied_journal_event(
 ) -> Result<(), Status> {
     runtime_state
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: session_id.to_owned(),
             run_id: run_id.to_owned(),
             kind: common_v1::journal_event::EventKind::ToolProposed as i32,

@@ -5493,7 +5493,7 @@ fn chromium_upload_staging_path(upload_dir: &Path, file_name: &str) -> Result<Pa
     if file_name.is_empty() {
         return Err("upload file name is empty after sanitization".to_owned());
     }
-    Ok(upload_dir.join(Ulid::new().to_string()).join(file_name))
+    Ok(upload_dir.join(Ulid::generate().to_string()).join(file_name))
 }
 
 fn chromium_type_script(

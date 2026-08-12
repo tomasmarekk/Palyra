@@ -772,7 +772,7 @@ fn query_redaction_treats_oauth_code_and_state_as_sensitive() {
 #[test]
 fn action_log_entry_to_proto_redacts_url_selector_query_secrets() {
     let entry = BrowserActionLogEntryInternal {
-        action_id: ulid::Ulid::new().to_string(),
+        action_id: ulid::Ulid::generate().to_string(),
         action_name: "navigate".to_owned(),
         selector: "https://idp.example/callback?code=oauthCODE123&state=csrfSTATE456&access_token=tok789&signature=sig000&safe=1#fragment".to_owned(),
         success: true,
@@ -792,7 +792,7 @@ fn action_log_entry_to_proto_redacts_url_selector_query_secrets() {
 #[test]
 fn action_log_entry_to_proto_preserves_password_field_css_selector() {
     let entry = BrowserActionLogEntryInternal {
-        action_id: ulid::Ulid::new().to_string(),
+        action_id: ulid::Ulid::generate().to_string(),
         action_name: "type".to_owned(),
         selector: "#password".to_owned(),
         success: true,
@@ -5734,7 +5734,7 @@ fn validate_restored_snapshot_against_profile_accepts_legacy_hash_for_revision_z
         v: CANONICAL_PROTOCOL_MAJOR,
         principal: "user:ops".to_owned(),
         channel: None,
-        tabs: vec![BrowserTabRecord::new(ulid::Ulid::new().to_string())],
+        tabs: vec![BrowserTabRecord::new(ulid::Ulid::generate().to_string())],
         tab_order: Vec::new(),
         active_tab_id: String::new(),
         permissions: SessionPermissionsInternal::default(),
@@ -5746,7 +5746,7 @@ fn validate_restored_snapshot_against_profile_accepts_legacy_hash_for_revision_z
     let legacy_hash =
         persisted_snapshot_legacy_hash(&snapshot).expect("legacy hash generation should succeed");
     let profile = BrowserProfileRecord {
-        profile_id: ulid::Ulid::new().to_string(),
+        profile_id: ulid::Ulid::generate().to_string(),
         principal: "user:ops".to_owned(),
         name: "Ops".to_owned(),
         theme_color: None,
@@ -6042,7 +6042,7 @@ fn apply_snapshot_clamps_cookie_and_storage_state() {
         v: CANONICAL_PROTOCOL_MAJOR,
         principal: "user:ops".to_owned(),
         channel: None,
-        tabs: vec![BrowserTabRecord::new(ulid::Ulid::new().to_string())],
+        tabs: vec![BrowserTabRecord::new(ulid::Ulid::generate().to_string())],
         tab_order: Vec::new(),
         active_tab_id: String::new(),
         permissions: SessionPermissionsInternal::default(),
@@ -6087,8 +6087,8 @@ fn apply_snapshot_clamps_cookie_and_storage_state() {
 fn apply_snapshot_drops_network_log_and_preserves_missing_tab_append() {
     let mut session = test_session_record();
     session.budget.max_network_log_entries = 4;
-    let first_tab_id = ulid::Ulid::new().to_string();
-    let second_tab_id = ulid::Ulid::new().to_string();
+    let first_tab_id = ulid::Ulid::generate().to_string();
+    let second_tab_id = ulid::Ulid::generate().to_string();
 
     let mut first_tab = BrowserTabRecord::new(first_tab_id.clone());
     let retained_entry = NetworkLogEntryInternal {
@@ -6241,7 +6241,7 @@ fn validate_restored_snapshot_against_profile_accepts_raw_persisted_hash() {
     let state_dir = tempfile::tempdir().expect("state temp dir should be available");
     let store = PersistedStateStore::new(state_dir.path().join("state"), [3_u8; STATE_KEY_LEN])
         .expect("state store should initialize");
-    let profile_id = ulid::Ulid::new().to_string();
+    let profile_id = ulid::Ulid::generate().to_string();
     let raw_json = format!(
             concat!(
                 "{{",
@@ -7449,7 +7449,7 @@ async fn browser_service_download_listing_hides_cross_principal_session_existenc
         .into_inner();
     let download_session_id = download_session.session_id.expect("session id should be present");
     let missing_session_id =
-        proto::palyra::common::v1::CanonicalId { ulid: ulid::Ulid::new().to_string() };
+        proto::palyra::common::v1::CanonicalId { ulid: ulid::Ulid::generate().to_string() };
 
     let mut missing_request = Request::new(browser_v1::ListDownloadArtifactsRequest {
         v: 1,
@@ -7810,7 +7810,7 @@ async fn browser_service_inspect_session_redacts_debug_state() {
             ]),
         );
         session.action_log.push_back(BrowserActionLogEntryInternal {
-            action_id: ulid::Ulid::new().to_string(),
+            action_id: ulid::Ulid::generate().to_string(),
             action_name: "navigate".to_owned(),
             selector: String::new(),
             success: false,
@@ -7992,7 +7992,7 @@ async fn browser_service_inspect_session_truncates_deterministically() {
         );
         for index in 0..3 {
             session.action_log.push_back(BrowserActionLogEntryInternal {
-                action_id: ulid::Ulid::new().to_string(),
+                action_id: ulid::Ulid::generate().to_string(),
                 action_name: format!("action-{index}"),
                 selector: format!("#selector-{index}"),
                 success: true,

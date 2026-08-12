@@ -969,9 +969,9 @@ async fn record_tool_permissions_journal_event(
     let synthetic_session_id = format!("tool-posture:{}:{scope_id}", scope_kind.as_str());
     runtime
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: synthetic_session_id,
-            run_id: format!("tool-posture-{}", Ulid::new()),
+            run_id: format!("tool-posture-{}", Ulid::generate()),
             kind: gateway::proto::palyra::common::v1::journal_event::EventKind::ToolExecuted as i32,
             actor: gateway::proto::palyra::common::v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: gateway::current_unix_ms(),

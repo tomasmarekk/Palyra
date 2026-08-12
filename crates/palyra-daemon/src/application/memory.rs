@@ -622,7 +622,7 @@ async fn retain_memory_candidate(
 
     let item = runtime_state
         .ingest_memory_item(MemoryItemCreateRequest {
-            memory_id: Ulid::new().to_string(),
+            memory_id: Ulid::generate().to_string(),
             principal: request.principal.clone(),
             channel: channel_scope,
             session_id: session_scope,

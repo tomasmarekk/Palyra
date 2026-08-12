@@ -6,15 +6,15 @@ Commands:
   status
   list
   show
-  upsert                [aliases: apply]
+  upsert                [alias: apply]
   create-from-template
   enable
   disable
   run-now
-  test-run              [aliases: replay]
-  logs                  [aliases: runs]
+  test-run              [alias: replay]
+  logs                  [alias: runs]
   dispatch
-  delete                [aliases: rm]
+  delete                [alias: rm]
   templates
   suggestions
   blueprints

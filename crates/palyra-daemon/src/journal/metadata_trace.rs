@@ -184,8 +184,8 @@ fn create_root_metadata_trace_for_entrypoint_tx(
             run_id: request.run_id.clone(),
             reason_code: "metadata_trace.timestamp_out_of_range",
         })?;
-    let segment_id = Ulid::new().to_string();
-    let event_identity = Ulid::new().to_string();
+    let segment_id = Ulid::generate().to_string();
+    let event_identity = Ulid::generate().to_string();
     let event = MetadataTraceEventV1 {
         sequence: 0,
         generation: 1,
@@ -327,7 +327,7 @@ fn insert_status_tx(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             run_id,
             segment_id,
             i64::try_from(status_ordinal).map_err(|_| {
@@ -789,7 +789,7 @@ impl JournalStore {
                 run_id: run_id.to_owned(),
                 reason_code: "metadata_trace.root_event_missing",
             })?;
-        let event_identity = Ulid::new().to_string();
+        let event_identity = Ulid::generate().to_string();
         let event = MetadataTraceEventV1 {
             sequence,
             generation,
@@ -1011,8 +1011,8 @@ impl JournalStore {
                 run_id: run_id.to_owned(),
                 reason_code: "metadata_trace.event_sequence_out_of_range",
             })?;
-        let segment_id = Ulid::new().to_string();
-        let event_identity = Ulid::new().to_string();
+        let segment_id = Ulid::generate().to_string();
+        let event_identity = Ulid::generate().to_string();
         let event = MetadataTraceEventV1 {
             sequence,
             generation,

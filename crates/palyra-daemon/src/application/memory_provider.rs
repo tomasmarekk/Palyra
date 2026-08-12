@@ -577,7 +577,7 @@ impl MemoryProviderRuntime for BuiltinJournalMemoryProvider {
         context: &MemoryProviderHookContext,
         candidate: MemoryProviderWriteCandidate,
     ) -> Result<MemoryProviderHookOutcome, Status> {
-        let session_id = context.session_id.clone().unwrap_or_else(|| Ulid::new().to_string());
+        let session_id = context.session_id.clone().unwrap_or_else(|| Ulid::generate().to_string());
         let classification = classify_memory_write(MemoryWriteClassificationInput {
             principal: context.principal.clone(),
             channel: context.channel.clone(),
@@ -842,7 +842,7 @@ pub(crate) async fn run_memory_provider_reindex(
 ) -> Result<MemoryProviderReindexOutcome, Status> {
     let outcome = runtime_state.run_memory_embeddings_backfill(batch_size).await?;
     Ok(MemoryProviderReindexOutcome {
-        job_id: Ulid::new().to_string(),
+        job_id: Ulid::generate().to_string(),
         provider_id: "builtin_journal".to_owned(),
         state: if outcome.is_complete() { "completed" } else { "running" }.to_owned(),
         cancel_supported: true,

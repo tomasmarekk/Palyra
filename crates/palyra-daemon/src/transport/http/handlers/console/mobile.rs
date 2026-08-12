@@ -539,7 +539,7 @@ pub(crate) async fn console_mobile_voice_note_create_handler(
     let task = state
         .runtime
         .create_orchestrator_background_task(journal::OrchestratorBackgroundTaskCreateRequest {
-            task_id: Ulid::new().to_string(),
+            task_id: Ulid::generate().to_string(),
             task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
             session_id: target_session.session_id.clone(),
             child_session_id: None,

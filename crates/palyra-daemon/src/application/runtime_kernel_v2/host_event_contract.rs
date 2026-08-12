@@ -48,7 +48,7 @@ impl HarnessHostEventAuthority for SystemHarnessEventAuthority {
         )
         .map_err(|_| HarnessContractError::HostEventMetadata)?;
         Ok(HarnessHostEventStamp {
-            event_id: RuntimeEventId::parse(format!("event_{}", Ulid::new()).as_str())
+            event_id: RuntimeEventId::parse(format!("event_{}", Ulid::generate()).as_str())
                 .map_err(|_| HarnessContractError::HostEventMetadata)?,
             occurred_at_unix_ms,
         })

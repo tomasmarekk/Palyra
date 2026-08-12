@@ -14,8 +14,8 @@ fn fixture() -> BarrierFixture {
     let root = tempfile::tempdir().expect("temporary journal root should create");
     let db_path = root.path().join("journal.db");
     let store = open_store(db_path.clone());
-    let session_id = Ulid::new().to_string();
-    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
     store
         .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
             session_id: session_id.clone(),
@@ -55,9 +55,9 @@ fn barrier_request(
     wake_at_unix_ms: Option<i64>,
 ) -> WaitBarrierCreateRequest {
     WaitBarrierCreateRequest {
-        barrier_id: Ulid::new().to_string(),
+        barrier_id: Ulid::generate().to_string(),
         owner_kind: "objective_attempt".to_owned(),
-        owner_id: Ulid::new().to_string(),
+        owner_id: Ulid::generate().to_string(),
         session_id: fixture.session_id.clone(),
         root_run_id: Some(fixture.run_id.clone()),
         barrier_kind: if wake_at_unix_ms.is_some() {
@@ -70,7 +70,7 @@ fn barrier_request(
         } else {
             WaitBarrierKind::BackgroundTask.as_str().to_owned()
         },
-        source_id: Ulid::new().to_string(),
+        source_id: Ulid::generate().to_string(),
         wake_decision: WakeDecision::Run,
         continuation_prompt: Some("Resume only after the durable event.".to_owned()),
         budget_tokens: 2_048,
@@ -90,7 +90,7 @@ fn repeated_source_events_coalesce_into_one_intent() {
     let request = barrier_request(&fixture, None);
     fixture.store.register_wait_barrier(&request).expect("barrier should persist");
     let event = WakeEventRequest {
-        source_event_id: Ulid::new().to_string(),
+        source_event_id: Ulid::generate().to_string(),
         source_kind: request.source_kind.clone(),
         source_id: request.source_id.clone(),
         source_generation: 1,
@@ -104,7 +104,7 @@ fn repeated_source_events_coalesce_into_one_intent() {
     let second = fixture
         .store
         .emit_wake_event(&WakeEventRequest {
-            source_event_id: Ulid::new().to_string(),
+            source_event_id: Ulid::generate().to_string(),
             occurred_at_unix_ms: 11,
             ..event
         })
@@ -145,7 +145,7 @@ fn pending_user_input_preempts_wake_task_reservation() {
     let intent = fixture
         .store
         .emit_wake_event(&WakeEventRequest {
-            source_event_id: Ulid::new().to_string(),
+            source_event_id: Ulid::generate().to_string(),
             source_kind: request.source_kind,
             source_id: request.source_id,
             source_generation: 1,
@@ -159,7 +159,7 @@ fn pending_user_input_preempts_wake_task_reservation() {
     fixture
         .store
         .create_orchestrator_queued_input(&OrchestratorQueuedInputCreateRequest {
-            queued_input_id: Ulid::new().to_string(),
+            queued_input_id: Ulid::generate().to_string(),
             run_id: fixture.run_id.clone(),
             session_id: fixture.session_id,
             state: QueuedInputState::Pending.as_str().to_owned(),
@@ -183,7 +183,7 @@ fn pending_user_input_preempts_wake_task_reservation() {
 
     let outcome = fixture
         .store
-        .reserve_wake_task(intent.intent_id.as_str(), Ulid::new().to_string().as_str())
+        .reserve_wake_task(intent.intent_id.as_str(), Ulid::generate().to_string().as_str())
         .expect("preemption should be typed");
     let WakeTaskReserveOutcome::UserPreempted(cancelled) = outcome else {
         panic!("pending user input must preempt autonomous wake");
@@ -199,7 +199,7 @@ fn source_event_before_registration_is_recovered_once() {
     fixture
         .store
         .emit_wake_event(&WakeEventRequest {
-            source_event_id: Ulid::new().to_string(),
+            source_event_id: Ulid::generate().to_string(),
             source_kind: request.source_kind.clone(),
             source_id: request.source_id.clone(),
             source_generation: 1,

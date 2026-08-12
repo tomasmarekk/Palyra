@@ -238,7 +238,8 @@ async fn deliver_intent(
             return Ok(WakeDelivery::Cancelled);
         }
     }
-    let task_id = intent.continuation_task_id.clone().unwrap_or_else(|| Ulid::new().to_string());
+    let task_id =
+        intent.continuation_task_id.clone().unwrap_or_else(|| Ulid::generate().to_string());
     let reserved = reserve_wake_task(runtime, intent.intent_id.clone(), task_id.clone()).await?;
     let WakeTaskReserveOutcome::Reserved(reserved) = reserved else {
         return Ok(WakeDelivery::Cancelled);
@@ -304,7 +305,7 @@ async fn ensure_wake_task(
             child_session_id: None,
             parent_run_id: None,
             target_run_id: None,
-            planned_child_run_id: Some(Ulid::new().to_string()),
+            planned_child_run_id: Some(Ulid::generate().to_string()),
             queued_input_id: None,
             owner_principal: session.principal,
             device_id: session.device_id,
@@ -417,7 +418,7 @@ pub(crate) async fn register_objective_wait(
         }
     };
     let request = WaitBarrierCreateRequest {
-        barrier_id: Ulid::new().to_string(),
+        barrier_id: Ulid::generate().to_string(),
         owner_kind: "objective_attempt".to_owned(),
         owner_id: attempt.attempt_id.clone(),
         session_id: attempt.session_id.clone(),
@@ -453,7 +454,7 @@ pub(crate) async fn register_objective_user_input(
     register_barrier(
         runtime,
         WaitBarrierCreateRequest {
-            barrier_id: Ulid::new().to_string(),
+            barrier_id: Ulid::generate().to_string(),
             owner_kind: "objective_attempt".to_owned(),
             owner_id: attempt.attempt_id.clone(),
             session_id: attempt.session_id.clone(),

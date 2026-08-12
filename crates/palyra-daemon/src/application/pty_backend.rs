@@ -634,7 +634,7 @@ impl NativePtySession {
         spawn_child_waiter(child, exit_tx)?;
         let descriptor = PtySessionDescriptorV1 {
             schema_version: PTY_SESSION_SCHEMA_VERSION,
-            pty_session_id: format!("pty_{}", ulid::Ulid::new()),
+            pty_session_id: format!("pty_{}", ulid::Ulid::generate()),
             owner_id: resource_lease.owner_id.clone(),
             owner_generation: resource_lease.generation,
             backend: native_backend_kind(),

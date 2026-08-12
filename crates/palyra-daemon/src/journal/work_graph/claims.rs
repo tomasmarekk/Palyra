@@ -94,7 +94,7 @@ impl JournalStore {
         let token = WorkClaimToken::issue()
             .map_err(|_| invalid_claim_data("operating-system entropy unavailable"))?;
         let token_sha256 = token.sha256_hex();
-        let attempt_id = Ulid::new().to_string();
+        let attempt_id = Ulid::generate().to_string();
         let expires_at = now.saturating_add(
             i64::try_from(request.lease_ttl_ms)
                 .map_err(|_| invalid_claim_data("lease duration exceeds i64"))?,
@@ -1127,7 +1127,7 @@ fn record_orphan_result(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             request.authority.graph_id,
             request.authority.work_item_id,
             u64_to_sqlite(request.authority.generation, "observed_generation")?,

@@ -860,8 +860,8 @@ port = 9911
 fn state_file_migration_moves_plaintext_tokens_to_secret_store() {
     let fixture = TempFixtureDir::new();
     let state_path = fixture.path().join("state.json");
-    let legacy_admin_token = format!("legacy-admin-{}", Ulid::new());
-    let legacy_browser_token = format!("legacy-browser-{}", Ulid::new());
+    let legacy_admin_token = format!("legacy-admin-{}", Ulid::generate());
+    let legacy_browser_token = format!("legacy-browser-{}", Ulid::generate());
     let legacy = json!({
         "schema_version": 1_u32,
         "admin_token": legacy_admin_token,
@@ -1189,7 +1189,7 @@ fn runtime_state_root_override_rejects_paths_outside_desktop_state_directory() {
     let fixture = TempFixtureDir::new();
     let default_runtime_root = fixture.path().join("runtime");
     let escaped_runtime_root =
-        std::env::temp_dir().join(format!("palyra-desktop-escape-{}", Ulid::new()));
+        std::env::temp_dir().join(format!("palyra-desktop-escape-{}", Ulid::generate()));
     std::fs::create_dir_all(default_runtime_root.as_path())
         .expect("default runtime root should exist for validation");
 
@@ -1210,7 +1210,7 @@ fn desktop_state_file_rejects_runtime_root_escape_on_reload() {
     let fixture = TempFixtureDir::new();
     let default_runtime_root = fixture.path().join("runtime");
     let escaped_runtime_root =
-        std::env::temp_dir().join(format!("palyra-desktop-reload-escape-{}", Ulid::new()));
+        std::env::temp_dir().join(format!("palyra-desktop-reload-escape-{}", Ulid::generate()));
     std::fs::create_dir_all(default_runtime_root.as_path())
         .expect("default runtime root should exist for reload validation");
 
@@ -1442,7 +1442,7 @@ fn resolve_binary_path_rejects_relative_env_override() {
 fn resolve_binary_path_rejects_cwd_target_fallback() {
     let _env_guard = lock_env();
     let fixture = TempFixtureDir::new();
-    let binary_name = format!("palyra-cwd-{}", Ulid::new());
+    let binary_name = format!("palyra-cwd-{}", Ulid::generate());
     let binary_path = fixture
         .path()
         .join("target")
@@ -1461,7 +1461,7 @@ fn resolve_binary_path_rejects_cwd_target_fallback() {
 fn resolve_binary_path_rejects_path_only_binary() {
     let _env_guard = lock_env();
     let fixture = TempFixtureDir::new();
-    let binary_name = format!("palyra-path-{}", Ulid::new());
+    let binary_name = format!("palyra-path-{}", Ulid::generate());
     let binary_path = fixture.path().join(executable_file_name(binary_name.as_str()));
     write_file(binary_path.as_path(), "binary");
     let path_value = fixture.path().to_string_lossy().into_owned();

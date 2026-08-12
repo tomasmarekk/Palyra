@@ -2109,7 +2109,7 @@ fn resolve_gateway_session_id(
         );
         request.metadata_mut().insert(
             "x-palyra-trace-id",
-            MetadataValue::try_from(Ulid::new().to_string())
+            MetadataValue::try_from(Ulid::generate().to_string())
                 .context("invalid trace-id metadata")?,
         );
         let response = client
@@ -2403,13 +2403,13 @@ fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "{prefix}-{}-{}.{}",
         std::process::id(),
-        Ulid::new(),
+        Ulid::generate(),
         extension
     ))
 }
 
 fn unique_temp_dir_path(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), Ulid::new()))
+    std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), Ulid::generate()))
 }
 
 struct ExampleSkillFixturePaths {

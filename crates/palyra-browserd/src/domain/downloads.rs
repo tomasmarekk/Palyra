@@ -252,7 +252,7 @@ pub(crate) async fn store_generated_artifact(
         ));
     }
 
-    let artifact_id = Ulid::new().to_string();
+    let artifact_id = Ulid::generate().to_string();
     let sanitized_name = sanitize_download_file_name(file_name);
     let stored_name = format!("{}-{}", artifact_id, sanitized_name);
     let mut guard = runtime.download_sessions.lock().await;
@@ -784,7 +784,7 @@ async fn fetch_download_artifact_inner(
     let quarantined = quarantine_reason.is_some();
     let quarantine_reason = quarantine_reason.unwrap_or_default();
 
-    let artifact_id = Ulid::new().to_string();
+    let artifact_id = Ulid::generate().to_string();
     let sanitized_name = sanitize_download_file_name(file_name.as_str());
     let stored_name = format!("{}-{}", artifact_id, sanitized_name);
     let mut guard = runtime.download_sessions.lock().await;

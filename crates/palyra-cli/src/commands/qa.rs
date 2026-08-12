@@ -1004,7 +1004,7 @@ async fn execute_checkpointed_scenario(
     checkpoint_store: &mut QaCheckpointStore,
     resume_reason_code: &str,
 ) -> QaPackScenarioReport {
-    let execution_id = Ulid::new().to_string();
+    let execution_id = Ulid::generate().to_string();
     let result_path = scenario_result_artifact_path(execution_id.as_str(), &prepared.execution_key);
     let result_path = display_path_slash(result_path.as_path());
     let token = match checkpoint_store.begin_attempt(
@@ -1924,7 +1924,7 @@ fn write_qa_report(path: &Path, bytes: &[u8]) -> Result<()> {
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow::anyhow!("qa.runner.report_path_invalid"))?;
-    let temporary_path = path.with_file_name(format!(".{file_name}.{}.tmp", Ulid::new()));
+    let temporary_path = path.with_file_name(format!(".{file_name}.{}.tmp", Ulid::generate()));
     let mut temporary = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

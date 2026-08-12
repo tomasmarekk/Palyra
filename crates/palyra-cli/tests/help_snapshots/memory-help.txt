@@ -3,9 +3,9 @@ Inspect and manage session, workspace, and learning memory
 Usage: palyra memory [OPTIONS] <COMMAND>
 
 Commands:
-  status            [aliases: list]
+  status            [alias: list]
   doctor
-  index             [aliases: reindex]
+  index             [alias: reindex]
   index-drift
   index-reconcile
   search

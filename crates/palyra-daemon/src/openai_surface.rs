@@ -1752,7 +1752,7 @@ fn start_openai_oauth_attempt(
         )))
     })?;
     let expires_at_unix_ms = now.saturating_add(OPENAI_OAUTH_ATTEMPT_TTL_MS);
-    let attempt_id = Ulid::new().to_string().to_ascii_lowercase();
+    let attempt_id = Ulid::generate().to_string().to_ascii_lowercase();
     let endpoint_config = oauth_endpoint_config_from_env().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to load OpenAI OAuth endpoint config: {error}"
@@ -1862,7 +1862,7 @@ async fn start_openai_chatgpt_device_oauth_attempt(
             "failed to read system clock: {error}"
         )))
     })?;
-    let attempt_id = Ulid::new().to_string().to_ascii_lowercase();
+    let attempt_id = Ulid::generate().to_string().to_ascii_lowercase();
     let code_endpoint = Url::parse(OPENAI_CHATGPT_DEVICE_CODE_ENDPOINT).map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "invalid ChatGPT device code endpoint: {error}"
@@ -2303,7 +2303,7 @@ async fn start_minimax_oauth_attempt(
             "failed to read system clock: {error}"
         )))
     })?;
-    let attempt_id = Ulid::new().to_string().to_ascii_lowercase();
+    let attempt_id = Ulid::generate().to_string().to_ascii_lowercase();
     let endpoint_config = minimax_oauth_endpoint_config_from_env().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to load MiniMax OAuth endpoint config: {error}"
@@ -3115,7 +3115,7 @@ fn generate_provider_profile_id(provider_slug: &str, profile_name: &str) -> Stri
         .collect::<Vec<_>>()
         .join("-");
     let base = if slug.is_empty() { provider_slug.to_owned() } else { slug };
-    let suffix = Ulid::new().to_string().to_ascii_lowercase();
+    let suffix = Ulid::generate().to_string().to_ascii_lowercase();
     format!("{base}-{suffix}")
 }
 
@@ -3541,9 +3541,9 @@ async fn append_console_auth_journal_event(
     state
         .runtime
         .record_journal_event(JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
-            session_id: Ulid::new().to_string(),
-            run_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
+            session_id: Ulid::generate().to_string(),
+            run_id: Ulid::generate().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
             actor: common_v1::journal_event::EventActor::System as i32,
             timestamp_unix_ms: unix_ms_now().map_err(|error| {

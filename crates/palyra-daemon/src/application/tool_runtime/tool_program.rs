@@ -456,7 +456,7 @@ async fn execute_validated_program(
         wrappers: python_tool_rpc_sdk_wrappers(&grants),
     };
     let python_sdk_bytes = python_sdk.bytes;
-    let job_id = Ulid::new().to_string();
+    let job_id = Ulid::generate().to_string();
     runtime_state
         .create_tool_job(ToolJobCreateRequest {
             job_id: job_id.clone(),
@@ -814,7 +814,7 @@ async fn record_execution_environment_health_journal_projection(
     let event_type = projection.event_type.clone();
     if let Err(error) = runtime_state
         .record_journal_event(crate::journal::JournalAppendRequest {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             session_id: projection.session_id.clone(),
             run_id: projection.run_id.clone(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
@@ -1172,7 +1172,7 @@ async fn create_step_artifact(
     .content;
     runtime_state
         .create_tool_result_artifact(ToolResultArtifactCreateRequest {
-            artifact_id: Ulid::new().to_string(),
+            artifact_id: Ulid::generate().to_string(),
             session_id: context.session_id.to_owned(),
             run_id: context.run_id.to_owned(),
             proposal_id: proposal_id.to_owned(),

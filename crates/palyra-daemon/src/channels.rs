@@ -867,14 +867,14 @@ impl ChannelPlatform {
             body.push_str(" [connector-crash-once]");
         }
         let event = InboundMessageEvent {
-            envelope_id: Ulid::new().to_string(),
+            envelope_id: Ulid::generate().to_string(),
             connector_id: connector_id.trim().to_owned(),
             conversation_id: request.conversation_id.trim().to_owned(),
             thread_id: None,
             sender_id: request.sender_id.trim().to_owned(),
             sender_display: request.sender_display,
             body,
-            adapter_message_id: Some(Ulid::new().to_string()),
+            adapter_message_id: Some(Ulid::generate().to_string()),
             adapter_thread_id: None,
             received_at_unix_ms: unix_ms_now(),
             is_direct_message: request.is_direct_message,

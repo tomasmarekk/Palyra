@@ -1135,7 +1135,7 @@ pub(crate) async fn console_usage_insights_handler(
         let _ = state
             .runtime
             .upsert_usage_alert(journal::UsageAlertUpsertRequest {
-                alert_id: format!("{}-{index}", Ulid::new()),
+                alert_id: format!("{}-{index}", Ulid::generate()),
                 alert_kind: candidate.alert_kind.clone(),
                 severity: candidate.severity.clone(),
                 scope_kind: candidate.scope_kind.clone(),

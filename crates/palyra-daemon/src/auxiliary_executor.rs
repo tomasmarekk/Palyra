@@ -886,8 +886,8 @@ mod tests {
     #[tokio::test]
     async fn auxiliary_provider_supersession_retries_without_failed_lifecycle() {
         let state = build_test_runtime_state(false);
-        let session_id = Ulid::new().to_string();
-        let task_id = Ulid::new().to_string();
+        let session_id = Ulid::generate().to_string();
+        let task_id = Ulid::generate().to_string();
         state
             .journal_store
             .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {

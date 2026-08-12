@@ -635,8 +635,8 @@ impl QaDaemonSandbox {
             let identity_root = state_root_path.join("identity");
 
             let principal = QA_RUNNER_PRINCIPAL.to_owned();
-            let device_id = Ulid::new().to_string();
-            let admin_token = format!("qa-{}-{}", Ulid::new(), Ulid::new());
+            let device_id = Ulid::generate().to_string();
+            let admin_token = format!("qa-{}-{}", Ulid::generate(), Ulid::generate());
             let provider_environment = prepare_provider_environment(
                 prepared,
                 &fixture_snapshot,
@@ -1111,7 +1111,7 @@ impl QaDaemonSandbox {
             principal: self.launch.principal.clone(),
             device_id: self.device_id.clone(),
             channel: "qa".to_owned(),
-            trace_id: format!("qa:{}", Ulid::new()),
+            trace_id: format!("qa:{}", Ulid::generate()),
         });
         cleanup_session_with_timeout(
             runtime.cleanup_session(SessionCleanupInput {

@@ -197,7 +197,7 @@ impl<'a> AgentPlanStore<'a> {
         command: AgentPlanCreateCommand,
     ) -> Result<AgentPlanItem, JournalError> {
         let record = self.journal.create_agent_plan_item(&AgentPlanCreateRequest {
-            plan_item_id: command.plan_item_id.unwrap_or_else(|| Ulid::new().to_string()),
+            plan_item_id: command.plan_item_id.unwrap_or_else(|| Ulid::generate().to_string()),
             session_id: command.session_id,
             run_id: command.run_id,
             parent_run_id: command.parent_run_id,
@@ -335,7 +335,7 @@ pub(crate) async fn ensure_authoritative_v2_complex_plan(
         )
     };
     let request = V2ComplexPlanEnsureRequest {
-        plan_item_id: Ulid::new().to_string(),
+        plan_item_id: Ulid::generate().to_string(),
         objective_id,
         session_id: context.session_id.to_owned(),
         root_run_id: root_run_id.to_owned(),

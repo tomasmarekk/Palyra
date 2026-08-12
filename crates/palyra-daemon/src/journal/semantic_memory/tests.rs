@@ -67,13 +67,13 @@ fn config(path: PathBuf) -> JournalConfig {
 }
 
 fn temp_db_path() -> PathBuf {
-    std::env::temp_dir().join(format!("palyra-semantic-memory-{}.sqlite3", Ulid::new()))
+    std::env::temp_dir().join(format!("palyra-semantic-memory-{}.sqlite3", Ulid::generate()))
 }
 
 fn authority(store: &JournalStore) -> SemanticMemoryReviewAuthority {
     let authority = SemanticMemoryReviewAuthority {
-        session_id: Ulid::new().to_string(),
-        run_id: Ulid::new().to_string(),
+        session_id: Ulid::generate().to_string(),
+        run_id: Ulid::generate().to_string(),
         principal: "user-1".to_owned(),
         device_id: "device-1".to_owned(),
         channel: Some("console".to_owned()),
@@ -209,7 +209,7 @@ fn approve(
     proposed: &SemanticMemoryProposedRecord,
     authority: &SemanticMemoryReviewAuthority,
 ) -> String {
-    let approval_id = Ulid::new().to_string();
+    let approval_id = Ulid::generate().to_string();
     store
         .create_approval(&semantic_memory_approval_request(
             approval_id.clone(),
@@ -492,7 +492,7 @@ fn proposal_rejects_disabled_acl_mismatch_and_actual_quality_failure() {
     );
 
     let mut missing_review = authority.clone();
-    missing_review.session_id = Ulid::new().to_string();
+    missing_review.session_id = Ulid::generate().to_string();
     let review_error = store
         .propose_semantic_memory(
             "missing-review",

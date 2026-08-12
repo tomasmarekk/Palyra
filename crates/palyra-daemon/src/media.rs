@@ -826,7 +826,7 @@ impl MediaArtifactStore {
 
         let now = current_unix_ms();
         let sha256 = sha256_hex(request.bytes);
-        let artifact_id = ulid::Ulid::new().to_string();
+        let artifact_id = ulid::Ulid::generate().to_string();
         let (storage_path, relative_path) =
             prepare_content_storage_path(self.content_root.as_path(), sha256.as_str())?;
         match fs::OpenOptions::new().write(true).create_new(true).open(storage_path.as_path()) {
@@ -1187,7 +1187,7 @@ impl MediaArtifactStore {
         request: MediaDerivedArtifactUpsertRequest<'_>,
     ) -> Result<MediaDerivedArtifactRecord, MediaStoreError> {
         let now = current_unix_ms();
-        let derived_artifact_id = ulid::Ulid::new().to_string();
+        let derived_artifact_id = ulid::Ulid::generate().to_string();
         let warnings_json =
             serde_json::to_string(&request.derived.warnings).unwrap_or_else(|_| "[]".to_owned());
         let anchors_json =
@@ -1308,7 +1308,7 @@ impl MediaArtifactStore {
         request: MediaFailedDerivedArtifactUpsertRequest<'_>,
     ) -> Result<MediaDerivedArtifactRecord, MediaStoreError> {
         let now = current_unix_ms();
-        let derived_artifact_id = ulid::Ulid::new().to_string();
+        let derived_artifact_id = ulid::Ulid::generate().to_string();
         let guard = self.connection.lock().map_err(|_| {
             MediaStoreError::Io(
                 "media artifact db lock poisoned while recording failed derived artifact"
@@ -2258,7 +2258,7 @@ impl MediaArtifactStore {
         }
         let size_bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
         let sha256 = sha256_hex(body.as_slice());
-        let artifact_id = ulid::Ulid::new().to_string();
+        let artifact_id = ulid::Ulid::generate().to_string();
         let (storage_path, relative_path) =
             prepare_content_storage_path(self.content_root.as_path(), sha256.as_str())?;
         match fs::OpenOptions::new().write(true).create_new(true).open(storage_path.as_path()) {

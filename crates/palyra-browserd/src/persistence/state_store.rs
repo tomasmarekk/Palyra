@@ -349,7 +349,7 @@ impl PersistedStateStore {
     /// Fresh tmp path for an atomic snapshot write; the ULID suffix keeps concurrent writers
     /// from colliding.
     pub(crate) fn tmp_snapshot_path(&self, state_id: &str) -> PathBuf {
-        self.root_dir.join(format!("{state_id}.{}.{}", Ulid::new(), STATE_TMP_EXTENSION))
+        self.root_dir.join(format!("{state_id}.{}.{}", Ulid::generate(), STATE_TMP_EXTENSION))
     }
 
     /// Path of the encrypted profile registry file.
@@ -523,7 +523,7 @@ impl PersistedStateStore {
         let tmp_path = self.root_dir.join(format!(
             "{}.{}.{}",
             PROFILE_REGISTRY_FILE_NAME,
-            Ulid::new(),
+            Ulid::generate(),
             STATE_TMP_EXTENSION
         ));
         write_hardened_file_atomic(

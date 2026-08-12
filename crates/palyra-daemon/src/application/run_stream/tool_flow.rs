@@ -1632,7 +1632,7 @@ async fn execute_parallel_prepared_tool_group(
     tape_seq: &mut i64,
     harness_lifecycle: Option<&RunStreamHarnessLifecycle>,
 ) -> Result<RunStreamPreparedToolExecutionBatchOutcome, Status> {
-    let group_id = Ulid::new().to_string();
+    let group_id = Ulid::generate().to_string();
     append_tool_parallel_group_tape_event(
         runtime_state,
         run_id,
@@ -4425,7 +4425,7 @@ async fn project_tool_result_for_model(
     .map_err(Status::resource_exhausted)?;
     let artifact = runtime_state
         .create_tool_result_artifact(ToolResultArtifactCreateRequest {
-            artifact_id: Ulid::new().to_string(),
+            artifact_id: Ulid::generate().to_string(),
             session_id: context.session_id.to_owned(),
             run_id: context.run_id.to_owned(),
             proposal_id: proposal_id.to_owned(),

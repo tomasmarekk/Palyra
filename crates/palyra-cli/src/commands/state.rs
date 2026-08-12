@@ -1039,7 +1039,7 @@ fn create_state_repair_backup(
         format!("failed to harden backup directory permissions at {}", backup_dir.display())
     })?;
     let backup_path =
-        backup_dir.join(format!("journal-{}-{}.sqlite3", created_at_unix_ms, Ulid::new()));
+        backup_dir.join(format!("journal-{}-{}.sqlite3", created_at_unix_ms, Ulid::generate()));
     connection
         .execute("VACUUM INTO ?1", rusqlite::params![backup_path.to_string_lossy().as_ref()])
         .with_context(|| {

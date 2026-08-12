@@ -726,7 +726,7 @@ fn build_reload_plan(
 
     control_plane::ConfigReloadPlanEnvelope {
         contract: contract_descriptor(),
-        plan_id: Ulid::new().to_string(),
+        plan_id: Ulid::generate().to_string(),
         source_path,
         generated_at_unix_ms: unix_ms_now().unwrap_or(0),
         active_runs,

@@ -226,7 +226,7 @@ async fn create_graph(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| Ulid::new().to_string());
+        .unwrap_or_else(|| Ulid::generate().to_string());
     let snapshot = runtime
         .create_work_graph(WorkGraphCreateRequest {
             graph_id: graph_id.clone(),

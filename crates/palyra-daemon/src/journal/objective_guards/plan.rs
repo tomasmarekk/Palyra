@@ -100,7 +100,7 @@ pub(super) fn ensure_v2_complex_plan_tx(
     insert_agent_plan_event(
         transaction,
         AgentPlanEventInsert {
-            event_id: Ulid::new().to_string(),
+            event_id: Ulid::generate().to_string(),
             plan_item_id: request.plan_item_id.as_str(),
             session_id: request.session_id.as_str(),
             run_id: Some(request.source_run_id.as_str()),
@@ -398,7 +398,7 @@ fn insert_link_event(
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         "#,
         params![
-            Ulid::new().to_string(),
+            Ulid::generate().to_string(),
             objective_id,
             plan_item_id,
             event_type,

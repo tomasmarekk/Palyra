@@ -477,7 +477,7 @@ async fn session_new(
     ensure_grant(client, AcpScope::SessionsWrite, AcpCapability::SessionNew)?;
     let acp_session_id = required_string(&envelope.params, "acp_session_id")?;
     let session_key = optional_string(&envelope.params, "session_key")
-        .unwrap_or_else(|| format!("acp:{}:{}", client.client_id, Ulid::new()));
+        .unwrap_or_else(|| format!("acp:{}:{}", client.client_id, Ulid::generate()));
     let session_label = optional_string(&envelope.params, "session_label");
     let outcome = state
         .runtime
@@ -603,7 +603,7 @@ async fn session_fork(
     let parent_session_id = required_string(&envelope.params, "parent_session_id")?;
     let parent = load_owned_session(state, request_context, &parent_session_id).await?;
     let fork_key = optional_string(&envelope.params, "session_key")
-        .unwrap_or_else(|| format!("fork:{}:{}", parent.session_key, Ulid::new()));
+        .unwrap_or_else(|| format!("fork:{}:{}", parent.session_key, Ulid::generate()));
     let label = optional_string(&envelope.params, "session_label")
         .or_else(|| Some(format!("Fork of {}", parent.title)));
     let outcome = state
@@ -974,7 +974,7 @@ async fn approval_request(
     ensure_grant(client, AcpScope::ApprovalsWrite, AcpCapability::ApprovalBridge)?;
     let session_id = required_string(&envelope.params, "session_id")?;
     let run_id =
-        optional_string(&envelope.params, "run_id").unwrap_or_else(|| Ulid::new().to_string());
+        optional_string(&envelope.params, "run_id").unwrap_or_else(|| Ulid::generate().to_string());
     validate_canonical(&session_id, "session_id")?;
     validate_canonical(&run_id, "run_id")?;
     let subject_id = optional_string(&envelope.params, "subject_id")
@@ -982,8 +982,8 @@ async fn approval_request(
     let summary = optional_string(&envelope.params, "summary")
         .unwrap_or_else(|| "ACP permission request".to_owned());
     let risk_level = parse_risk_level(optional_string(&envelope.params, "risk_level").as_deref());
-    let approval_id =
-        optional_string(&envelope.params, "approval_id").unwrap_or_else(|| Ulid::new().to_string());
+    let approval_id = optional_string(&envelope.params, "approval_id")
+        .unwrap_or_else(|| Ulid::generate().to_string());
     validate_canonical(&approval_id, "approval_id")?;
     let tape_segment = optional_string(&envelope.params, "tape_segment");
     let source_binding = optional_string(&envelope.params, "source_binding");
