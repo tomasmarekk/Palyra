@@ -88,6 +88,13 @@ impl OpenAiProviderSelectionRuntime {
     }
 }
 
+fn openai_reconnect_uses_public_chatgpt_device_flow(client_id: &str) -> bool {
+    matches!(
+        OpenAiProviderSelectionRuntime::from_client_id(client_id),
+        OpenAiProviderSelectionRuntime::ChatGptCodex
+    )
+}
+
 /// Validates an OpenAI API key against the provider's models endpoint, then
 /// stores it as an auth profile (key in the vault, profile via the console
 /// auth service), optionally selecting it as the default provider profile.
@@ -505,8 +512,8 @@ pub(crate) async fn connect_minimax_api_key(
     Ok(provider_action_envelope("minimax", "api_key", state_name, message, Some(profile_id)))
 }
 
-/// Normalizes an OAuth bootstrap request and starts a PKCE authorization-code
-/// attempt for OpenAI, returning the authorization URL the user must open.
+/// Normalizes an OAuth bootstrap request and starts either the public ChatGPT
+/// device flow or a custom PKCE authorization-code flow for OpenAI.
 ///
 /// # Errors
 /// Returns a validation error response for malformed identifiers and an
@@ -1033,9 +1040,9 @@ pub(crate) async fn complete_openai_oauth_callback(
     Ok(render_callback_page("OpenAI Connected", message.as_str(), Some(payload_json.as_str())))
 }
 
-/// Starts a fresh OpenAI authorization-code attempt that reuses the client
-/// id, client secret (loaded from the vault), and scopes stored on an
-/// existing OpenAI OAuth profile.
+/// Starts a fresh OpenAI reconnect attempt using the flow that created the
+/// existing profile. Public ChatGPT profiles retain device authorization,
+/// while custom OAuth applications retain PKCE authorization-code handling.
 ///
 /// # Errors
 /// Returns a validation error response when `profile_id` is missing or
@@ -1083,13 +1090,26 @@ pub(crate) async fn reconnect_openai_oauth_attempt(
             )));
         }
     };
+    let scope = auth_scope_to_control_plane(&profile.scope);
+    if openai_reconnect_uses_public_chatgpt_device_flow(client_id.as_str()) {
+        return start_openai_chatgpt_device_oauth_attempt(
+            state,
+            context,
+            profile.profile_id,
+            profile.profile_name,
+            scope,
+            scopes,
+            false,
+        )
+        .await;
+    }
     start_openai_oauth_attempt(
         state,
         context,
         headers,
-        profile.profile_id.clone(),
-        profile.profile_name.clone(),
-        auth_scope_to_control_plane(&profile.scope),
+        profile.profile_id,
+        profile.profile_name,
+        scope,
         client_id,
         client_secret,
         scopes,
@@ -4686,6 +4706,12 @@ mod tests {
         assert!(profile_id.chars().all(|ch| {
             ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_' || ch == '.'
         }));
+    }
+
+    #[test]
+    fn openai_reconnect_preserves_public_device_and_custom_authorization_code_flows() {
+        assert!(openai_reconnect_uses_public_chatgpt_device_flow(OPENAI_CHATGPT_OAUTH_CLIENT_ID));
+        assert!(!openai_reconnect_uses_public_chatgpt_device_flow("custom-openai-client"));
     }
 
     #[test]
