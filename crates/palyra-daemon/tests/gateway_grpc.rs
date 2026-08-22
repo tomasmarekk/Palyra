@@ -8912,6 +8912,10 @@ async fn grpc_run_stream_finalizes_under_stale_external_approval_flood() -> Resu
     let mut saw_tool_result = false;
     let mut saw_done = false;
     let mut model_tokens = Vec::new();
+    // h2 0.4.16 rejects connections that accumulate too many tiny DATA
+    // frames. A normal-sized durable reason keeps this test focused on
+    // Palyra's stale-approval flood handling.
+    let approval_reason = format!("approved_by_external_console_test:{}", "x".repeat(512));
     let stale_flood_stop = Arc::new(AtomicBool::new(false));
     let mut stale_flood_handle = None;
     loop {
@@ -8942,7 +8946,7 @@ async fn grpc_run_stream_finalizes_under_stale_external_approval_flood() -> Resu
                         serde_json::json!({
                             "approved": true,
                             "decision_scope": "once",
-                            "reason": "approved_by_external_console_test",
+                            "reason": approval_reason.clone(),
                         }),
                         console_cookie.clone(),
                         csrf_token.clone(),
@@ -8954,7 +8958,7 @@ async fn grpc_run_stream_finalizes_under_stale_external_approval_flood() -> Resu
                 common_v1::run_stream_event::Body::ToolApprovalResponse(response)
                     if response.approved =>
                 {
-                    assert_eq!(response.reason, "approved_by_external_console_test");
+                    assert_eq!(response.reason, approval_reason);
                     if stale_flood_handle.is_none() {
                         let stale_request = common_v1::RunStreamRequest {
                             v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
