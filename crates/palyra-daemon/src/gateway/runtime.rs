@@ -1736,6 +1736,48 @@ impl CredentialAvailabilityService {
         })
     }
 
+    async fn materialize_configured_credential(
+        &self,
+        configured_credential_id: &str,
+    ) -> Result<Option<ProviderCredentialLease>, ProviderAttemptAdmissionError> {
+        let Some(profile_id) =
+            auth_profile_id_from_credential_id(configured_credential_id).map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        let registry = Arc::clone(&self.auth_runtime.registry);
+        let profile_id_for_lookup = profile_id.clone();
+        let auth_class = tokio::task::spawn_blocking(move || {
+            registry
+                .get_profile(profile_id_for_lookup.as_str())
+                .map_err(|_| "registry_unavailable")?
+                .map(|profile| profile.credential.credential_type())
+                .ok_or("profile_missing")
+        })
+        .await
+        .map_err(|_| {
+            credential_attempt_admission_error(
+                "probe credential lookup worker failed",
+                "provider_probe_credential_lookup_worker_failed",
+                false,
+            )
+        })?
+        .map_err(|reason_code| {
+            credential_attempt_admission_error(
+                "probe credential binding is unavailable",
+                reason_code,
+                false,
+            )
+        })?;
+        let attempt = CredentialAttemptBinding {
+            profile_id_sha256: crate::sha256_hex(profile_id.as_bytes()),
+            profile_id,
+            auth_class,
+            selection_reason: "health_probe_exact_binding".to_owned(),
+        };
+        self.materialize(attempt).await.map(Some)
+    }
+
     async fn ensure_mcp_oauth_profile(
         &self,
         profile_id: &str,
@@ -2088,6 +2130,81 @@ impl GatewayProviderAttemptAdmission {
             }
         }
     }
+
+    async fn ensure_candidate_health(
+        &self,
+        binding: &ProviderAttemptBinding,
+    ) -> Result<(), ProviderAttemptAdmissionError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            match self.check_candidate_health(binding) {
+                Ok(()) => return Ok(()),
+                Err(ProviderAttemptAdmissionError::HealthBlocked { reason_code, .. })
+                    if reason_code == "provider_attempt_admission_probe_required" =>
+                {
+                    let probe_result = tokio::time::timeout_at(
+                        deadline,
+                        self.runtime_state.execute_provider_health_probe(
+                            binding.health_authority.component_id.as_str(),
+                            "runtime.health.ordinary_admission_probe".to_owned(),
+                            None,
+                            None,
+                        ),
+                    )
+                    .await;
+                    let probe_failed = match probe_result {
+                        Ok(result) => result.is_err(),
+                        Err(_) => {
+                            return Err(ProviderAttemptAdmissionError::HealthBlocked {
+                                safe_message:
+                                    "provider candidate health probe exceeded the admission deadline"
+                                        .to_owned(),
+                                reason_code: "provider_attempt_admission_probe_timed_out".to_owned(),
+                                retry_after_ms: None,
+                                operator_action_required: false,
+                            });
+                        }
+                    };
+                    if probe_failed {
+                        let retrying_existing_probe = matches!(
+                            self.check_candidate_health(binding),
+                            Err(ProviderAttemptAdmissionError::HealthBlocked {
+                                ref reason_code,
+                                ..
+                            }) if reason_code == "provider_attempt_admission_probe_in_progress"
+                        );
+                        if !retrying_existing_probe {
+                            return Err(ProviderAttemptAdmissionError::HealthBlocked {
+                                safe_message: "provider candidate health probe could not execute"
+                                    .to_owned(),
+                                reason_code: "provider_attempt_admission_probe_execution_failed"
+                                    .to_owned(),
+                                retry_after_ms: None,
+                                operator_action_required: false,
+                            });
+                        }
+                    }
+                }
+                Err(ProviderAttemptAdmissionError::HealthBlocked {
+                    safe_message,
+                    reason_code,
+                    retry_after_ms,
+                    operator_action_required,
+                }) if reason_code == "provider_attempt_admission_probe_in_progress" => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ProviderAttemptAdmissionError::HealthBlocked {
+                            safe_message,
+                            reason_code,
+                            retry_after_ms,
+                            operator_action_required,
+                        });
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
@@ -2099,7 +2216,9 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
     ) -> ProviderAttemptPreparationFuture<'a> {
         Box::pin(async move {
             let Some(service) = self.runtime_state.credential_availability.as_ref() else {
-                return self.bind_attempt(provider_id, credential_id, model_id);
+                let binding = self.bind_attempt(provider_id, credential_id, model_id)?;
+                self.ensure_candidate_health(&binding).await?;
+                return Ok(binding);
             };
             let excluded_profile_ids = self
                 .attempted_profile_ids
@@ -2127,6 +2246,7 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
             )?;
             binding.credential_attempt = Some(attempt);
             binding.credential_selection = Some(report);
+            self.ensure_candidate_health(&binding).await?;
             Ok(binding)
         })
     }
@@ -2157,7 +2277,7 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
         binding: &'a ProviderAttemptBinding,
     ) -> ProviderAttemptPermitFuture<'a> {
         Box::pin(async move {
-            self.check_candidate_health(binding)?;
+            self.ensure_candidate_health(binding).await?;
             let candidate = self.candidate_lease_context(binding);
             let guard = self
                 .runtime_state
@@ -2195,7 +2315,7 @@ impl ProviderAttemptAdmission for GatewayProviderAttemptAdmission {
                         }
                     }
                 })?;
-            if let Err(error) = self.check_candidate_health(binding) {
+            if let Err(error) = self.ensure_candidate_health(binding).await {
                 drop(guard);
                 return Err(error);
             }
@@ -2633,6 +2753,18 @@ impl ProviderProbeAdmission for GatewayProviderProbeAdmission {
                 })
             }
         }
+    }
+
+    fn materialize_probe_credential<'a>(
+        &'a self,
+        binding: &'a ProviderAttemptBinding,
+    ) -> ProviderCredentialLeaseFuture<'a> {
+        Box::pin(async move {
+            let Some(service) = self.runtime_state.credential_availability.as_ref() else {
+                return Ok(None);
+            };
+            service.materialize_configured_credential(binding.credential_id.as_str()).await
+        })
     }
 }
 
@@ -23209,6 +23341,40 @@ pub(crate) mod tests {
                 .is_empty(),
             "stale completion must not persist tool results"
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_candidate_admission_runs_required_provider_probe() {
+        let state = test_runtime_state();
+        let provider = Arc::new(ConfigurableProbeProvider {
+            status: provider_status_snapshot(false),
+            result: Ok(()),
+            started: None,
+            release: None,
+        });
+        let _ = state.configure_model_provider(provider);
+        let authority = expire_provider_health_cooldown(&state, "openai-primary");
+        let admission = test_provider_attempt_admission(&state);
+
+        let binding = admission
+            .prepare_attempt(
+                "openai-primary",
+                "auth-profile:openai-primary:primary-profile",
+                "gpt-4o-mini",
+            )
+            .await
+            .expect("ordinary admission should execute and pass the required probe");
+
+        admission
+            .check_eligibility(&binding)
+            .expect("successful probe should restore ordinary eligibility");
+        let health = state
+            .journal_store
+            .runtime_component_health(authority.component_id.as_str())
+            .expect("provider health should load")
+            .expect("provider health should exist");
+        assert_eq!(health.state, RuntimeHealthState::Healthy);
+        assert_eq!(health.reason_code, "runtime.health.provider_probe_passed");
     }
 
     #[tokio::test]

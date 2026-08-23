@@ -886,6 +886,15 @@ pub trait ProviderProbeAdmission: Send + Sync {
         &self,
         binding: &ProviderAttemptBinding,
     ) -> Result<(), ProviderAttemptAdmissionError>;
+
+    /// Resolves the credential bound to the fixed probe target without
+    /// permitting credential rotation or ordinary attempt feedback.
+    fn materialize_probe_credential<'a>(
+        &'a self,
+        _binding: &'a ProviderAttemptBinding,
+    ) -> ProviderCredentialLeaseFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 struct UnrestrictedProviderAttemptAdmission;
@@ -1058,6 +1067,7 @@ pub trait ModelProvider: Send + Sync {
     fn probe_chat_once<'a>(
         &'a self,
         _request: ProviderRequest,
+        _credential: Option<&'a ProviderCredentialLease>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
         Box::pin(async {
             Err(ProviderError::RequestFailed {
@@ -1075,6 +1085,7 @@ pub trait ModelProvider: Send + Sync {
     fn probe_audio_once<'a>(
         &'a self,
         _request: AudioTranscriptionRequest,
+        _credential: Option<&'a ProviderCredentialLease>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
         Box::pin(async {
             Err(ProviderError::RequestFailed {
@@ -2600,6 +2611,10 @@ impl ModelProvider for RegistryBackedModelProvider {
             admission
                 .check_probe_eligibility(&binding)
                 .map_err(provider_attempt_admission_provider_error)?;
+            let credential = admission
+                .materialize_probe_credential(&binding)
+                .await
+                .map_err(provider_attempt_admission_provider_error)?;
             match target.role {
                 ProviderModelRole::Chat => {
                     let mut request = ProviderRequest::from_input_text(
@@ -2611,7 +2626,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                     request.max_output_tokens = Some(8);
                     match runtime.entry.kind {
                         ModelProviderKind::OpenAiCompatible | ModelProviderKind::Anthropic => {
-                            runtime.provider.probe_chat_once(request).await
+                            runtime.provider.probe_chat_once(request, credential.as_ref()).await
                         }
                         ModelProviderKind::Deterministic => {
                             runtime.provider.complete(request).await.map(|_| ())
@@ -2628,7 +2643,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                     };
                     match runtime.entry.kind {
                         ModelProviderKind::OpenAiCompatible => {
-                            runtime.provider.probe_audio_once(request).await
+                            runtime.provider.probe_audio_once(request, credential.as_ref()).await
                         }
                         ModelProviderKind::Anthropic | ModelProviderKind::Deterministic => {
                             runtime.provider.transcribe_audio(request).await.map(|_| ())
@@ -4828,9 +4843,16 @@ impl OpenAiCompatibleProvider {
         })
     }
 
-    async fn complete_probe_once(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
-        let api_key = self.config.openai_api_key.as_ref().ok_or(ProviderError::MissingApiKey)?;
-        self.request_once(api_key.as_str(), request)
+    async fn complete_probe_once(
+        &self,
+        request: &ProviderRequest,
+        credential: Option<&ProviderCredentialLease>,
+    ) -> Result<(), ProviderError> {
+        let api_key = match credential {
+            Some(credential) => credential.secret_utf8()?,
+            None => self.config.openai_api_key.as_deref().ok_or(ProviderError::MissingApiKey)?,
+        };
+        self.request_once(api_key, request)
             .await
             .map(|_| ())
             .map_err(|error| error.into_provider_error(0))
@@ -4839,9 +4861,13 @@ impl OpenAiCompatibleProvider {
     async fn transcribe_probe_once(
         &self,
         request: &AudioTranscriptionRequest,
+        credential: Option<&ProviderCredentialLease>,
     ) -> Result<(), ProviderError> {
-        let api_key = self.config.openai_api_key.as_ref().ok_or(ProviderError::MissingApiKey)?;
-        self.transcribe_audio_once(api_key.as_str(), request)
+        let api_key = match credential {
+            Some(credential) => credential.secret_utf8()?,
+            None => self.config.openai_api_key.as_deref().ok_or(ProviderError::MissingApiKey)?,
+        };
+        self.transcribe_audio_once(api_key, request)
             .await
             .map(|_| ())
             .map_err(|error| error.into_provider_error(0))
@@ -6195,15 +6221,17 @@ impl ModelProvider for OpenAiCompatibleProvider {
     fn probe_chat_once<'a>(
         &'a self,
         request: ProviderRequest,
+        credential: Option<&'a ProviderCredentialLease>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
-        Box::pin(async move { self.complete_probe_once(&request).await })
+        Box::pin(async move { self.complete_probe_once(&request, credential).await })
     }
 
     fn probe_audio_once<'a>(
         &'a self,
         request: AudioTranscriptionRequest,
+        credential: Option<&'a ProviderCredentialLease>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
-        Box::pin(async move { self.transcribe_probe_once(&request).await })
+        Box::pin(async move { self.transcribe_probe_once(&request, credential).await })
     }
 
     fn complete<'a>(
@@ -6476,10 +6504,20 @@ impl AnthropicProvider {
         lock_runtime_metrics(&self.runtime_metrics).snapshot()
     }
 
-    async fn complete_probe_once(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
-        let api_key =
-            self.config.anthropic_api_key.as_ref().ok_or(ProviderError::MissingAnthropicApiKey)?;
-        self.request_once(api_key.as_str(), request, None)
+    async fn complete_probe_once(
+        &self,
+        request: &ProviderRequest,
+        credential: Option<&ProviderCredentialLease>,
+    ) -> Result<(), ProviderError> {
+        let api_key = match credential {
+            Some(credential) => credential.secret_utf8()?,
+            None => self
+                .config
+                .anthropic_api_key
+                .as_deref()
+                .ok_or(ProviderError::MissingAnthropicApiKey)?,
+        };
+        self.request_once(api_key, request, None)
             .await
             .map(|_| ())
             .map_err(|error| error.into_provider_error(0))
@@ -6824,8 +6862,9 @@ impl ModelProvider for AnthropicProvider {
     fn probe_chat_once<'a>(
         &'a self,
         request: ProviderRequest,
+        credential: Option<&'a ProviderCredentialLease>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>> {
-        Box::pin(async move { self.complete_probe_once(&request).await })
+        Box::pin(async move { self.complete_probe_once(&request, credential).await })
     }
 
     fn complete<'a>(
@@ -9321,6 +9360,7 @@ turns:
         started: Mutex<Vec<ProviderAttemptBinding>>,
         succeeded: Mutex<Vec<ProviderAttemptBinding>>,
         failed: Mutex<Vec<ProviderAttemptBinding>>,
+        probe_credential: Option<&'static str>,
     }
 
     impl ProviderAttemptAdmission for RecordingProviderAttemptAdmission {
@@ -9423,6 +9463,19 @@ turns:
             binding: &ProviderAttemptBinding,
         ) -> Result<(), ProviderAttemptAdmissionError> {
             ProviderAttemptAdmission::check_eligibility(self, binding)
+        }
+
+        fn materialize_probe_credential<'a>(
+            &'a self,
+            _binding: &'a ProviderAttemptBinding,
+        ) -> ProviderCredentialLeaseFuture<'a> {
+            let credential = self.probe_credential.map(|secret| {
+                ProviderCredentialLease::new(
+                    AuthCredentialType::Oauth,
+                    SensitiveBytes::new(secret.as_bytes().to_vec()),
+                )
+            });
+            Box::pin(async move { Ok(credential) })
         }
     }
 
@@ -9694,6 +9747,38 @@ turns:
             .expect_err("single-attempt probe should expose the first upstream failure");
 
         assert_eq!(error.retry_count(), 0);
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_probe_uses_exact_admission_credential() {
+        let response_body = r#"{"id":"resp_probe","model":"gpt-4o-mini","choices":[{"message":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#.to_owned();
+        let (base_url, request_count, handle) =
+            spawn_scripted_server(vec![(200_u16, response_body)]);
+        let mut config = openai_chat_and_audio_test_config(base_url);
+        config.openai_api_key = None;
+        config.registry.providers[0].api_key = None;
+        config.registry.providers[0].auth_profile_id = Some("oauth-probe".to_owned());
+        let provider =
+            build_model_provider(&config).expect("registry-backed provider should build");
+        let snapshot = provider.status_snapshot();
+        let target = ProviderHealthProbeTarget {
+            provider_id: "openai-primary".to_owned(),
+            credential_id: snapshot.registry.providers[0].credential_id.clone(),
+            model_id: "gpt-4o-mini".to_owned(),
+            role: ProviderModelRole::Chat,
+        };
+        let admission = RecordingProviderAttemptAdmission {
+            probe_credential: Some("oauth-probe-token"),
+            ..RecordingProviderAttemptAdmission::default()
+        };
+
+        provider
+            .probe_with_attempt_admission(target, Arc::new(admission))
+            .await
+            .expect("probe should use the exact credential materialized by admission");
+
         assert_eq!(request_count.load(Ordering::Relaxed), 1);
         handle.join().expect("scripted server thread should exit");
     }
