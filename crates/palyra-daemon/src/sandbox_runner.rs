@@ -16161,7 +16161,9 @@ mod tests {
         let policy = host_access_policy(workspace.clone());
         let input = br#"{"command":"hello.cmd","args":["world"]}"#;
 
-        let result = run_constrained_process(&policy, input, Duration::from_millis(2_000))
+        // A loaded Windows runner can spend multiple seconds starting cmd.exe and its wrapper.
+        // Use the suite's bounded process budget so scheduler delay is not mistaken for a hang.
+        let result = run_constrained_process(&policy, input, background_test_execution_timeout())
             .expect("workspace .cmd scripts should run through the safe cmd wrapper");
         let output: serde_json::Value =
             serde_json::from_slice(&result.output_json).expect("output should parse");
@@ -18813,9 +18815,11 @@ mod tests {
             format!("import time\ntime.sleep({BACKGROUND_TEST_SCRIPT_SLEEP_SECS})\n"),
         )
         .expect("child script should be written");
+        // Keep the fixture silent so the bounded exit probes, rather than pipe-read timing, observe
+        // completion. os._exit also removes interpreter teardown from this process-tree contract.
         fs::write(
             launcher_script.as_path(),
-            "import pathlib, subprocess, sys\nroot = pathlib.Path(__file__).resolve().parent\npid_path = root / 'child.pid'\nchild = root / 'child.py'\nprocess = subprocess.Popen([sys.executable, str(child)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\npid_path.write_text(str(process.pid), encoding='utf-8')\nprint('launcher started child', flush=True)\nsys.exit(0)\n",
+            "import os, pathlib, subprocess, sys\nroot = pathlib.Path(__file__).resolve().parent\npid_path = root / 'child.pid'\nchild = root / 'child.py'\nprocess = subprocess.Popen([sys.executable, str(child)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\npid_path.write_text(str(process.pid), encoding='utf-8')\nos._exit(0)\n",
         )
         .expect("launcher script should be written");
         let mut policy =
