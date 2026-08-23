@@ -15,8 +15,8 @@ use palyra_model_providers::{
     parse_discovered_model_ids,
     provider_models_endpoint_for_probe as build_provider_models_endpoint_for_probe,
     provider_probe_message_indicates_vault_unavailable, ProviderAttemptSummary,
-    ProviderModelsEndpoint, ANTHROPIC_API_VERSION, OPENAI_API_DEFAULT_CHAT_MODEL_ID,
-    OPENAI_CODEX_BACKEND_BASE_URL,
+    ProviderModelsEndpoint, ProviderReasoningEffort, ProviderServiceTier, ANTHROPIC_API_VERSION,
+    OPENAI_API_DEFAULT_CHAT_MODEL_ID, OPENAI_CODEX_BACKEND_BASE_URL,
 };
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultError, VaultRef};
 use reqwest::blocking::Client;
@@ -767,8 +767,9 @@ fn mutate_model_defaults(request: ModelsDefaultMutationRequest) -> Result<Models
 
     match target {
         "text" => {
-            let reasoning_effort = normalize_reasoning_effort_for_models_set(reasoning.as_deref())?;
-            let service_tier =
+            let requested_reasoning_effort =
+                normalize_reasoning_effort_for_models_set(reasoning.as_deref())?;
+            let requested_service_tier =
                 normalize_service_tier_for_models_set(fast, no_fast, service_tier.as_deref())?;
             let legacy_provider_kind = if !has_registry {
                 Some(legacy_provider_kind_for_mutation(&document)?)
@@ -785,6 +786,14 @@ fn mutate_model_defaults(request: ModelsDefaultMutationRequest) -> Result<Models
             if let Some(provider_kind) = legacy_provider_kind.as_deref() {
                 clear_conflicting_legacy_text_model(&mut document, provider_kind)?;
             }
+            let (reasoning_effort, service_tier) = resolve_text_model_execution_settings(
+                path.clone(),
+                path_ref,
+                &document,
+                model.as_str(),
+                requested_reasoning_effort,
+                requested_service_tier,
+            )?;
             if let Some(reasoning_effort) = reasoning_effort.as_deref() {
                 set_value_at_path(
                     &mut document,
@@ -848,6 +857,42 @@ fn mutate_model_defaults(request: ModelsDefaultMutationRequest) -> Result<Models
         backups,
         runtime_reload,
     })
+}
+
+fn resolve_text_model_execution_settings(
+    path: String,
+    config_path: &Path,
+    document: &toml::Value,
+    model_id: &str,
+    requested_reasoning_effort: Option<String>,
+    requested_service_tier: Option<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    let configured_reasoning_effort =
+        get_string_value_at_path(document, "model_provider.reasoning_effort")?;
+    let configured_service_tier =
+        get_string_value_at_path(document, "model_provider.service_tier")?;
+    if requested_reasoning_effort.is_some() && requested_service_tier.is_some()
+        || configured_reasoning_effort.is_some() && configured_service_tier.is_some()
+    {
+        return Ok((requested_reasoning_effort, requested_service_tier));
+    }
+
+    let overview = models_overview_from_document(path, config_path, document, false)?;
+    let uses_openai = overview.status.provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND
+        && auth_provider_kind_allows_openai_service_tier(
+            overview.status.auth_provider_kind.as_deref(),
+        );
+    let reasoning_effort = requested_reasoning_effort.or_else(|| {
+        (configured_reasoning_effort.is_none()
+            && uses_openai
+            && model_id_supports_reasoning_effort(model_id))
+        .then(|| ProviderReasoningEffort::XHigh.as_str().to_owned())
+    });
+    let service_tier = requested_service_tier.or_else(|| {
+        (configured_service_tier.is_none() && status_supports_openai_service_tier(&overview.status))
+            .then(|| ProviderServiceTier::Default.as_str().to_owned())
+    });
+    Ok((reasoning_effort, service_tier))
 }
 
 fn normalize_reasoning_effort_for_models_set(raw: Option<&str>) -> Result<Option<String>> {

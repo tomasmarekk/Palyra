@@ -625,6 +625,111 @@ openai_model = "gpt-5.5"
 }
 
 #[test]
+fn models_set_defaults_openai_reasoning_and_fast_mode_when_unconfigured() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(
+        &config_path,
+        r#"
+version = 1
+[model_provider]
+kind = "openai_compatible"
+auth_provider_kind = "openai"
+auth_profile_id = "chatgpt-login-test"
+openai_base_url = "https://chatgpt.com/backend-api/codex"
+default_chat_model_id = "gpt-5.6-sol"
+
+[[model_provider.providers]]
+provider_id = "openai-primary"
+display_name = "ChatGPT Login"
+kind = "openai_compatible"
+base_url = "https://chatgpt.com/backend-api/codex"
+auth_provider_kind = "openai"
+auth_profile_id = "chatgpt-login-test"
+enabled = true
+
+[[model_provider.models]]
+model_id = "gpt-5.6-sol"
+provider_id = "openai-primary"
+role = "chat"
+enabled = true
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output = run_cli(
+        &workdir,
+        &["models", "set", "gpt-5.6-terra", "--path", &config_path_string, "--json"],
+    )?;
+    assert!(
+        output.status.success(),
+        "models set should apply OpenAI execution defaults: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config_body = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert!(
+        config_body.contains("default_chat_model_id = \"gpt-5.6-terra\""),
+        "selected OpenAI model should be persisted: {config_body}"
+    );
+    assert!(
+        config_body.contains("reasoning_effort = \"xhigh\""),
+        "reasoning-capable OpenAI models should default to xhigh: {config_body}"
+    );
+    assert!(
+        config_body.contains("service_tier = \"default\""),
+        "OpenAI fast mode should default to off: {config_body}"
+    );
+    Ok(())
+}
+
+#[test]
+fn models_set_preserves_existing_openai_execution_settings() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(
+        &config_path,
+        r#"
+version = 1
+[model_provider]
+kind = "openai_compatible"
+auth_provider_kind = "openai"
+auth_profile_id = "chatgpt-login-test"
+openai_base_url = "https://chatgpt.com/backend-api/codex"
+openai_model = "gpt-5.6-sol"
+reasoning_effort = "high"
+service_tier = "priority"
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output = run_cli(
+        &workdir,
+        &["models", "set", "gpt-5.6-terra", "--path", &config_path_string, "--json"],
+    )?;
+    assert!(
+        output.status.success(),
+        "models set should preserve configured OpenAI execution settings: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config_body = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert!(
+        config_body.contains("reasoning_effort = \"high\""),
+        "existing reasoning effort should remain operator-owned: {config_body}"
+    );
+    assert!(
+        config_body.contains("service_tier = \"priority\""),
+        "existing service tier should remain operator-owned: {config_body}"
+    );
+    Ok(())
+}
+
+#[test]
 fn models_list_preserves_minimax_identity_for_legacy_anthropic_configs() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("palyra.toml");
