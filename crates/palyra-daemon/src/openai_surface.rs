@@ -3903,8 +3903,9 @@ fn apply_openai_provider_selection_defaults(
                 provider.provider_id,
                 discovered_model_present,
             ) {
-                // Operator-selected registry defaults come from `models set --allow-custom`;
-                // keep them when ChatGPT live discovery is unavailable.
+                // Profile reselection must retain operator-owned model capability
+                // metadata; the normalizer can synthesize only a genuinely missing
+                // default model when the registry is otherwise unresolved.
                 preserve_provider_registry_default_model(document, provider, model_id.as_str())?;
             } else {
                 apply_discovered_or_clear_text_model_selection(
@@ -4111,7 +4112,6 @@ fn preserve_provider_registry_default_model(
     model_id: &str,
 ) -> Result<(), Response> {
     set_single_model_registry_provider(document, provider)?;
-    unset_model_value_at_path(document, "model_provider.models")?;
     set_string_value_at_path(document, "model_provider.default_chat_model_id", model_id)?;
     unset_model_value_at_path(document, "model_provider.openai_model")
 }
@@ -5189,6 +5189,16 @@ mod tests {
             base_url = "https://chatgpt.com/backend-api/codex"
             auth_provider_kind = "openai"
             enabled = true
+
+            [[model_provider.models]]
+            model_id = "gpt-5.5"
+            provider_id = "openai-primary"
+            role = "chat"
+            enabled = true
+            reasoning = true
+            reasoning_efforts = ["low", "medium", "high", "xhigh"]
+            service_tier = true
+            service_tiers = ["default", "priority"]
             "#,
         )
         .expect("model provider config should parse");
@@ -5217,6 +5227,17 @@ mod tests {
                 .and_then(toml::Value::as_array)
                 .is_some_and(|providers| providers.len() == 1),
             "selection should keep an explicit ChatGPT provider registry"
+        );
+        let models = get_value_at_path(&document, "model_provider.models")
+            .ok()
+            .flatten()
+            .and_then(toml::Value::as_array)
+            .expect("selection should preserve the configured model registry");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].get("model_id").and_then(toml::Value::as_str), Some("gpt-5.5"));
+        assert_eq!(
+            models[0].get("reasoning_efforts").and_then(toml::Value::as_array).map(Vec::len),
+            Some(4)
         );
     }
 
