@@ -727,9 +727,7 @@ fn tool_call_canonical_events(
         }
     }
     let completes_tool_call =
-        matches!(event_type, Some("response.function_call_arguments.done" | "content_block_stop"))
-            || (event_type == Some("response.output_item.done")
-                && response_tool_start(value).is_some());
+        matches!(event_type, Some("response.function_call_arguments.done" | "content_block_stop"));
     if completes_tool_call {
         let index = response_tool_index(value).unwrap_or(0);
         events.push(ProviderCanonicalEvent::ToolCallEnd { index });
@@ -2159,6 +2157,44 @@ mod tests {
                 } if arguments_delta == "{\"text\":\"secret\"}"
             )
         }));
+    }
+
+    #[test]
+    fn sse_normalizer_ignores_redundant_codex_function_output_item_completion() {
+        let input = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+            "\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",",
+            "\"name\":\"palyra.echo\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",",
+            "\"output_index\":0,\"delta\":\"{\\\"text\\\":\\\"hello\\\"}\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+            "\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",",
+            "\"name\":\"palyra.echo\",\"arguments\":\"{\\\"text\\\":\\\"hello\\\"}\",",
+            "\"status\":\"completed\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        );
+
+        let report = normalize_provider_sse_stream(input, "openai-codex", "gpt-test");
+
+        assert_eq!(
+            report
+                .canonical_events
+                .iter()
+                .filter(|event| matches!(event, ProviderCanonicalEvent::ToolCallEnd { index: 0 }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            report.normalized_stream_v2.terminal_validation.disposition,
+            ProviderTerminalDisposition::Complete
+        );
+        assert!(!report
+            .normalized_stream_v2
+            .terminal_validation
+            .diagnostic_reason_codes
+            .iter()
+            .any(|reason| reason == "provider.stream.tool_call.complete_without_start"));
     }
 
     #[test]

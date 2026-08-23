@@ -7402,6 +7402,31 @@ mod tests {
     }
 
     #[test]
+    fn openai_codex_sse_parser_accepts_completed_function_call_item() {
+        let body = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"palyra.echo"}}"#,
+            "",
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"text\":\"hello\"}"}"#,
+            "",
+            r#"data: {"type":"response.function_call_arguments.done","output_index":0}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"palyra.echo","arguments":"{\"text\":\"hello\"}","status":"completed"}}"#,
+            "",
+            r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+            "",
+        ]
+        .join("\n");
+
+        let parsed = parse_openai_codex_sse_response(body.as_str(), "gpt-test")
+            .expect("completed function call stream should parse");
+
+        assert_eq!(parsed.status.as_deref(), Some("completed"));
+        assert_eq!(parsed.output.len(), 1);
+        assert_eq!(parsed.output[0].kind, "function_call");
+        assert_eq!(parsed.output[0].call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
     fn transport_timeout_classification_is_actionable() {
         let timeout_failure = classify_transport_provider_failure("anthropic_chat_request", true);
 
