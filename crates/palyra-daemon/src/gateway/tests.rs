@@ -10144,7 +10144,7 @@ async fn networked_worker_result_receipt_replays_exactly_and_rejects_conflicts()
                     grant_id: "grant-networked-worker-result-replay".to_owned(),
                     run_id: "run-networked-worker-result-replay".to_owned(),
                     tool_name: "palyra.fs.read_file".to_owned(),
-                    expires_at_unix_ms: super::current_unix_ms().saturating_add(30_000),
+                    expires_at_unix_ms: super::current_unix_ms().saturating_add(60_000),
                 },
             },
         )
