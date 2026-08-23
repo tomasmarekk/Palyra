@@ -10328,7 +10328,9 @@ async fn networked_worker_archived_result_receipt_replays_with_first_observation
                     grant_id: "grant-networked-worker-archived-result-replay".to_owned(),
                     run_id: "run-networked-worker-archived-result-replay".to_owned(),
                     tool_name: "palyra.fs.read_file".to_owned(),
-                    expires_at_unix_ms: super::current_unix_ms().saturating_add(30_000),
+                    // Keep the grant strictly longer-lived than the requested lease so assignment
+                    // cannot race an equal wall-clock deadline under a loaded test runner.
+                    expires_at_unix_ms: super::current_unix_ms().saturating_add(60_000),
                 },
             },
         )
