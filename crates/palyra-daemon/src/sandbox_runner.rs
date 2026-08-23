@@ -140,6 +140,13 @@ const BACKGROUND_POST_OUTPUT_EXIT_CHECK_MS: u64 = 250;
 const BACKGROUND_METADATA_RETURN_RESERVE_MS: u64 = 100;
 const BACKGROUND_MONITOR_POLL_MS: u64 = 50;
 const BACKGROUND_TERMINATION_WAIT_MS: u64 = 1_000;
+// A retained Windows Job Object can acknowledge termination before a heavily loaded host updates
+// both the job membership and direct-process views. Recovery owns the exact capability, so it can
+// wait longer without falling back to a reusable PID or weakening the ordinary cleanup bound.
+#[cfg(windows)]
+const RETAINED_BACKGROUND_TERMINATION_WAIT_MS: u64 = 5_000;
+#[cfg(not(windows))]
+const RETAINED_BACKGROUND_TERMINATION_WAIT_MS: u64 = BACKGROUND_TERMINATION_WAIT_MS;
 #[cfg(target_os = "macos")]
 const MAX_MACOS_BACKGROUND_PROCESS_GROUP_MEMBERS: usize = 4_096;
 #[cfg(target_os = "macos")]
@@ -10691,7 +10698,7 @@ pub(crate) fn terminate_retained_background_process(
         if !wait_for_owned_background_tree_inactive_for_identity(
             pid,
             Some(&registration.identity),
-            Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
+            Duration::from_millis(RETAINED_BACKGROUND_TERMINATION_WAIT_MS),
         )? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -10707,7 +10714,7 @@ pub(crate) fn terminate_retained_background_process(
         if !wait_for_owned_background_tree_inactive_for_identity(
             pid,
             Some(&registration.identity),
-            Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
+            Duration::from_millis(RETAINED_BACKGROUND_TERMINATION_WAIT_MS),
         )? {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -10720,7 +10727,7 @@ pub(crate) fn terminate_retained_background_process(
         pid,
         expected,
         &retained_windows_job,
-        Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
+        Duration::from_millis(RETAINED_BACKGROUND_TERMINATION_WAIT_MS),
     )?
     .ok_or_else(|| {
         io::Error::new(
