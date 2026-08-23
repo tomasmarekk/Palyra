@@ -4119,10 +4119,9 @@ fn auth_profile_failure_kind_for_provider_error(
         "quota" | "quota_exceeded" => Some(AuthProfileFailureKind::Quota),
         "rate_limit" | "rate_limited" => Some(AuthProfileFailureKind::RateLimit),
         "suspected_compromise" => Some(AuthProfileFailureKind::SuspectedCompromise),
-        "network_unavailable"
-        | "provider_timeout"
-        | "transient_upstream"
-        | "malformed_response" => Some(AuthProfileFailureKind::Transient),
+        "network_unavailable" | "provider_timeout" | "transient_upstream" => {
+            Some(AuthProfileFailureKind::Transient)
+        }
         _ => None,
     }
 }
@@ -21307,10 +21306,10 @@ fn normalize_optional_agent_model_profile(value: &str) -> Option<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        apply_shared_runtime_tape_identities, current_unix_ms,
-        fallback_workspace_document_search_hits, provider_credential_attribution_for_provider,
-        provider_lease_timeout_status, select_default_agent_model_profile,
-        shared_runtime_event_for_tape, sign_canvas_hmac_sha256,
+        apply_shared_runtime_tape_identities, auth_profile_failure_kind_for_provider_error,
+        current_unix_ms, fallback_workspace_document_search_hits,
+        provider_credential_attribution_for_provider, provider_lease_timeout_status,
+        select_default_agent_model_profile, shared_runtime_event_for_tape, sign_canvas_hmac_sha256,
         validate_memory_item_content_limits, AuthRuntimeState, BrowserServiceRuntimeConfig,
         CanvasHostRuntimeConfig, CredentialAvailabilityService, GatewayJournalConfigSnapshot,
         GatewayProviderAttemptAdmission, GatewayProviderAttemptRuntimeAuthorityGuard,
@@ -21370,7 +21369,10 @@ pub(crate) mod tests {
         RuntimeRunId, RuntimeSessionId, RuntimeSubsystem, RuntimeToolExecutionId, RuntimeTraceId,
         RUNTIME_EVENT_LEGACY_IDENTITY_ADAPTER_EXTENSION,
     };
-    use palyra_model_providers::{classify_http_provider_failure, retry_provider_classification};
+    use palyra_model_providers::{
+        classify_http_provider_failure, invalid_response_classification,
+        retry_provider_classification,
+    };
     use palyra_vault::{Vault, VaultScope};
     use std::{
         future::Future,
@@ -21590,6 +21592,18 @@ pub(crate) mod tests {
         assert!(right_result.expect("right selection should complete").is_some());
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
         assert_eq!(adapter.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn malformed_provider_response_does_not_penalize_auth_profile() {
+        let error = ProviderError::RequestFailed {
+            message: "provider returned malformed output".to_owned(),
+            retryable: false,
+            retry_count: 0,
+            classification: invalid_response_classification("test_malformed_output"),
+        };
+
+        assert_eq!(auth_profile_failure_kind_for_provider_error(&error), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
