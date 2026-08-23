@@ -726,14 +726,11 @@ fn tool_call_canonical_events(
             });
         }
     }
-    if matches!(
-        event_type,
-        Some(
-            "response.function_call_arguments.done"
-                | "response.output_item.done"
-                | "content_block_stop"
-        )
-    ) {
+    let completes_tool_call =
+        matches!(event_type, Some("response.function_call_arguments.done" | "content_block_stop"))
+            || (event_type == Some("response.output_item.done")
+                && response_tool_start(value).is_some());
+    if completes_tool_call {
         let index = response_tool_index(value).unwrap_or(0);
         events.push(ProviderCanonicalEvent::ToolCallEnd { index });
     }
@@ -2162,6 +2159,36 @@ mod tests {
                 } if arguments_delta == "{\"text\":\"secret\"}"
             )
         }));
+    }
+
+    #[test]
+    fn sse_normalizer_does_not_complete_tools_for_codex_text_or_reasoning_items() {
+        let input = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,",
+            "\"delta\":\"OK\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+            "\"item\":{\"type\":\"reasoning\",\"id\":\"reasoning_1\",\"status\":\"completed\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,",
+            "\"item\":{\"type\":\"message\",\"id\":\"message_1\",\"status\":\"completed\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        );
+
+        let report = normalize_provider_sse_stream(input, "openai-codex", "gpt-test");
+
+        assert!(!report
+            .canonical_events
+            .iter()
+            .any(|event| matches!(event, ProviderCanonicalEvent::ToolCallEnd { .. })));
+        assert_eq!(
+            report.normalized_stream_v2.terminal_validation.disposition,
+            ProviderTerminalDisposition::Complete
+        );
+        assert!(!report
+            .normalized_stream_v2
+            .terminal_validation
+            .diagnostic_reason_codes
+            .iter()
+            .any(|reason| reason == "provider.stream.tool_call.complete_without_start"));
     }
 
     #[test]
