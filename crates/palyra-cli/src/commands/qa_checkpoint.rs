@@ -2,8 +2,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, TryLockError},
     path::{Component, Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -21,6 +22,8 @@ const EXECUTION_RESULT_SCHEMA_VERSION: u32 = 3;
 const EXECUTION_RESULT_FORMAT: &str = "palyra-qa-scenario-execution-result";
 const EXECUTION_RESULT_ARTIFACT_KIND: &str = "execution_result";
 const MAX_ATTEMPT_REASON_CODES: usize = 64;
+const COORDINATOR_LOCK_ACQUIRE_GRACE: Duration = Duration::from_millis(250);
+const COORDINATOR_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Returns the pinned durable checkpoint contract used by QA recovery tooling.
 #[cfg(test)]
@@ -270,8 +273,23 @@ impl QaCheckpointCoordinatorLock {
             .with_context(|| {
                 format!("qa.resume.coordinator_lock_open_failed: {}", lock_path.display())
             })?;
-        file.try_lock()
-            .map_err(|error| anyhow::anyhow!("qa.resume.coordinator_lock_unavailable: {error}"))?;
+        let started_at = Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock)
+                    if started_at.elapsed() < COORDINATOR_LOCK_ACQUIRE_GRACE =>
+                {
+                    // A close or terminated coordinator can become observable just after the
+                    // holder disappears. Retrying only the exclusive non-blocking lock preserves
+                    // single-owner authority while avoiding a false restart refusal.
+                    std::thread::sleep(COORDINATOR_LOCK_RETRY_INTERVAL);
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!("qa.resume.coordinator_lock_unavailable: {error}"));
+                }
+            }
+        }
         Ok(Self { _file: file })
     }
 }
