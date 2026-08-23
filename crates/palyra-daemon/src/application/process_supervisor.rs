@@ -1965,10 +1965,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let supervisor =
             ProcessSupervisor::start(test_config(temp.path())).expect("start supervisor");
+        // Keep the child blocked on a second read until EOF so the test exercises the ordered
+        // write-then-close path instead of racing close against the child's natural exit.
         #[cfg(windows)]
-        let script = "setlocal EnableDelayedExpansion & set /p value=& echo got:!value!";
+        let script =
+            "setlocal EnableDelayedExpansion & set /p value=& set /p ignored=& echo got:!value!";
         #[cfg(not(windows))]
-        let script = "read value; printf 'got:%s\\n' \"$value\"";
+        let script = "read value; read ignored || true; printf 'got:%s\\n' \"$value\"";
         let record = supervisor
             .launch(shell_spec(script, temp.path(), Duration::from_secs(5)))
             .expect("launch process");
