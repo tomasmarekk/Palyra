@@ -10,7 +10,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -1939,14 +1939,17 @@ fn compat_responses_stream_maps_stream_failures_to_failed_event() -> Result<()> 
 #[test]
 fn compat_responses_stream_maps_tool_call_and_approval_events() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
-        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
-        ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED".to_owned(), "true".to_owned()),
-        (
-            "PALYRA_TOOL_CALL_ALLOWED_TOOLS".to_owned(),
-            "palyra.fs.apply_patch,palyra.fs.read_file".to_owned(),
-        ),
-    ])?;
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports_and_approvals(
+        &[
+            ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+            ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED".to_owned(), "true".to_owned()),
+            (
+                "PALYRA_TOOL_CALL_ALLOWED_TOOLS".to_owned(),
+                "palyra.fs.apply_patch,palyra.fs.read_file".to_owned(),
+            ),
+        ],
+        &["palyra.fs.apply_patch", "palyra.fs.read_file"],
+    )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -4094,9 +4097,19 @@ fn lock_openai_auth_surface_test() -> MutexGuard<'static, ()> {
 }
 
 fn spawn_palyrad_with_dynamic_ports(extra_env: &[(String, String)]) -> Result<(Child, u16)> {
+    spawn_palyrad_with_dynamic_ports_and_approvals(extra_env, &[])
+}
+
+fn spawn_palyrad_with_dynamic_ports_and_approvals(
+    extra_env: &[(String, String)],
+    approval_required_tools: &[&str],
+) -> Result<(Child, u16)> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=PALYRAD_STARTUP_ATTEMPTS {
-        match spawn_palyrad_with_dynamic_ports_once(extra_env) {
+        match spawn_palyrad_with_dynamic_ports_once_and_approvals(
+            extra_env,
+            approval_required_tools,
+        ) {
             Ok(started) => return Ok(started),
             Err(error) => {
                 last_error = Some(error);
@@ -4115,6 +4128,13 @@ fn spawn_palyrad_with_dynamic_ports(extra_env: &[(String, String)]) -> Result<(C
 }
 
 fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(String, String)]) -> Result<(Child, u16)> {
+    spawn_palyrad_with_dynamic_ports_once_and_approvals(extra_env, &[])
+}
+
+fn spawn_palyrad_with_dynamic_ports_once_and_approvals(
+    extra_env: &[(String, String)],
+    approval_required_tools: &[&str],
+) -> Result<(Child, u16)> {
     let state_root_dir = unique_temp_dir("palyra-openai-auth-state-root");
     let journal_db_path = unique_temp_path("palyra-openai-auth-journal", "sqlite3");
     let identity_store_dir = state_root_dir.join("identity");
@@ -4127,6 +4147,7 @@ fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(String, String)]) -> Resu
     })?;
     prepare_test_vault_dir(&vault_dir)?;
     prepare_test_config(&config_path)?;
+    seed_explicit_tool_approval_posture(&state_root_dir, approval_required_tools)?;
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
     command
@@ -4168,6 +4189,47 @@ fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(String, String)]) -> Resu
         }
     };
     Ok((child, admin_port))
+}
+
+fn seed_explicit_tool_approval_posture(
+    state_root: &Path,
+    approval_required_tools: &[&str],
+) -> Result<()> {
+    if approval_required_tools.is_empty() {
+        return Ok(());
+    }
+    let registry_dir = state_root.join("tool-posture");
+    fs::create_dir_all(&registry_dir).with_context(|| {
+        format!("failed to create test tool posture directory at {}", registry_dir.display())
+    })?;
+    let overrides = approval_required_tools
+        .iter()
+        .map(|tool_name| {
+            json!({
+                "tool_name": tool_name,
+                "scope_kind": "global",
+                "scope_id": "global",
+                "state": "ask_each_time",
+                "reason": "explicit safe mode for approval flow integration test",
+                "actor_principal": "test:harness",
+                "source": "integration_test_safe_mode",
+                "created_at_unix_ms": 1,
+                "updated_at_unix_ms": 1
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut payload = serde_json::to_vec_pretty(&json!({
+        "schema_version": 2,
+        "overrides": overrides,
+        "recommendation_actions": [],
+        "audit_events": []
+    }))
+    .context("failed to serialize test tool posture registry")?;
+    payload.push(b'\n');
+    let registry_path = registry_dir.join("registry.json");
+    fs::write(&registry_path, payload).with_context(|| {
+        format!("failed to write test tool posture registry at {}", registry_path.display())
+    })
 }
 
 fn login_console_session(
