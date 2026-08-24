@@ -14398,6 +14398,19 @@ async fn tool_program_python_rpc_script_inherits_http_fetch_approval() {
     );
     let session_id = "session-tool-program-script-http";
     let run_id = "run-tool-program-script-http";
+    state
+        .upsert_tool_posture_override(crate::tool_posture::ToolPostureOverrideUpsertRequest {
+            tool_name: super::HTTP_FETCH_TOOL_NAME.to_owned(),
+            scope_kind: crate::tool_posture::ToolPostureScopeKind::Session,
+            scope_id: session_id.to_owned(),
+            state: crate::tool_posture::ToolPostureState::AskEachTime,
+            reason: Some("safe mode enabled for parent approval inheritance test".to_owned()),
+            actor_principal: "admin:ops".to_owned(),
+            source: "test".to_owned(),
+            expires_at_unix_ms: None,
+            now_unix_ms: super::current_unix_ms(),
+        })
+        .expect("HTTP fetch safe-mode posture should be accepted");
     start_tool_program_test_run(&state, session_id, run_id).await;
     let (url, handle) = spawn_static_http_server_with_content_type(
         r#"{"scenario":"script-http"}"#,
