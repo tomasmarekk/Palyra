@@ -169,6 +169,43 @@ fn palyra_state_verify_hash_chain_supports_json_output() -> Result<()> {
 }
 
 #[test]
+fn palyra_state_doctor_and_verify_honor_global_json_output() -> Result<()> {
+    let tempdir = tempfile::tempdir().context("failed to create tempdir")?;
+    let db_path = tempdir.path().join("journal.sqlite3");
+    seed_hash_chained_journal_db(db_path.as_path())?;
+    let db_path = db_path.to_string_lossy();
+
+    for (subcommand, expected_field) in [("doctor", "subsystem"), ("verify-hash-chain", "status")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+            .args([
+                "--output-format",
+                "json",
+                "state",
+                subcommand,
+                "--db-path",
+                db_path.as_ref(),
+                "--full",
+            ])
+            .output()
+            .with_context(|| format!("failed to execute palyra state {subcommand}"))?;
+
+        assert!(
+            output.status.success(),
+            "state {subcommand} should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: Value =
+            serde_json::from_slice(output.stdout.as_slice()).context("stdout was not JSON")?;
+        assert!(
+            payload.get(expected_field).is_some(),
+            "state {subcommand} JSON should include {expected_field}: {payload}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn palyra_state_full_hash_verification_rejects_deleted_prefix() -> Result<()> {
     let tempdir = tempfile::tempdir().context("failed to create tempdir")?;
     let db_path = tempdir.path().join("journal.sqlite3");

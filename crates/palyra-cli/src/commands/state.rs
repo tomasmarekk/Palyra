@@ -269,7 +269,7 @@ pub(crate) fn run_state(command: StateCommand) -> Result<()> {
             let db_path = resolve_state_db_path(db_path)?;
             let scope = hash_scope(full, fast_window);
             let report = build_state_doctor_report(db_path.as_path(), scope)?;
-            if json {
+            if state_prefers_json(json) {
                 output::print_json_pretty(&report, "failed to encode state doctor report as JSON")
             } else {
                 print_state_doctor_report(&report)
@@ -279,7 +279,7 @@ pub(crate) fn run_state(command: StateCommand) -> Result<()> {
             let db_path = resolve_state_db_path(db_path)?;
             let connection = open_state_connection(db_path.as_path())?;
             let report = verify_hash_chain(&connection, hash_scope(full, limit))?;
-            if json {
+            if state_prefers_json(json) {
                 output::print_json_pretty(
                     &report,
                     "failed to encode state hash-chain report as JSON",
@@ -296,7 +296,7 @@ pub(crate) fn run_state(command: StateCommand) -> Result<()> {
             }
             let db_path = resolve_state_db_path(db_path)?;
             let report = repair_state(db_path.as_path(), dry_run, actor_principal)?;
-            if json {
+            if state_prefers_json(json) {
                 output::print_json_pretty(&report, "failed to encode state repair report as JSON")
             } else {
                 print_state_repair_report(&report)
@@ -306,7 +306,7 @@ pub(crate) fn run_state(command: StateCommand) -> Result<()> {
             let db_path = resolve_state_db_path(db_path)?;
             let connection = open_state_connection(db_path.as_path())?;
             let report = checkpoint_wal(&connection, db_path.as_path(), mode)?;
-            if json {
+            if state_prefers_json(json) {
                 output::print_json_pretty(
                     &report,
                     "failed to encode state checkpoint report as JSON",
@@ -326,7 +326,7 @@ pub(crate) fn run_state(command: StateCommand) -> Result<()> {
         StateCommand::SidecarsPrepare { db_path, json } => {
             let db_path = resolve_state_db_path(db_path)?;
             let descriptors = prepare_sidecar_storage(db_path.as_path())?;
-            if json {
+            if state_prefers_json(json) {
                 output::print_json_pretty(
                     &descriptors,
                     "failed to encode state sidecar descriptors as JSON",
@@ -345,6 +345,10 @@ pub(crate) fn run_state(command: StateCommand) -> Result<()> {
             }
         }
     }
+}
+
+fn state_prefers_json(command_json: bool) -> bool {
+    command_json || app::current_root_context().is_some_and(|context| context.prefers_json())
 }
 
 fn resolve_state_db_path(db_path: Option<String>) -> Result<PathBuf> {
