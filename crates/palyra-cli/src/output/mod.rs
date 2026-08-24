@@ -336,6 +336,11 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     if is_provider_quota_or_rate_limit(&lower) {
         return CliExitCode::Connectivity;
     }
+    // Serde's unknown-field detail lists valid field names, which may include
+    // auth-related words; the command-owned validation prefix must win first.
+    if is_qa_manifest_validation(&lower) {
+        return CliExitCode::Validation;
+    }
     if lower.contains("unauthorized")
         || lower.contains("forbidden")
         || lower.contains("authentication")
@@ -433,6 +438,11 @@ fn is_provider_quota_or_rate_limit(lower_error: &str) -> bool {
         || lower_error.contains("token plan usage limit")
         || lower_error.contains("rate_limited")
         || lower_error.contains("rate limit")
+}
+
+fn is_qa_manifest_validation(lower_error: &str) -> bool {
+    lower_error.contains("qa scenario validation failed")
+        || lower_error.contains("failed to parse qa scenario")
 }
 
 fn classify_control_plane_error(cause: &(dyn std::error::Error + 'static)) -> Option<CliExitCode> {
@@ -612,6 +622,12 @@ mod tests {
         assert_eq!(
             classify_error(&anyhow!(
                 "message commands require a routable connector id with provider and instance, such as `echo:default`; `echo` is a provider shorthand for channel filters, not a message connector id."
+            )),
+            CliExitCode::Validation
+        );
+        assert_eq!(
+            classify_error(&anyhow!(
+                "QA scenario validation failed for invalid.yaml: unknown field `not_a_scenario`, expected one of `schema_version`, `id`, `authorization`, `token_budget`"
             )),
             CliExitCode::Validation
         );

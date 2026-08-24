@@ -128,6 +128,38 @@ timeout:
 }
 
 #[test]
+fn qa_validate_classifies_unknown_fields_as_validation_errors() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let scenario_path = temp_dir.path().join("unknown-field.yaml");
+    fs::write(scenario_path.as_path(), "not_a_scenario: true\n")
+        .context("failed to write invalid scenario")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args(["qa", "validate", "--path"])
+        .arg(scenario_path.as_os_str())
+        .arg("--json")
+        .output()
+        .context("failed to execute palyra qa validate")?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "schema failures should use the validation exit code: {}",
+        String::from_utf8_lossy(output.stderr.as_slice())
+    );
+    let stderr = String::from_utf8_lossy(output.stderr.as_slice());
+    assert!(
+        stderr.contains("validation_error"),
+        "schema failures should expose the validation category: {stderr}"
+    );
+    assert!(
+        stderr.contains("not_a_scenario"),
+        "schema failures should preserve the actionable parser detail: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn qa_run_pack_accepts_full_p0_pack() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .current_dir(repo_root())
