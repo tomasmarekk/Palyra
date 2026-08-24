@@ -9920,7 +9920,7 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
     let (child, admin_port, grpc_port, _journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
+        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner_in_safe_mode(
             ProcessRunnerSpawnConfig {
                 openai_base_url: openai_base_url.as_str(),
                 openai_api_key: OPENAI_API_KEY,
@@ -9932,6 +9932,7 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
                 allowed_egress_hosts: "",
                 allowed_dns_suffixes: "",
             },
+            &["palyra.process.run"],
         )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
@@ -10079,7 +10080,7 @@ async fn grpc_run_stream_denies_sandbox_process_runner_on_macos() -> Result<()> 
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
     let (child, admin_port, grpc_port, _journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
+        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner_in_safe_mode(
             ProcessRunnerSpawnConfig {
                 openai_base_url: openai_base_url.as_str(),
                 openai_api_key: OPENAI_API_KEY,
@@ -10091,6 +10092,7 @@ async fn grpc_run_stream_denies_sandbox_process_runner_on_macos() -> Result<()> 
                 allowed_egress_hosts: "",
                 allowed_dns_suffixes: "",
             },
+            &["palyra.process.run"],
         )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
@@ -10191,7 +10193,7 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_path_traversal() -> Resul
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
     let (child, admin_port, grpc_port, _journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
+        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner_in_safe_mode(
             ProcessRunnerSpawnConfig {
                 openai_base_url: openai_base_url.as_str(),
                 openai_api_key: OPENAI_API_KEY,
@@ -10203,6 +10205,7 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_path_traversal() -> Resul
                 allowed_egress_hosts: "allowed.example",
                 allowed_dns_suffixes: ".corp.local",
             },
+            &["palyra.process.run"],
         )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
@@ -10292,7 +10295,7 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
     let (child, admin_port, grpc_port, _journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
+        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner_in_safe_mode(
             ProcessRunnerSpawnConfig {
                 openai_base_url: openai_base_url.as_str(),
                 openai_api_key: OPENAI_API_KEY,
@@ -10304,6 +10307,7 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
                 allowed_egress_hosts: "allowed.example",
                 allowed_dns_suffixes: ".corp.local",
             },
+            &["palyra.process.run"],
         )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
@@ -11295,7 +11299,7 @@ async fn grpc_run_stream_admin_cancel_preempts_inflight_process_runner() -> Resu
     let workspace_root =
         std::env::current_dir().context("failed to resolve workspace root for process runner")?;
     let (child, admin_port, grpc_port, _journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
+        spawn_palyrad_with_openai_provider_tool_policy_and_process_runner_in_safe_mode(
             ProcessRunnerSpawnConfig {
                 openai_base_url: openai_base_url.as_str(),
                 openai_api_key: OPENAI_API_KEY,
@@ -11307,6 +11311,7 @@ async fn grpc_run_stream_admin_cancel_preempts_inflight_process_runner() -> Resu
                 allowed_egress_hosts: "",
                 allowed_dns_suffixes: "",
             },
+            &["palyra.process.run"],
         )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
@@ -13714,8 +13719,9 @@ struct ProcessRunnerSpawnConfig<'a> {
 }
 
 #[cfg(unix)]
-fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
+fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner_in_safe_mode(
     config: ProcessRunnerSpawnConfig<'_>,
+    approval_required_tools: &[&str],
 ) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     let config_path = write_process_runner_config(
         config.workspace_root,
@@ -13728,6 +13734,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
     prepare_test_vault_dir(&vault_dir)?;
+    seed_explicit_tool_approval_posture(&identity_store_dir, approval_required_tools)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
     let mut child = apply_isolated_daemon_test_env(&mut command, &config_path)
         .args([
