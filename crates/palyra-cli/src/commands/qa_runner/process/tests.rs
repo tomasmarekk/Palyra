@@ -83,6 +83,36 @@ fn isolated_daemon_config_enables_only_declared_runtime() {
     assert!(mcp_config.contains(r#"egress_policy = "deny_all""#));
 }
 
+#[test]
+fn explicit_approval_steps_seed_safe_mode_only_for_declared_tools() {
+    let state_root = tempfile::tempdir().expect("state root should be created");
+    seed_explicit_approval_posture(&parse_scenario(APPROVAL_DENIED_SCENARIO), state_root.path())
+        .expect("explicit approval posture should be seeded");
+
+    let registry_path =
+        state_root.path().join(QA_TOOL_POSTURE_DIRECTORY).join(QA_TOOL_POSTURE_REGISTRY_FILE);
+    let document: Value = serde_json::from_slice(
+        fs::read(registry_path).expect("seeded registry should be readable").as_slice(),
+    )
+    .expect("seeded registry should be valid JSON");
+    assert_eq!(document["schema_version"], Value::from(QA_TOOL_POSTURE_REGISTRY_SCHEMA_VERSION));
+    assert_eq!(document["overrides"].as_array().map(Vec::len), Some(1));
+    assert_eq!(document["overrides"][0]["tool_name"], Value::from("palyra.fs.apply_patch"));
+    assert_eq!(document["overrides"][0]["state"], Value::from("ask_each_time"));
+}
+
+#[test]
+fn scenario_without_approval_steps_keeps_default_posture() {
+    let state_root = tempfile::tempdir().expect("state root should be created");
+    seed_explicit_approval_posture(&parse_scenario(NO_TOOLS_SCENARIO), state_root.path())
+        .expect("default posture should need no seed");
+
+    assert!(
+        !state_root.path().join(QA_TOOL_POSTURE_DIRECTORY).exists(),
+        "approval-free scenarios must exercise the production default"
+    );
+}
+
 fn command_env<'a>(command: &'a Command, key: &str) -> Option<&'a OsStr> {
     command
         .get_envs()

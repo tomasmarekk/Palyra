@@ -211,6 +211,9 @@ const QA_FAULT_MUTATION_TOOLS: &[&str] =
     &["palyra.fs.apply_patch", "palyra.process.run", "palyra.http.fetch", "sessions_spawn"];
 const QA_FAULT_DELIVERY_TOOLS: &[&str] = &["palyra.clarify.ask"];
 const QA_MCP_PERSISTENT_TOOLS: &[&str] = &["mcp.conformance.inspect"];
+const QA_TOOL_POSTURE_REGISTRY_SCHEMA_VERSION: u32 = 2;
+const QA_TOOL_POSTURE_DIRECTORY: &str = "tool-posture";
+const QA_TOOL_POSTURE_REGISTRY_FILE: &str = "registry.json";
 const QA_BASE_DAEMON_CONFIG: &str = "version = 1\n";
 const QA_PROCESS_DAEMON_CONFIG: &str = r#"version = 1
 
@@ -250,6 +253,25 @@ egress_policy = "deny_all"
 oauth_required = false
 tool_allowlist = ["inspect"]
 "#;
+
+#[derive(Serialize)]
+struct QaToolPostureRegistryDocument<'a> {
+    schema_version: u32,
+    overrides: Vec<QaToolPostureOverride<'a>>,
+}
+
+#[derive(Serialize)]
+struct QaToolPostureOverride<'a> {
+    tool_name: &'a str,
+    scope_kind: &'static str,
+    scope_id: &'static str,
+    state: &'static str,
+    reason: &'static str,
+    actor_principal: &'static str,
+    source: &'static str,
+    created_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct QaDaemonRuntimeHealth {
@@ -629,6 +651,7 @@ impl QaDaemonSandbox {
             let config_path = state_root_path.join("palyra.toml");
             fs::write(config_path.as_path(), isolated_daemon_config(manifest))
                 .context("failed to write isolated QA daemon config")?;
+            seed_explicit_approval_posture(manifest, state_root_path.as_path())?;
             let vault_dir = state_root_path.join("vault");
             fs::create_dir_all(vault_dir.as_path())
                 .context("failed to create isolated QA vault directory")?;
@@ -1180,6 +1203,44 @@ fn isolated_daemon_config(manifest: &QaScenarioManifest) -> &'static str {
     } else {
         QA_BASE_DAEMON_CONFIG
     }
+}
+
+/// Converts a manifest's explicit approval steps into an isolated safe-mode
+/// posture without changing the production out-of-box default.
+fn seed_explicit_approval_posture(manifest: &QaScenarioManifest, state_root: &Path) -> Result<()> {
+    if manifest.steps.iter().all(|step| step.action != QaScenarioStepAction::ApprovalDecision) {
+        return Ok(());
+    }
+
+    let overrides = manifest
+        .requires
+        .tools
+        .iter()
+        .map(|tool_name| QaToolPostureOverride {
+            tool_name,
+            scope_kind: "global",
+            scope_id: "global",
+            state: "ask_each_time",
+            reason: "QA scenario declares an explicit approval decision",
+            actor_principal: QA_RUNNER_PRINCIPAL,
+            source: "qa_runner_explicit_approval",
+            // Fixed timestamps keep fixture-backed QA execution deterministic.
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        })
+        .collect();
+    let document = QaToolPostureRegistryDocument {
+        schema_version: QA_TOOL_POSTURE_REGISTRY_SCHEMA_VERSION,
+        overrides,
+    };
+    let registry_root = state_root.join(QA_TOOL_POSTURE_DIRECTORY);
+    fs::create_dir_all(registry_root.as_path())
+        .context("failed to create isolated QA tool posture directory")?;
+    let registry_path = registry_root.join(QA_TOOL_POSTURE_REGISTRY_FILE);
+    let mut payload =
+        serde_json::to_vec_pretty(&document).context("failed to serialize isolated QA posture")?;
+    payload.push(b'\n');
+    fs::write(registry_path, payload).context("failed to seed isolated QA approval posture")
 }
 
 fn copy_workspace_fixture(source: &Path, destination: &Path) -> Result<()> {
