@@ -5,13 +5,16 @@
 
 use std::{
     collections::HashMap,
+    io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context as TaskContext, Poll},
 };
 
 use agent_client_protocol::{self as acp, Client as _};
 use anyhow::{Context, Result};
-use futures::io::AllowStdIo;
+use futures::io::{AsyncRead, AsyncWrite};
 use palyra_control_plane::ControlPlaneClient;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
@@ -36,6 +39,49 @@ const PERMISSION_ALLOW_ONCE: &str = "allow-once";
 const PERMISSION_ALLOW_ALWAYS: &str = "allow-always";
 const PERMISSION_REJECT_ONCE: &str = "reject-once";
 const PERMISSION_REJECT_ALWAYS: &str = "reject-always";
+
+struct TokioAsyncReadCompat<R>(R);
+
+impl<R> AsyncRead for TokioAsyncReadCompat<R>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut read_buffer = tokio::io::ReadBuf::new(buffer);
+        match Pin::new(&mut self.0).poll_read(context, &mut read_buffer) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buffer.filled().len())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct TokioAsyncWriteCompat<W>(W);
+
+impl<W> AsyncWrite for TokioAsyncWriteCompat<W>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(context)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(context)
+    }
+}
 
 /// Resolved link between an ACP session id and its gateway session identity.
 #[derive(Debug, Clone)]
@@ -952,11 +998,10 @@ pub fn run_agent_acp_bridge(
                     default_cwd,
                 );
 
-                // Blocking stdio wrapped as async is acceptable: this runtime
-                // exists solely for the bridge, so a stalled read cannot
-                // starve unrelated tasks.
-                let outgoing = AllowStdIo::new(std::io::stdout());
-                let incoming = AllowStdIo::new(std::io::stdin());
+                // Tokio's stdio workers keep the local ACP executor available
+                // while it waits for the client's next JSON-RPC line.
+                let outgoing = TokioAsyncWriteCompat(tokio::io::stdout());
+                let incoming = TokioAsyncReadCompat(tokio::io::stdin());
                 let (conn, handle_io) =
                     acp::AgentSideConnection::new(bridge, outgoing, incoming, |fut| {
                         tokio::task::spawn_local(fut);

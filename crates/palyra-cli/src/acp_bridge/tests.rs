@@ -5,15 +5,17 @@ use super::{
     acp, build_tool_permission_request, format_acp_verification_summary,
     map_list_sessions_response, map_permission_outcome, AcpSessionDefaults, ActiveRunGuard,
     AgentConnection, BridgeState, ClientBridgeRequest, PalyraAcpAgent, SessionBinding,
-    PERMISSION_ALLOW_ALWAYS, PERMISSION_ALLOW_ONCE, PERMISSION_REJECT_ALWAYS,
-    PERMISSION_REJECT_ONCE,
+    TokioAsyncReadCompat, TokioAsyncWriteCompat, PERMISSION_ALLOW_ALWAYS, PERMISSION_ALLOW_ONCE,
+    PERMISSION_REJECT_ALWAYS, PERMISSION_REJECT_ONCE,
 };
 use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 use serde_json::json;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 fn test_agent() -> PalyraAcpAgent {
@@ -114,6 +116,56 @@ async fn initialize_negotiates_requested_protocol_version() {
     assert_eq!(response.protocol_version, requested_version);
     assert!(response.agent_capabilities.load_session);
     assert!(response.agent_capabilities.session_capabilities.list.is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn initialize_response_does_not_wait_for_input_eof() {
+    let local_set = tokio::task::LocalSet::new();
+    local_set
+        .run_until(async {
+            let (mut client_input, agent_input) = tokio::io::duplex(4_096);
+            let (agent_output, client_output) = tokio::io::duplex(4_096);
+            let (connection, handle_io) = acp::AgentSideConnection::new(
+                test_agent(),
+                TokioAsyncWriteCompat(agent_output),
+                TokioAsyncReadCompat(agent_input),
+                |future| {
+                    tokio::task::spawn_local(future);
+                },
+            );
+            let io_task = tokio::task::spawn_local(handle_io);
+
+            client_input
+                .write_all(
+                    br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}
+"#,
+                )
+                .await
+                .expect("initialize request should write");
+            let mut response = String::new();
+            let mut reader = BufReader::new(client_output);
+            let bytes_read =
+                tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut response))
+                    .await
+                    .expect("initialize response should arrive while client input remains open")
+                    .expect("initialize response should read");
+            assert!(bytes_read > 0, "initialize response should not be EOF");
+            let response: serde_json::Value =
+                serde_json::from_str(response.as_str()).expect("response should be JSON-RPC");
+            assert_eq!(response.pointer("/id").and_then(serde_json::Value::as_u64), Some(0));
+            assert_eq!(
+                response.pointer("/result/protocolVersion").and_then(serde_json::Value::as_u64),
+                Some(1)
+            );
+
+            drop(client_input);
+            io_task
+                .await
+                .expect("ACP I/O task should join")
+                .expect("ACP I/O should close cleanly");
+            drop(connection);
+        })
+        .await;
 }
 
 #[test]
