@@ -362,6 +362,7 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
         || lower.contains("navigation_failed")
         || lower.contains("network_request_failed")
         || lower.contains("browser_runtime_failed")
+        || lower.contains("ssh tunnel exited with status")
     {
         return CliExitCode::Connectivity;
     }
@@ -591,6 +592,10 @@ mod tests {
             classify_error(&anyhow!(
                 "browser.tabs.open failed: navigation_failed: navigation returned HTTP 403"
             )),
+            CliExitCode::Connectivity
+        );
+        assert_eq!(
+            classify_error(&anyhow!("ssh tunnel exited with status 255")),
             CliExitCode::Connectivity
         );
     }
