@@ -1225,15 +1225,28 @@ fn parse_schedule_payload(
             Ok(ParsedSchedule::Every { interval_ms })
         }
         CronScheduleType::At => {
-            let at_unix_ms = payload
-                .get("at_unix_ms")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| Status::internal("at schedule payload missing at_unix_ms"))?;
             let timestamp_rfc3339 = payload
                 .get("timestamp_rfc3339")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
+            let at_unix_ms = match payload.get("at_unix_ms").and_then(Value::as_i64) {
+                Some(value) => value,
+                None if !timestamp_rfc3339.is_empty() => {
+                    DateTime::parse_from_rfc3339(timestamp_rfc3339.as_str())
+                        .map_err(|error| {
+                            Status::internal(format!(
+                                "invalid persisted at schedule timestamp: {error}"
+                            ))
+                        })?
+                        .timestamp_millis()
+                }
+                None => {
+                    return Err(Status::internal(
+                        "at schedule payload missing at_unix_ms and timestamp_rfc3339",
+                    ));
+                }
+            };
             Ok(ParsedSchedule::At { at_unix_ms, timestamp_rfc3339 })
         }
     }
@@ -4897,13 +4910,13 @@ mod tests {
         decide_concurrency_policy, deferred_one_shot_should_be_disabled,
         effective_cron_session_key, effective_cron_session_label,
         host_only_routine_terminal_projection, load_periodic_reaudit_skills_index,
-        max_runs_for_job, merged_parameter_delta_json, normalize_schedule, now_unix_ms_or_fallback,
-        panicked_cron_run_finalize_request, parse_skill_reaudit_interval, periodic_reaudit_targets,
-        reserved_cron_run_slot_count, routine_approval_subject_id, routine_gate_error_kind,
-        routine_parameter_delta_json, routines_automation_enabled,
-        scheduled_routine_approval_matches, scheduled_routine_requires_first_run_approval,
-        scheduled_routine_run_metadata_upsert, scheduler_attempt_failure,
-        scheduler_retry_backoff_delay_ms, scheduler_sleep_duration,
+        max_runs_for_job, merged_parameter_delta_json, next_run_at_for_enabled_state,
+        normalize_schedule, now_unix_ms_or_fallback, panicked_cron_run_finalize_request,
+        parse_skill_reaudit_interval, periodic_reaudit_targets, reserved_cron_run_slot_count,
+        routine_approval_subject_id, routine_gate_error_kind, routine_parameter_delta_json,
+        routines_automation_enabled, scheduled_routine_approval_matches,
+        scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
+        scheduler_attempt_failure, scheduler_retry_backoff_delay_ms, scheduler_sleep_duration,
         should_disable_exhausted_scheduled_one_shot,
         should_pause_recurring_cron_after_policy_denied, should_repair_stale_cron_run,
         visible_cron_job_enabled, ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction,
@@ -6087,6 +6100,19 @@ mod tests {
         let error = normalize_schedule(Some(schedule), 1_730_000_000_000, CronTimezoneMode::Utc)
             .expect_err("past at schedule must be rejected");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn enabling_legacy_at_schedule_recovers_timestamp_only_payload() {
+        let mut job = sample_every_job("legacy-manual-objective", None, CronMisfirePolicy::Skip);
+        job.schedule_type = CronScheduleType::At;
+        job.schedule_payload_json =
+            json!({ "timestamp_rfc3339": "2100-01-01T00:00:00Z" }).to_string();
+
+        let next_run = next_run_at_for_enabled_state(&job, true, 1_730_000_000_000)
+            .expect("legacy timestamp-only payload should remain resumable");
+
+        assert_eq!(next_run, Some(4_102_444_800_000));
     }
 
     #[test]

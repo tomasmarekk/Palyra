@@ -66,6 +66,11 @@ pub const MIN_AUTO_ENABLE_EVERY_INTERVAL_MS: u64 = 60_000;
 /// Far-future timestamp used as a never-firing `at` schedule placeholder for routines that are
 /// triggered manually or by hooks instead of by the cron clock.
 pub const SHADOW_AT_TIMESTAMP_RFC3339: &str = "2100-01-01T00:00:00Z";
+/// Millisecond representation of [`SHADOW_AT_TIMESTAMP_RFC3339`].
+///
+/// Persisted cron payloads consume this normalized field when an objective is
+/// resumed, so the shadow schedule must carry both representations.
+pub const SHADOW_AT_UNIX_MS: i64 = 4_102_444_800_000;
 /// Schema identifier embedded in [`RoutineExportBundle`] payloads.
 pub const ROUTINE_EXPORT_SCHEMA_ID: &str = "palyra.routine.export.v1";
 /// Schema version embedded in [`RoutineExportBundle`] payloads.
@@ -1895,7 +1900,11 @@ pub fn resolve_routines_root(state_root: Option<&Path>) -> Result<PathBuf, Routi
 /// never-firing shadow schedule for manually triggered routines.
 #[must_use]
 pub fn shadow_manual_schedule_payload_json() -> String {
-    json!({ "timestamp_rfc3339": SHADOW_AT_TIMESTAMP_RFC3339 }).to_string()
+    json!({
+        "at_unix_ms": SHADOW_AT_UNIX_MS,
+        "timestamp_rfc3339": SHADOW_AT_TIMESTAMP_RFC3339,
+    })
+    .to_string()
 }
 
 /// Validates a raw file-watch trigger payload and takes the initial observation.
@@ -4031,7 +4040,13 @@ mod tests {
         let payload =
             serde_json::from_str::<serde_json::Value>(&shadow_manual_schedule_payload_json())
                 .expect("payload should parse");
-        assert_eq!(payload, json!({ "timestamp_rfc3339": "2100-01-01T00:00:00Z" }));
+        assert_eq!(
+            payload,
+            json!({
+                "at_unix_ms": 4_102_444_800_000_i64,
+                "timestamp_rfc3339": "2100-01-01T00:00:00Z",
+            })
+        );
         let _ = CronScheduleType::At;
     }
 
