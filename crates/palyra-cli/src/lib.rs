@@ -9827,11 +9827,13 @@ fn resolve_daemon_journal_db_path(db_path_override: Option<String>) -> Result<Pa
                 .map(|value| value.trim().to_owned())
             {
                 if !journal_db_path.is_empty() {
+                    let configured_path_is_absolute =
+                        Path::new(journal_db_path.as_str()).is_absolute();
                     let resolved = resolve_config_relative_path(
                         config_path.as_path(),
                         journal_db_path.as_str(),
                     );
-                    if resolved.is_file() {
+                    if configured_path_is_absolute {
                         return Ok(resolved);
                     }
                     if let Some(runtime_journal) =
@@ -9847,6 +9849,12 @@ fn resolve_daemon_journal_db_path(db_path_override: Option<String>) -> Result<Pa
 
     let installed_journal_path = discover_installed_journal_db_path()?;
     if let Some(context) = app::current_root_context() {
+        if !context.state_root_explicit() {
+            let runtime_journal = desktop_runtime_journal_db_path(context.state_root());
+            if runtime_journal.is_file() {
+                return Ok(runtime_journal);
+            }
+        }
         return Ok(select_preferred_journal_db_path(
             context.state_root(),
             context.state_root().join(DEFAULT_JOURNAL_DB_PATH),
@@ -9901,6 +9909,9 @@ fn installed_journal_path_belongs_to_state_root(
 
 fn discover_desktop_runtime_journal_db_path(config_path: &Path) -> Option<PathBuf> {
     if let Some(context) = app::current_root_context() {
+        if context.state_root_explicit() {
+            return None;
+        }
         let candidate = desktop_runtime_journal_db_path(context.state_root());
         if candidate.is_file() {
             return Some(candidate);
@@ -16721,32 +16732,70 @@ mod journal_path_tests {
     }
 
     #[test]
-    fn relative_configured_journal_path_prefers_existing_desktop_runtime_journal() -> Result<()> {
+    fn implicit_state_root_prefers_existing_desktop_runtime_journal_over_outer_copy() -> Result<()>
+    {
         let _guard = crate::app::test_env_lock_for_tests().lock().expect("env lock");
         crate::app::clear_root_context_for_tests();
         let tempdir = tempdir()?;
         let state_root = tempdir.path().join("state-root");
         let config_path = state_root.join("config").join("palyra.toml");
+        let outer_journal = state_root.join(DEFAULT_JOURNAL_DB_PATH);
         let runtime_journal =
             state_root.join("desktop-control-center").join("runtime").join(DEFAULT_JOURNAL_DB_PATH);
         fs::create_dir_all(config_path.parent().expect("config parent should exist"))?;
+        fs::create_dir_all(outer_journal.parent().expect("outer journal parent should exist"))?;
         fs::create_dir_all(runtime_journal.parent().expect("journal parent should exist"))?;
         fs::write(
             config_path.as_path(),
             "[storage]\njournal_db_path = \"data/journal.sqlite3\"\n",
         )?;
+        fs::write(outer_journal.as_path(), b"stale outer journal")?;
         fs::write(runtime_journal.as_path(), [])?;
         let _palyra_config = ScopedEnvVar::set("PALYRA_CONFIG", config_path.as_path());
+        let _state_root = ScopedEnvVar::set("PALYRA_STATE_ROOT", state_root.as_path());
         let _journal_env = ScopedEnvVar::unset("PALYRA_JOURNAL_DB_PATH");
 
-        crate::app::install_root_context(crate::args::RootOptions {
-            state_root: Some(state_root.display().to_string()),
-            ..crate::args::RootOptions::default()
-        })?;
+        let context = crate::app::install_root_context(crate::args::RootOptions::default())?;
+        assert!(!context.state_root_explicit());
 
         let resolved = resolve_daemon_journal_db_path(None)?;
 
         assert_eq!(resolved, runtime_journal);
+        crate::app::clear_root_context_for_tests();
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_state_root_keeps_existing_outer_journal_authoritative() -> Result<()> {
+        let _guard = crate::app::test_env_lock_for_tests().lock().expect("env lock");
+        crate::app::clear_root_context_for_tests();
+        let tempdir = tempdir()?;
+        let state_root = tempdir.path().join("state-root");
+        let config_path = state_root.join("config").join("palyra.toml");
+        let outer_journal = state_root.join(DEFAULT_JOURNAL_DB_PATH);
+        let runtime_journal =
+            state_root.join("desktop-control-center").join("runtime").join(DEFAULT_JOURNAL_DB_PATH);
+        fs::create_dir_all(config_path.parent().expect("config parent should exist"))?;
+        fs::create_dir_all(outer_journal.parent().expect("outer journal parent should exist"))?;
+        fs::create_dir_all(runtime_journal.parent().expect("runtime journal parent should exist"))?;
+        fs::write(
+            config_path.as_path(),
+            "[storage]\njournal_db_path = \"data/journal.sqlite3\"\n",
+        )?;
+        fs::write(outer_journal.as_path(), [])?;
+        fs::write(runtime_journal.as_path(), [])?;
+        let _palyra_config = ScopedEnvVar::set("PALYRA_CONFIG", config_path.as_path());
+        let _journal_env = ScopedEnvVar::unset("PALYRA_JOURNAL_DB_PATH");
+
+        let context = crate::app::install_root_context(crate::args::RootOptions {
+            state_root: Some(state_root.display().to_string()),
+            ..crate::args::RootOptions::default()
+        })?;
+        assert!(context.state_root_explicit());
+
+        let resolved = resolve_daemon_journal_db_path(None)?;
+
+        assert_eq!(resolved, outer_journal);
         crate::app::clear_root_context_for_tests();
         Ok(())
     }
