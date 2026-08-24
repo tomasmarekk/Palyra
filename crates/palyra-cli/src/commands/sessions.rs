@@ -2,8 +2,9 @@
 //! retry/branch, transcript search/export, compaction, checkpoints, and background tasks.
 //!
 //! Mixes the gateway gRPC operator runtime (session resolution, runs) with the admin
-//! console HTTP API (queue, compaction, checkpoints, background tasks). Every output
-//! mode redacts reusable identifiers and user-routing labels.
+//! console HTTP API (queue, compaction, checkpoints, background tasks). Broad listing
+//! surfaces redact reusable identifiers and user-routing labels; the explicit resolver
+//! returns the selectors required by subsequent commands.
 
 use crate::*;
 use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
@@ -293,7 +294,7 @@ pub(crate) async fn run_sessions_async(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
-                        "session": session_to_json(&session),
+                        "session": resolved_session_to_json(&session),
                         "created": response.created,
                         "reset_applied": response.reset_applied,
                     }))?
@@ -301,11 +302,12 @@ pub(crate) async fn run_sessions_async(
             } else {
                 output::print_text_line(
                     format!(
-                        "sessions.resolve title={} source={} preview={} key={} label={} created={} reset_applied={} archived_at_unix_ms={}",
+                        "sessions.resolve session_id={} title={} source={} preview={} key={} label={} created={} reset_applied={} archived_at_unix_ms={}",
+                        operational_canonical_id_text(&session.session_id),
                         session_title_for_output(&session),
                         empty_to_none(session.title_source.as_str()),
                         empty_to_none(session.preview.as_str()),
-                        redacted_text_or_none(!session.session_key.trim().is_empty()),
+                        empty_to_none(session.session_key.as_str()),
                         redacted_text_or_none(!session.session_label.trim().is_empty()),
                         response.created,
                         response.reset_applied,
@@ -1238,6 +1240,38 @@ fn session_to_json(session: &gateway_v1::SessionSummary) -> Value {
     })
 }
 
+/// Builds the explicit resolver payload with reusable ID/key selectors.
+///
+/// Labels, lineage, and run identifiers remain redacted; only the two values
+/// accepted by subsequent `sessions` commands are restored.
+fn resolved_session_to_json(session: &gateway_v1::SessionSummary) -> Value {
+    let mut payload = session_to_json(session);
+    let Some(fields) = payload.as_object_mut() else {
+        return payload;
+    };
+    fields
+        .insert("session_id".to_owned(), operational_canonical_id_json_value(&session.session_id));
+    fields.insert("session_key".to_owned(), empty_to_json_or_null(session.session_key.as_str()));
+    payload
+}
+
+fn operational_canonical_id_json_value(value: &Option<common_v1::CanonicalId>) -> Value {
+    value
+        .as_ref()
+        .map(|id| id.ulid.trim())
+        .filter(|ulid| !ulid.is_empty())
+        .map_or(Value::Null, |ulid| Value::String(ulid.to_owned()))
+}
+
+fn operational_canonical_id_text(value: &Option<common_v1::CanonicalId>) -> String {
+    value
+        .as_ref()
+        .map(|id| id.ulid.trim())
+        .filter(|ulid| !ulid.is_empty())
+        .unwrap_or("none")
+        .to_owned()
+}
+
 fn redacted_canonical_id_json_value(value: &Option<common_v1::CanonicalId>) -> Value {
     redacted_identifier_json_value(value.as_ref().map(|id| id.ulid.as_str()))
 }
@@ -1708,7 +1742,8 @@ mod tests {
     use super::{
         build_cleanup_session_request, build_resolve_session_request,
         build_session_retry_agent_run_input, redacted_canonical_id_text,
-        redacted_cleanup_warning_json, redacted_cleanup_warning_text, session_to_json,
+        redacted_cleanup_warning_json, redacted_cleanup_warning_text, resolved_session_to_json,
+        session_to_json,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
@@ -1808,6 +1843,37 @@ mod tests {
             payload.get("session_label").and_then(serde_json::Value::as_str),
             Some(REDACTED)
         );
+    }
+
+    #[test]
+    fn resolved_session_json_returns_reusable_selectors_only() {
+        let session = gateway_v1::SessionSummary {
+            session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            }),
+            session_key: "onboarding-smoke".to_owned(),
+            session_label: "Sensitive user label".to_owned(),
+            last_run_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            }),
+            ..Default::default()
+        };
+
+        let payload = resolved_session_to_json(&session);
+
+        assert_eq!(
+            payload.get("session_id").and_then(serde_json::Value::as_str),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        assert_eq!(
+            payload.get("session_key").and_then(serde_json::Value::as_str),
+            Some("onboarding-smoke")
+        );
+        assert_eq!(
+            payload.get("session_label").and_then(serde_json::Value::as_str),
+            Some(REDACTED)
+        );
+        assert_eq!(payload.get("last_run_id").and_then(serde_json::Value::as_str), Some(REDACTED));
     }
 
     #[test]

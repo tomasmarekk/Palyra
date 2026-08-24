@@ -1260,14 +1260,20 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
         assert_json_success(sessions_resolve_output, "sessions resolve")?;
     assert_eq!(sessions_resolve_payload.get("created").and_then(Value::as_bool), Some(true));
     assert_eq!(sessions_resolve_payload.get("reset_applied").and_then(Value::as_bool), Some(false));
-    let gateway_session_id = resolve_gateway_session_id(
-        gateway_grpc_url.as_str(),
-        ADMIN_TOKEN,
-        "admin:local",
-        DEVICE_ID,
-        "cli",
-        "workflow:browser",
-    )?;
+    let gateway_session_id = sessions_resolve_payload
+        .pointer("/session/session_id")
+        .and_then(Value::as_str)
+        .context("sessions resolve should return a reusable session_id")?
+        .to_owned();
+    assert_eq!(
+        sessions_resolve_payload.pointer("/session/session_key").and_then(Value::as_str),
+        Some("workflow:browser"),
+        "sessions resolve should return the reusable lookup key"
+    );
+    assert!(
+        Ulid::from_string(gateway_session_id.as_str()).is_ok(),
+        "sessions resolve should return a canonical session ULID"
+    );
 
     let sessions_before_show = assert_json_success(
         run_cli_json(&workdir, &["sessions", "list", "--json"], &browser_cli_env)?,
