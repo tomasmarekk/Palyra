@@ -14912,6 +14912,10 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn host_access_process_command_uses_resolved_workspace_command_path_with_cwd() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
         let workspace = unique_temp_dir("workspace-relative-command-spawn");
         let executable = workspace.join("repo").join(".venv").join("Scripts").join("python.exe");
         fs::create_dir_all(executable.parent().expect("executable should have parent"))
