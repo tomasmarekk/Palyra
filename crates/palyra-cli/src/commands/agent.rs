@@ -167,30 +167,19 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
     }
 }
 
-/// Rejects `agent run` flag combinations that would bypass or deadlock tool approval.
+/// Rejects contradictory `agent run` approval flags.
 ///
 /// # Errors
-/// Returns an error when `--allow-sensitive-tools` contradicts the requested
-/// approval mode, or when `--approval-mode prompt` competes with
-/// `--prompt-stdin` for stdin.
+/// Returns an error when sensitive tools are exposed while every approval is
+/// configured to be denied.
 pub(crate) fn ensure_agent_run_approval_flags(
     allow_sensitive_tools: bool,
     approval_mode: AgentApprovalModeArg,
-    prompt_stdin: bool,
+    _prompt_stdin: bool,
 ) -> Result<()> {
     if allow_sensitive_tools && approval_mode == AgentApprovalModeArg::Deny {
         anyhow::bail!(
-            "--allow-sensitive-tools cannot be combined with --approval-mode deny; remove --allow-sensitive-tools to deny sensitive tool requests, or use --approval-mode allow-once after reviewing the requested tool risk"
-        );
-    }
-    if allow_sensitive_tools && approval_mode == AgentApprovalModeArg::Prompt {
-        anyhow::bail!(
-            "--allow-sensitive-tools cannot be combined with --approval-mode prompt because it auto-approves sensitive tool requests before an interactive prompt can be shown; remove --allow-sensitive-tools for manual approval prompts, or use --approval-mode allow-once after reviewing the requested tool risk"
-        );
-    }
-    if prompt_stdin && approval_mode == AgentApprovalModeArg::Prompt {
-        anyhow::bail!(
-            "--approval-mode prompt cannot be combined with --prompt-stdin because stdin is consumed by the task prompt and cannot also receive tool approval decisions; use --approval-mode deny for no-tools stdin smoke runs, use --approval-mode allow-once for reviewed unattended CLI runs, pass the task with --prompt from an interactive terminal, or use `palyra agent interactive`"
+            "--allow-sensitive-tools cannot be combined with --approval-mode deny; remove --allow-sensitive-tools to deny sensitive tool requests, use --approval-mode prompt for explicit safe-mode decisions, or use --approval-mode allow-run for a reviewed unattended run"
         );
     }
     Ok(())
@@ -557,10 +546,6 @@ async fn read_next_interactive_approval_line(
         .map_err(|error| anyhow!("failed to read interactive approval from stdin: {error}"))
 }
 
-fn interactive_approval_line_is_approved(line: &str) -> bool {
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-}
-
 fn interactive_interrupt_message(cancel_requested: bool, queued_prompt_count: usize) -> String {
     format!(
         "agent.interactive.interrupt run_id={} cancel_requested={} queued_prompt_count={} reason=interactive_interrupt",
@@ -704,6 +689,8 @@ fn deny_tool_approval_due_to_pending_interactive_input() -> ToolApprovalDecision
     ToolApprovalDecision {
         approved: false,
         reason: "denied_due_to_pending_interactive_input".to_owned(),
+        decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+        decision_scope_ttl_ms: 0,
     }
 }
 
@@ -814,8 +801,8 @@ async fn execute_interactive_agent_stream(
                         approval,
                         decision.approved,
                         decision.reason,
-                        common_v1::ApprovalDecisionScope::Once as i32,
-                        0,
+                        decision.decision_scope,
+                        decision.decision_scope_ttl_ms,
                     )?;
                 }
                 if reached_terminal_status {
@@ -859,7 +846,7 @@ async fn prompt_tool_approval_decision_from_interactive_input(
 ) -> Result<ToolApprovalDecision> {
     match *mode {
         AgentApprovalMode::Prompt => {}
-        AgentApprovalMode::Deny | AgentApprovalMode::AllowOnce => {
+        AgentApprovalMode::Deny | AgentApprovalMode::AllowOnce | AgentApprovalMode::AllowRun => {
             return prompt_tool_approval_decision_with_mode_state(approval, mode);
         }
     }
@@ -869,6 +856,8 @@ async fn prompt_tool_approval_decision_from_interactive_input(
         return Ok(ToolApprovalDecision {
             approved: false,
             reason: "approval_required_non_interactive_cli".to_owned(),
+            decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+            decision_scope_ttl_ms: 0,
         });
     }
 
@@ -876,15 +865,7 @@ async fn prompt_tool_approval_decision_from_interactive_input(
     eprint!("{}", tool_approval_terminal_prompt_text());
     std::io::stderr().flush().context("stderr flush failed")?;
     let input = read_next_interactive_approval_line(input_rx).await?.unwrap_or_default();
-    let approved = interactive_approval_line_is_approved(input.as_str());
-    Ok(ToolApprovalDecision {
-        approved,
-        reason: if approved {
-            "approved_by_cli_terminal".to_owned()
-        } else {
-            "denied_by_cli_terminal".to_owned()
-        },
-    })
+    Ok(tool_approval_decision_from_terminal_input(input.as_str()))
 }
 
 fn redacted_identifier_presence(value: Option<&common_v1::CanonicalId>) -> &'static str {
@@ -943,13 +924,14 @@ mod tests {
     use super::{
         cli_launch_parameter_delta_json_for_cwd,
         deny_tool_approval_due_to_pending_interactive_input, drain_ready_interactive_prompts,
-        ensure_agent_run_approval_flags, interactive_approval_line_is_approved,
-        interactive_interrupt_message, interactive_session_started_message,
-        normalize_interactive_prompt_line, normalize_reasoning_effort_arg,
-        normalize_service_tier_arg, read_next_interactive_approval_line,
+        ensure_agent_run_approval_flags, interactive_interrupt_message,
+        interactive_session_started_message, normalize_interactive_prompt_line,
+        normalize_reasoning_effort_arg, normalize_service_tier_arg,
+        read_next_interactive_approval_line,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
+    use crate::tool_approval_decision_from_terminal_input;
     use serde_json::Value;
     use std::{
         ffi::OsString,
@@ -1042,7 +1024,7 @@ mod tests {
             .expect("approval input should be readable")
             .expect("approval input should remain open");
 
-        assert!(!interactive_approval_line_is_approved(input.as_str()));
+        assert!(!tool_approval_decision_from_terminal_input(input.as_str()).approved);
         assert_eq!(rx.try_recv(), Ok(Ok("yes".to_owned())));
     }
 
@@ -1067,13 +1049,9 @@ mod tests {
     }
 
     #[test]
-    fn allow_sensitive_tools_conflicts_with_approval_prompt() {
-        let error = ensure_agent_run_approval_flags(true, AgentApprovalModeArg::Prompt, false)
-            .expect_err("prompt approval mode must not be silently bypassed by auto-approval");
-
-        assert!(error.to_string().contains("--allow-sensitive-tools"), "{error}");
-        assert!(error.to_string().contains("--approval-mode prompt"), "{error}");
-        assert!(error.to_string().contains("manual approval prompts"), "{error}");
+    fn allow_sensitive_tools_can_pair_with_safe_mode_prompt() {
+        ensure_agent_run_approval_flags(true, AgentApprovalModeArg::Prompt, false)
+            .expect("sensitive tool exposure must remain compatible with explicit safe mode");
     }
 
     #[test]
@@ -1083,14 +1061,9 @@ mod tests {
     }
 
     #[test]
-    fn prompt_approval_mode_rejects_prompt_stdin() {
-        let error = ensure_agent_run_approval_flags(false, AgentApprovalModeArg::Prompt, true)
-            .expect_err("prompt approval mode needs stdin for approval decisions");
-
-        assert!(error.to_string().contains("--approval-mode prompt"), "{error}");
-        assert!(error.to_string().contains("--prompt-stdin"), "{error}");
-        assert!(error.to_string().contains("--approval-mode deny"), "{error}");
-        assert!(error.to_string().contains("palyra agent interactive"), "{error}");
+    fn prompt_stdin_does_not_fail_before_an_approval_is_requested() {
+        ensure_agent_run_approval_flags(false, AgentApprovalModeArg::Prompt, true)
+            .expect("a default run without approval gates must accept prompt stdin");
     }
 
     #[test]

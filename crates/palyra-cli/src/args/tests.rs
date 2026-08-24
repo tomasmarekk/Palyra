@@ -1429,6 +1429,24 @@ fn parse_agent_run_with_approval_mode_allow_once() {
 }
 
 #[test]
+fn parse_agent_run_with_approval_mode_allow_run() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "agent",
+        "run",
+        "--prompt",
+        "inspect",
+        "--approval-mode",
+        "allow-run",
+    ]);
+    let Command::Agent { command: AgentCommand::Run { approval_mode, .. } } = parsed.command else {
+        panic!("agent run command should parse");
+    };
+
+    assert_eq!(approval_mode, AgentApprovalModeArg::AllowRun);
+}
+
+#[test]
 fn parse_agent_run_with_reasoning_effort_alias() {
     let parsed = Cli::parse_from([
         "palyra",

@@ -14282,7 +14282,7 @@ async fn tool_program_runtime_executes_echo_and_emits_child_attestation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tool_program_python_rpc_script_denies_workspace_reads_without_nested_approval() {
+async fn tool_program_python_rpc_script_runs_workspace_reads_without_default_approval() {
     let mut tool_call = default_test_tool_call_config();
     tool_call.allowed_tools = vec![
         super::WORKSPACE_READ_FILE_TOOL_NAME.to_owned(),
@@ -14374,22 +14374,14 @@ async fn tool_program_python_rpc_script_denies_workspace_reads_without_nested_ap
     )
     .await;
 
-    assert!(!outcome.success, "approval-gated workspace reads must fail closed");
+    assert!(outcome.success, "default workspace reads should succeed: {}", outcome.error);
     let output = parse_tool_output_json(&outcome);
     assert_eq!(output.get("program_kind").and_then(Value::as_str), Some("python_rpc_script"));
-    assert_eq!(output.get("status").and_then(Value::as_str), Some("failed"));
-    assert_eq!(output.pointer("/steps/0/status").and_then(Value::as_str), Some("denied"));
-    assert_eq!(output.pointer("/steps/0/approval_required").and_then(Value::as_bool), Some(true));
+    assert_eq!(output.get("status").and_then(Value::as_str), Some("completed"));
+    assert_eq!(output.pointer("/steps/0/status").and_then(Value::as_str), Some("completed"));
     assert_eq!(
         output.pointer("/budget_debit/nested_approval_requests").and_then(Value::as_u64),
-        Some(1)
-    );
-    assert!(
-        output
-            .pointer("/steps/0/error")
-            .and_then(Value::as_str)
-            .is_some_and(|error| error.contains("cannot self-approve")),
-        "workspace read denial should explain the nested approval boundary: {output}"
+        Some(0)
     );
 }
 
@@ -15008,17 +15000,33 @@ async fn tool_program_runtime_denies_http_fetch_child_missing_runtime_allowlist(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tool_program_runtime_denies_sensitive_child_without_nested_approval() {
-    let state = build_test_runtime_state(false);
-    start_tool_program_test_run(&state, "session-tool-program-denied", "run-tool-program-denied")
-        .await;
+async fn tool_program_runtime_denies_child_with_explicit_approval_posture() {
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.process_runner.enabled = true;
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let session_id = "session-tool-program-denied";
+    state
+        .upsert_tool_posture_override(crate::tool_posture::ToolPostureOverrideUpsertRequest {
+            tool_name: "palyra.process.run".to_owned(),
+            scope_kind: crate::tool_posture::ToolPostureScopeKind::Session,
+            scope_id: session_id.to_owned(),
+            state: crate::tool_posture::ToolPostureState::AskEachTime,
+            reason: Some("safe mode enabled for nested rpc regression test".to_owned()),
+            actor_principal: "admin:ops".to_owned(),
+            source: "test".to_owned(),
+            expires_at_unix_ms: None,
+            now_unix_ms: super::current_unix_ms(),
+        })
+        .expect("approval posture override should be accepted");
+    start_tool_program_test_run(&state, session_id, "run-tool-program-denied").await;
     let outcome = super::execute_tool_with_runtime_dispatch(
         &state,
         super::ToolRuntimeExecutionContext {
             principal: "user:ops",
             device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             channel: Some("cli"),
-            session_id: "session-tool-program-denied",
+            session_id,
             run_id: "run-tool-program-denied",
             execution_backend: ExecutionBackendPreference::LocalSandbox,
             backend_reason_code: "backend.default.local_sandbox",
@@ -15037,11 +15045,15 @@ async fn tool_program_runtime_denies_sensitive_child_without_nested_approval() {
     )
     .await;
 
-    assert!(!outcome.success, "sensitive child should fail closed");
+    assert!(!outcome.success, "approval-gated child should fail closed");
     let output = parse_tool_output_json(&outcome);
     assert_eq!(output.get("status").and_then(Value::as_str), Some("failed"));
     assert_eq!(output.pointer("/steps/0/status").and_then(Value::as_str), Some("denied"));
-    assert_eq!(output.pointer("/steps/0/approval_required").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        output.pointer("/steps/0/approval_required").and_then(Value::as_bool),
+        Some(true),
+        "explicit approval posture should be reported: {output}"
+    );
     assert_eq!(output.pointer("/budget/child_runs_used").and_then(Value::as_u64), Some(0));
     assert_eq!(output.pointer("/budget/nested_approval_requests").and_then(Value::as_u64), Some(1));
     assert!(

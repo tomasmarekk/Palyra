@@ -5523,8 +5523,8 @@ where
                         approved: decision.approved,
                         reason: decision.reason,
                         approval_id: approval.approval_id.clone(),
-                        decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
-                        decision_scope_ttl_ms: 0,
+                        decision_scope: decision.decision_scope,
+                        decision_scope_ttl_ms: decision.decision_scope_ttl_ms,
                     },
                 )
                 .await?;
@@ -6067,6 +6067,7 @@ enum AgentApprovalMode {
     Prompt,
     Deny,
     AllowOnce,
+    AllowRun,
 }
 
 impl From<AgentApprovalModeArg> for AgentApprovalMode {
@@ -6075,6 +6076,7 @@ impl From<AgentApprovalModeArg> for AgentApprovalMode {
             AgentApprovalModeArg::Prompt => Self::Prompt,
             AgentApprovalModeArg::Deny => Self::Deny,
             AgentApprovalModeArg::AllowOnce => Self::AllowOnce,
+            AgentApprovalModeArg::AllowRun => Self::AllowRun,
         }
     }
 }
@@ -6260,6 +6262,7 @@ fn agent_approval_mode_cli_value(mode: AgentApprovalMode) -> &'static str {
         AgentApprovalMode::Prompt => "prompt",
         AgentApprovalMode::Deny => "deny",
         AgentApprovalMode::AllowOnce => "allow-once",
+        AgentApprovalMode::AllowRun => "allow-run",
     }
 }
 
@@ -6458,9 +6461,11 @@ fn session_summary_reference(
 struct ToolApprovalDecision {
     approved: bool,
     reason: String,
+    decision_scope: i32,
+    decision_scope_ttl_ms: i64,
 }
 
-const NONINTERACTIVE_APPROVAL_HINT: &str = "noninteractive CLI cannot prompt for tool requests; rerun in an interactive terminal, use --approval-mode allow-once to approve the next request only, or use --allow-sensitive-tools only after reviewing the requested tool risk";
+const NONINTERACTIVE_APPROVAL_HINT: &str = "noninteractive CLI cannot prompt for an explicit safe-mode approval; rerun in an interactive terminal, use --approval-mode allow-once for one reviewed request, or use --approval-mode allow-run for the reviewed current run";
 const PROCESS_RUN_TOOL_NAME: &str = "palyra.process.run";
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 
@@ -6477,6 +6482,8 @@ fn prompt_tool_approval_decision(
         AgentApprovalMode::Deny => Ok(ToolApprovalDecision {
             approved: false,
             reason: "denied_by_cli_approval_mode_deny".to_owned(),
+            decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+            decision_scope_ttl_ms: 0,
         }),
         AgentApprovalMode::AllowOnce => {
             if let Some(reason) = allow_once_manual_safety_stop_reason(approval) {
@@ -6485,13 +6492,23 @@ fn prompt_tool_approval_decision(
                     reason: format!(
                         "denied_by_cli_manual_safety_stop_{reason}; rerun with --approval-mode prompt for an interactive decision, or use --allow-sensitive-tools only after reviewing the requested source-control mutation"
                     ),
+                    decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+                    decision_scope_ttl_ms: 0,
                 });
             }
             Ok(ToolApprovalDecision {
                 approved: true,
                 reason: "approved_by_cli_approval_mode_allow_once".to_owned(),
+                decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+                decision_scope_ttl_ms: 0,
             })
         }
+        AgentApprovalMode::AllowRun => Ok(ToolApprovalDecision {
+            approved: true,
+            reason: "approved_by_cli_approval_mode_allow_run".to_owned(),
+            decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+            decision_scope_ttl_ms: 0,
+        }),
     }
 }
 
@@ -6641,6 +6658,8 @@ fn prompt_tool_approval_decision_from_terminal(
         return Ok(ToolApprovalDecision {
             approved: false,
             reason: "approval_required_non_interactive_cli".to_owned(),
+            decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+            decision_scope_ttl_ms: 0,
         });
     }
 
@@ -6652,19 +6671,34 @@ fn prompt_tool_approval_decision_from_terminal(
         .lock()
         .read_line(&mut input)
         .context("failed to read tool approval decision from stdin")?;
-    let approved = matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-    Ok(ToolApprovalDecision {
-        approved,
-        reason: if approved {
-            "approved_by_cli_terminal".to_owned()
-        } else {
-            "denied_by_cli_terminal".to_owned()
+    Ok(tool_approval_decision_from_terminal_input(input.as_str()))
+}
+
+fn tool_approval_decision_from_terminal_input(input: &str) -> ToolApprovalDecision {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => ToolApprovalDecision {
+            approved: true,
+            reason: "approved_by_cli_terminal_once".to_owned(),
+            decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+            decision_scope_ttl_ms: 0,
         },
-    })
+        "s" | "session" | "always" => ToolApprovalDecision {
+            approved: true,
+            reason: "approved_by_cli_terminal_session".to_owned(),
+            decision_scope: common_v1::ApprovalDecisionScope::Session as i32,
+            decision_scope_ttl_ms: 0,
+        },
+        _ => ToolApprovalDecision {
+            approved: false,
+            reason: "denied_by_cli_terminal".to_owned(),
+            decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+            decision_scope_ttl_ms: 0,
+        },
+    }
 }
 
 fn tool_approval_terminal_prompt_text() -> &'static str {
-    "agent.approval.prompt allow_once [y/N default=N]: "
+    "agent.approval.prompt [y] allow once / [s] allow for session / [N] deny (default=N): "
 }
 
 fn tool_approval_prompt_line(approval: &common_v1::ToolApprovalRequest) -> String {
@@ -8505,7 +8539,8 @@ mod agent_stream_output_tests {
     fn terminal_approval_prompt_declares_deny_default() {
         let prompt = tool_approval_terminal_prompt_text();
 
-        assert!(prompt.contains("[y/N"), "{prompt}");
+        assert!(prompt.contains("[y] allow once"), "{prompt}");
+        assert!(prompt.contains("[s] allow for session"), "{prompt}");
         assert!(prompt.contains("default=N"), "{prompt}");
     }
 
@@ -8686,7 +8721,7 @@ mod agent_stream_output_tests {
 
         assert!(hint.contains("interactive"), "{hint}");
         assert!(hint.contains("--approval-mode allow-once"), "{hint}");
-        assert!(hint.contains("--allow-sensitive-tools"), "{hint}");
+        assert!(hint.contains("--approval-mode allow-run"), "{hint}");
     }
 
     fn approval_request() -> common_v1::ToolApprovalRequest {
@@ -8724,6 +8759,30 @@ mod agent_stream_output_tests {
         assert_eq!(mode, AgentApprovalMode::Deny);
         assert_eq!(first.reason, "approved_by_cli_approval_mode_allow_once");
         assert_eq!(second.reason, "denied_by_cli_approval_mode_deny");
+    }
+
+    #[test]
+    fn approval_mode_allow_run_approves_every_request_in_current_run() {
+        let mut mode = AgentApprovalMode::AllowRun;
+        let first = prompt_tool_approval_decision_with_mode_state(&approval_request(), &mut mode)
+            .expect("allow-run should approve the first request");
+        let second = prompt_tool_approval_decision_with_mode_state(&approval_request(), &mut mode)
+            .expect("allow-run should approve later requests");
+
+        assert!(first.approved);
+        assert!(second.approved);
+        assert_eq!(mode, AgentApprovalMode::AllowRun);
+        assert_eq!(first.reason, "approved_by_cli_approval_mode_allow_run");
+        assert_eq!(second.reason, "approved_by_cli_approval_mode_allow_run");
+    }
+
+    #[test]
+    fn terminal_session_choice_emits_session_scoped_approval() {
+        let decision = tool_approval_decision_from_terminal_input("session");
+
+        assert!(decision.approved);
+        assert_eq!(decision.decision_scope, common_v1::ApprovalDecisionScope::Session as i32);
+        assert_eq!(decision.reason, "approved_by_cli_terminal_session");
     }
 
     #[test]

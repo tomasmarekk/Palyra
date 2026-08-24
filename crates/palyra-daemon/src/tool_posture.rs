@@ -86,13 +86,14 @@ pub enum ToolPostureRegistryError {
 
 /// Approval posture of a tool within one scope.
 ///
-/// `AskEachTime` is the default: a tool stays usable but every call needs an
-/// interactive approval. Serialized snake_case names are persisted state.
+/// `AlwaysAllow` is the out-of-box default for an unlocked, allowlisted tool.
+/// Operators can opt into `AskEachTime` as an explicit safe-mode override.
+/// Serialized snake_case names are persisted state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolPostureState {
-    AlwaysAllow,
     #[default]
+    AlwaysAllow,
     AskEachTime,
     Disabled,
 }
@@ -1354,9 +1355,11 @@ pub fn normalize_scope_id(
     }
 }
 
-/// Derives the built-in posture for a tool when no override exists:
-/// runtime-locked tools are disabled, approval-gated tools ask each time,
-/// everything else is always allowed.
+/// Derives the built-in posture for a tool when no override exists.
+///
+/// Runtime locks remain fail-closed. Every unlocked, allowlisted tool is
+/// usable without approval until an operator applies an `AskEachTime` or
+/// `Disabled` override.
 #[must_use]
 pub fn default_tool_posture_state(
     config: &GatewayRuntimeConfigSnapshot,
@@ -1365,11 +1368,7 @@ pub fn default_tool_posture_state(
     if tool_lock_reason(config, tool_name).is_some() {
         return ToolPostureState::Disabled;
     }
-    if tool_protocol::tool_requires_approval(tool_name) {
-        ToolPostureState::AskEachTime
-    } else {
-        ToolPostureState::AlwaysAllow
-    }
+    ToolPostureState::default()
 }
 
 /// Returns the operator-facing reason a tool cannot be enabled at all under
@@ -1844,6 +1843,11 @@ mod tests {
             created_at_unix_ms: 1_000,
             updated_at_unix_ms: 1_100,
         }
+    }
+
+    #[test]
+    fn unlocked_tool_posture_defaults_to_no_approval() {
+        assert_eq!(ToolPostureState::default(), ToolPostureState::AlwaysAllow);
     }
 
     fn registry_path(temp: &TempStateRoot) -> PathBuf {

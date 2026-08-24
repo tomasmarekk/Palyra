@@ -140,52 +140,6 @@ fn parse_tool_skill_context(
     )))
 }
 
-fn tool_input_requires_proposal_approval(tool_name: &str, input_json: &[u8]) -> bool {
-    match tool_name {
-        "palyra.memory.search" => memory_search_input_requires_workspace_approval(input_json),
-        "palyra.plan.manage" => plan_manage_input_requires_mutation_approval(input_json),
-        _ => false,
-    }
-}
-
-fn plan_manage_input_requires_mutation_approval(input_json: &[u8]) -> bool {
-    let Ok(Value::Object(payload)) = serde_json::from_slice::<Value>(input_json) else {
-        return true;
-    };
-    trimmed_tool_input_string(&payload, "operation") != Some("read")
-}
-
-fn memory_search_input_requires_workspace_approval(input_json: &[u8]) -> bool {
-    let Ok(Value::Object(payload)) = serde_json::from_slice::<Value>(input_json) else {
-        return false;
-    };
-    let workspace_prefix_present = trimmed_tool_input_string(&payload, "workspace_prefix")
-        .is_some()
-        || trimmed_tool_input_string(&payload, "prefix").is_some();
-    let scope = if !payload.contains_key("scope") && workspace_prefix_present {
-        "workspace".to_owned()
-    } else {
-        trimmed_tool_input_string(&payload, "scope")
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| "all".to_owned())
-    };
-    matches!(scope.as_str(), "all" | "workspace" | "project")
-        || workspace_prefix_present
-        || tool_input_bool(&payload, "include_workspace_historical")
-        || tool_input_bool(&payload, "include_workspace_quarantined")
-}
-
-fn trimmed_tool_input_string<'a>(
-    payload: &'a serde_json::Map<String, Value>,
-    key: &str,
-) -> Option<&'a str> {
-    payload.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn tool_input_bool(payload: &serde_json::Map<String, Value>, key: &str) -> bool {
-    payload.get(key).and_then(Value::as_bool).unwrap_or(false)
-}
-
 /// Gates skill-backed plugin runs on installed-skill status and skill policy.
 ///
 /// Returns `Ok(None)` when execution may proceed, `Ok(Some(denial))` when the
@@ -638,21 +592,17 @@ pub(crate) async fn evaluate_tool_proposal_security(
     if skill_gate_decision.is_none() {
         skill_gate_decision = evaluate_backend_capability_gate(tool_name, &backend_selection);
     }
-    let input_approval_required = tool_input_requires_proposal_approval(tool_name, input_json);
-    let input_approval_can_apply =
-        skill_gate_decision.as_ref().is_none_or(|decision| decision.allowed);
-    // Ask-each-time posture forces an approval prompt unless a gate already
-    // denied the call outright; an approval-requiring backend resolution
-    // forces the prompt independently of posture. Some tools are sensitive
-    // only for particular arguments, such as workspace-backed memory search.
+    // Approval is an explicit safe-mode or backend decision. Tool arguments
+    // remain subject to validation, policy, capability, sandbox, and runtime
+    // locks, but do not silently enable interactive approval on a default
+    // installation.
     let proposal_approval_required = skill_gate_decision
         .as_ref()
         .map(|decision| {
             decision.allowed && effective_posture.effective_state == ToolPostureState::AskEachTime
         })
         .unwrap_or(effective_posture.effective_state == ToolPostureState::AskEachTime)
-        || backend_selection.resolution.approval_required
-        || (input_approval_can_apply && input_approval_required);
+        || backend_selection.resolution.approval_required;
     let approval_subject_id =
         build_tool_approval_subject_id(tool_name, skill_context.as_ref(), input_json);
     ToolProposalSecurityEvaluation {
@@ -1005,7 +955,7 @@ mod tests {
     use super::{
         annotate_tool_decision_with_backend_context, evaluate_backend_capability_gate,
         evaluate_delegation_scope_gate, execution_gate_pipeline_enabled_for_tool,
-        tool_input_requires_proposal_approval, ToolProposalBackendSelection,
+        ToolProposalBackendSelection,
     };
 
     fn networked_worker_selection() -> ToolProposalBackendSelection {
@@ -1097,68 +1047,6 @@ mod tests {
         assert!(execution_gate_pipeline_enabled_for_tool("palyra.fs.apply_patch", false));
         assert!(execution_gate_pipeline_enabled_for_tool("palyra.process.run", false));
         assert!(execution_gate_pipeline_enabled_for_tool("palyra.fs.apply_patch", true));
-    }
-
-    #[test]
-    fn memory_search_workspace_inputs_require_proposal_approval() {
-        for input in [
-            r#"{"query":"project notes"}"#,
-            r#"{"query":"project notes","scope":"all"}"#,
-            r#"{"query":"project notes","scope":"workspace"}"#,
-            r#"{"query":"project notes","scope":"project"}"#,
-            r#"{"query":"project notes","workspace_prefix":"projects/e2e"}"#,
-            r#"{"query":"project notes","scope":"session","include_workspace_quarantined":true}"#,
-        ] {
-            assert!(
-                tool_input_requires_proposal_approval("palyra.memory.search", input.as_bytes()),
-                "{input}"
-            );
-        }
-    }
-
-    #[test]
-    fn memory_search_lifecycle_inputs_do_not_require_proposal_approval() {
-        for input in [
-            r#"{"query":"rollback checklist","scope":"session"}"#,
-            r#"{"query":"rollback checklist","scope":"principal"}"#,
-            r#"{"query":"rollback checklist","scope":"channel","isolation_probe":true}"#,
-        ] {
-            assert!(
-                !tool_input_requires_proposal_approval("palyra.memory.search", input.as_bytes()),
-                "{input}"
-            );
-        }
-        assert!(!tool_input_requires_proposal_approval(
-            "palyra.echo",
-            br#"{"query":"project notes","scope":"workspace"}"#
-        ));
-    }
-
-    #[test]
-    fn plan_manage_mutations_require_proposal_approval() {
-        for input in [
-            r#"{"operation":"upsert","title":"Persisted state"}"#,
-            r#"{"operation":"reorder","item_id":"plan-1","priority":1}"#,
-            r#"{"operation":"block","item_id":"plan-1","blocked_reason":"waiting"}"#,
-            r#"{"operation":"complete","item_id":"plan-1"}"#,
-            r#"{"operation":"cancel","item_id":"plan-1"}"#,
-            r#"{"operation":"clear_active"}"#,
-            r#"{}"#,
-            r#"not-json"#,
-        ] {
-            assert!(
-                tool_input_requires_proposal_approval("palyra.plan.manage", input.as_bytes()),
-                "{input}"
-            );
-        }
-    }
-
-    #[test]
-    fn plan_manage_read_does_not_require_proposal_approval() {
-        assert!(!tool_input_requires_proposal_approval(
-            "palyra.plan.manage",
-            br#"{"operation":"read"}"#
-        ));
     }
 
     #[test]

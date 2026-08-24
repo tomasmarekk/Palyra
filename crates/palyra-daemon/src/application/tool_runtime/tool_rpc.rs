@@ -369,8 +369,6 @@ pub(crate) async fn execute_granted_tool_rpc_call(
                 ToolProposalApprovalState::default(),
             )
         });
-    let child_tool_requires_approval =
-        tool_protocol::tool_requires_approval(request.tool_name.as_str());
     let mut execution_decision = decision;
     let mut inherits_parent_approval = false;
     let mut inherited_approval_policy_checked = false;
@@ -406,20 +404,11 @@ pub(crate) async fn execute_granted_tool_rpc_call(
             execution_decision = inherited_approval_decision;
         }
     }
-    // A nested call has no operator to prompt, so anything approval-shaped
-    // (proposal gate, tool metadata, or resolved decision) fails closed here
-    // instead of suspending the program. `palyra.http.fetch` is the one
-    // approval-required child allowed to inherit the already-approved parent
-    // program, but only after a post-approval policy check proves the child
-    // is runtime-allowlisted; it still runs through normal fetch egress and
-    // content policy.
-    let child_tool_requires_standalone_approval = child_tool_requires_approval
-        && !inherited_approval_policy_checked
-        && (request.tool_name != HTTP_FETCH_TOOL_NAME
-            || execution_decision.allowed
-            || execution_decision.approval_required);
-    if (((proposal_approval_required || child_tool_requires_standalone_approval)
-        && !inherited_approval_policy_checked)
+    // A nested call has no operator to prompt, so an explicit posture, hook,
+    // backend, or resolved-policy approval still fails closed instead of
+    // suspending the program. Static tool sensitivity alone is not an
+    // approval gate on the out-of-box always-allow posture.
+    if ((proposal_approval_required && !inherited_approval_policy_checked)
         || execution_decision.approval_required)
         && !inherits_parent_approval
     {
