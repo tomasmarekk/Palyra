@@ -2818,6 +2818,7 @@ pub struct OrchestratorCheckpointCreateRequest {
 }
 
 /// Marks a conversation checkpoint as restored.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorCheckpointRestoreMarkRequest {
     pub checkpoint_id: String,
@@ -4672,6 +4673,35 @@ pub struct OrchestratorSessionLineageUpdateRequest {
     pub parent_session_id: Option<String>,
     pub branch_origin_run_id: Option<String>,
     pub suggested_auto_title: Option<String>,
+}
+
+/// Host-owned reason for atomically creating a session branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrchestratorSessionBranchKind {
+    /// Ordinary branch from the source session's latest terminal run.
+    Branch,
+    /// Branch restored from a durable conversation checkpoint.
+    CheckpointRestore { checkpoint_id: String },
+}
+
+/// Inputs committed together when an operator creates or restores a branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorSessionBranchCommitRequest {
+    pub source_session_id: String,
+    pub source_run_id: String,
+    pub session_label: Option<String>,
+    pub principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub suggested_auto_title: Option<String>,
+    pub kind: OrchestratorSessionBranchKind,
+}
+
+/// Result of an atomic branch commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorSessionBranchCommitOutcome {
+    pub session: OrchestratorSessionRecord,
+    pub checkpoint_restored_at_unix_ms: Option<i64>,
 }
 
 /// Scope and time-range parameters for usage reporting.
@@ -16483,6 +16513,362 @@ impl JournalStore {
         )
     }
 
+    /// Atomically creates a branch, updates source/child lineage, copies
+    /// project-context state, records the host-owned terminal-run marker, and
+    /// optionally marks a checkpoint restored.
+    ///
+    /// The marker is administrative history written after terminal settlement,
+    /// not a continuation of the closed execution generation. Its terminal-run
+    /// and owner checks therefore live in this transaction instead of the
+    /// generation-fenced live-run append path.
+    ///
+    /// # Errors
+    /// Returns an identity, source-run, checkpoint, lease, validation, or
+    /// storage error. All branch mutations roll back together.
+    pub fn commit_orchestrator_session_branch(
+        &self,
+        request: &OrchestratorSessionBranchCommitRequest,
+    ) -> Result<OrchestratorSessionBranchCommitOutcome, JournalError> {
+        let source_session_id = request.source_session_id.trim();
+        let source_run_id = request.source_run_id.trim();
+        if source_session_id.is_empty() || source_run_id.is_empty() {
+            return Err(JournalError::InvalidArgument(
+                "branch source session_id and run_id cannot be empty".to_owned(),
+            ));
+        }
+        let session_label =
+            request.session_label.clone().and_then(normalize_optional_session_field);
+        let suggested_auto_title = session_label
+            .is_none()
+            .then(|| request.suggested_auto_title.clone())
+            .flatten()
+            .and_then(normalize_optional_session_field);
+        let title_generation_state = if session_label.is_some() {
+            ORCHESTRATOR_TITLE_GENERATION_STATE_MANUAL_LOCKED
+        } else if suggested_auto_title.is_some() {
+            ORCHESTRATOR_TITLE_GENERATION_STATE_READY
+        } else {
+            ORCHESTRATOR_TITLE_GENERATION_STATE_IDLE
+        };
+        let child_session_id = Ulid::generate().to_string();
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let lease_request = internal_session_write_lease_request(
+            source_session_id,
+            "commit_orchestrator_session_branch",
+            false,
+        );
+        let lease = acquire_session_write_lease_tx(&guard, &lease_request, now)?;
+        let transaction = match guard.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                let _ = release_session_write_lease_record_tx(
+                    &guard,
+                    &lease,
+                    current_unix_ms().unwrap_or(now),
+                );
+                return Err(error.into());
+            }
+        };
+
+        let mutation_result = (|| -> Result<Option<i64>, JournalError> {
+            let source_session = load_orchestrator_session_by_id(&transaction, source_session_id)?
+                .ok_or_else(|| JournalError::SessionNotFound {
+                    selector: source_session_id.to_owned(),
+                })?;
+            if source_session.principal != request.principal
+                || source_session.device_id != request.device_id
+                || source_session.channel != request.channel
+            {
+                return Err(JournalError::SessionIdentityMismatch {
+                    session_id: source_session.session_id,
+                });
+            }
+
+            let (run_session_id, run_state) = transaction
+                .query_row(
+                    "SELECT session_ulid, state FROM orchestrator_runs WHERE run_ulid = ?1",
+                    params![source_run_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| JournalError::RunNotFound { run_id: source_run_id.to_owned() })?;
+            if run_session_id != source_session_id {
+                return Err(JournalError::InvalidArgument(
+                    "branch source run does not belong to the source session".to_owned(),
+                ));
+            }
+            let run_state = RunLifecycleState::from_str(run_state.as_str()).ok_or_else(|| {
+                JournalError::InvalidArgument(format!(
+                    "branch source run has unknown lifecycle state: {run_state}"
+                ))
+            })?;
+            if !run_state.is_terminal() {
+                return Err(JournalError::InvalidArgument(
+                    "branch source run must be terminal".to_owned(),
+                ));
+            }
+            if matches!(request.kind, OrchestratorSessionBranchKind::Branch)
+                && source_session.last_run_id.as_deref() != Some(source_run_id)
+            {
+                return Err(JournalError::InvalidArgument(
+                    "ordinary branch source must be the session's latest run".to_owned(),
+                ));
+            }
+
+            if let OrchestratorSessionBranchKind::CheckpointRestore { checkpoint_id } =
+                &request.kind
+            {
+                let (checkpoint_session_id, checkpoint_run_id) = transaction
+                    .query_row(
+                        "SELECT session_ulid, run_ulid FROM orchestrator_checkpoints WHERE checkpoint_ulid = ?1",
+                        params![checkpoint_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| JournalError::CheckpointNotFound {
+                        checkpoint_kind: "orchestrator",
+                        checkpoint_id: checkpoint_id.clone(),
+                    })?;
+                if checkpoint_session_id != source_session_id
+                    || checkpoint_run_id
+                        .as_deref()
+                        .is_some_and(|checkpoint_run_id| checkpoint_run_id != source_run_id)
+                {
+                    return Err(JournalError::InvalidArgument(
+                        "checkpoint branch source does not match its stored session/run".to_owned(),
+                    ));
+                }
+            }
+
+            transaction.execute(
+                r#"
+                    INSERT INTO orchestrator_sessions (
+                        session_ulid,
+                        session_key,
+                        session_label,
+                        principal,
+                        device_id,
+                        channel,
+                        created_at_unix_ms,
+                        updated_at_unix_ms,
+                        last_run_ulid,
+                        title_generation_state,
+                        manual_title_locked,
+                        manual_title_updated_at_unix_ms,
+                        model_profile_override,
+                        thinking_override,
+                        trace_override,
+                        verbose_override,
+                        auto_title,
+                        auto_title_source,
+                        auto_title_generator_version,
+                        auto_title_updated_at_unix_ms,
+                        branch_state,
+                        parent_session_ulid,
+                        branch_origin_run_ulid
+                    ) VALUES (
+                        ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?6, NULL, ?7, ?8, ?9,
+                        NULL, NULL, NULL, NULL, ?10, ?11, ?12, ?13,
+                        'active_branch', ?14, ?15
+                    )
+                "#,
+                params![
+                    child_session_id,
+                    session_label,
+                    request.principal,
+                    request.device_id,
+                    request.channel,
+                    now,
+                    title_generation_state,
+                    i64::from(session_label.is_some()),
+                    session_label.as_ref().map(|_| now),
+                    suggested_auto_title,
+                    suggested_auto_title.as_ref().map(|_| "title_family"),
+                    suggested_auto_title
+                        .as_ref()
+                        .map(|_| ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION),
+                    suggested_auto_title.as_ref().map(|_| now),
+                    source_session_id,
+                    source_run_id,
+                ],
+            )?;
+            let updated = transaction.execute(
+                r#"
+                    UPDATE orchestrator_sessions
+                    SET branch_state = 'branch_source', updated_at_unix_ms = ?2
+                    WHERE session_ulid = ?1
+                "#,
+                params![source_session_id, now],
+            )?;
+            if updated == 0 {
+                return Err(JournalError::SessionNotFound {
+                    selector: source_session_id.to_owned(),
+                });
+            }
+            transaction.execute(
+                r#"
+                    INSERT INTO session_project_context_state (
+                        session_ulid,
+                        focus_paths_json,
+                        disabled_entry_ids_json,
+                        approved_entry_ids_json,
+                        last_refreshed_at_unix_ms,
+                        updated_at_unix_ms
+                    )
+                    SELECT
+                        ?2,
+                        focus_paths_json,
+                        disabled_entry_ids_json,
+                        approved_entry_ids_json,
+                        last_refreshed_at_unix_ms,
+                        ?3
+                    FROM session_project_context_state
+                    WHERE session_ulid = ?1
+                "#,
+                params![source_session_id, child_session_id, now],
+            )?;
+
+            let (event_type, payload_json, checkpoint_restored_at_unix_ms) = match &request.kind {
+                OrchestratorSessionBranchKind::Branch => (
+                    "rollback.marker",
+                    serde_json::json!({
+                        "event": "rollback.marker",
+                        "source_session_id": source_session_id,
+                        "branched_session_id": child_session_id,
+                        "source_run_id": source_run_id,
+                        "actor_principal": request.principal,
+                    })
+                    .to_string(),
+                    None,
+                ),
+                OrchestratorSessionBranchKind::CheckpointRestore { checkpoint_id } => (
+                    "checkpoint.restore",
+                    serde_json::json!({
+                        "event": "checkpoint.restore",
+                        "checkpoint_id": checkpoint_id,
+                        "source_session_id": source_session_id,
+                        "restored_session_id": child_session_id,
+                        "anchor_run_id": source_run_id,
+                        "actor_principal": request.principal,
+                    })
+                    .to_string(),
+                    Some(now),
+                ),
+            };
+            let marker = OrchestratorTapeAppendRequest {
+                run_id: source_run_id.to_owned(),
+                seq: next_orchestrator_tape_seq(&transaction, source_run_id)?,
+                event_type: event_type.to_owned(),
+                payload_json,
+            };
+            append_orchestrator_tape_event_tx(
+                &transaction,
+                self.config.max_payload_bytes,
+                &marker,
+                now,
+            )?;
+
+            if let OrchestratorSessionBranchKind::CheckpointRestore { checkpoint_id } =
+                &request.kind
+            {
+                let updated = transaction.execute(
+                    r#"
+                        UPDATE orchestrator_checkpoints
+                        SET
+                            restore_count = restore_count + 1,
+                            last_restored_at_unix_ms = ?2
+                        WHERE checkpoint_ulid = ?1
+                    "#,
+                    params![checkpoint_id, now],
+                )?;
+                if updated == 0 {
+                    return Err(JournalError::CheckpointNotFound {
+                        checkpoint_kind: "orchestrator",
+                        checkpoint_id: checkpoint_id.clone(),
+                    });
+                }
+            }
+
+            let released = release_session_write_lease_record_tx(&transaction, &lease, now)?;
+            if !released {
+                return Err(JournalError::InvalidArgument(
+                    "branch transaction lost its source-session write lease".to_owned(),
+                ));
+            }
+            Ok(checkpoint_restored_at_unix_ms)
+        })();
+
+        let checkpoint_restored_at_unix_ms = match mutation_result {
+            Ok(value) => {
+                transaction.commit()?;
+                value
+            }
+            Err(error) => {
+                drop(transaction);
+                let _ = release_session_write_lease_record_tx(
+                    &guard,
+                    &lease,
+                    current_unix_ms().unwrap_or(now),
+                );
+                return Err(error);
+            }
+        };
+
+        let title = session_label
+            .clone()
+            .or_else(|| suggested_auto_title.clone())
+            .unwrap_or_else(|| child_session_id.clone());
+        let title_source = if session_label.is_some() {
+            "label"
+        } else if suggested_auto_title.is_some() {
+            "title_family"
+        } else {
+            "session_key"
+        };
+        Ok(OrchestratorSessionBranchCommitOutcome {
+            session: OrchestratorSessionRecord {
+                session_id: child_session_id.clone(),
+                session_key: child_session_id,
+                session_label: session_label.clone(),
+                principal: request.principal.clone(),
+                device_id: request.device_id.clone(),
+                channel: request.channel.clone(),
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                last_run_id: None,
+                archived_at_unix_ms: None,
+                auto_title: suggested_auto_title.clone(),
+                auto_title_source: suggested_auto_title.as_ref().map(|_| "title_family".to_owned()),
+                auto_title_generator_version: suggested_auto_title
+                    .as_ref()
+                    .map(|_| ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION.to_owned()),
+                auto_title_updated_at_unix_ms: suggested_auto_title.as_ref().map(|_| now),
+                title_generation_state: title_generation_state.to_owned(),
+                manual_title_locked: session_label.is_some(),
+                manual_title_updated_at_unix_ms: session_label.as_ref().map(|_| now),
+                model_profile_override: None,
+                thinking_override: None,
+                trace_override: None,
+                verbose_override: None,
+                title,
+                title_source: title_source.to_owned(),
+                title_generator_version: suggested_auto_title
+                    .as_ref()
+                    .map(|_| ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION.to_owned()),
+                preview: None,
+                last_intent: None,
+                last_summary: None,
+                match_snippet: None,
+                branch_state: "active_branch".to_owned(),
+                parent_session_id: Some(source_session_id.to_owned()),
+                branch_origin_run_id: Some(source_run_id.to_owned()),
+                last_run_state: None,
+            },
+            checkpoint_restored_at_unix_ms,
+        })
+    }
+
     /// Lists tape events across all of a session's runs as one transcript.
     ///
     /// # Errors
@@ -17833,6 +18219,7 @@ impl JournalStore {
     /// # Errors
     /// Returns [`JournalError::CheckpointNotFound`] for an
     /// unknown checkpoint, or [`JournalError`] on storage failure.
+    #[cfg(test)]
     pub fn mark_orchestrator_checkpoint_restored(
         &self,
         request: &OrchestratorCheckpointRestoreMarkRequest,
@@ -35592,15 +35979,16 @@ mod tests {
         NetworkedWorkerLifecycleCommit, OrchestratorBackgroundTaskClaimRequest,
         OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
         OrchestratorBackgroundTaskUpdateRequest, OrchestratorBackgroundTaskWorkerUpdateRequest,
-        OrchestratorCancelRequest, OrchestratorParentGenerationGuard,
-        OrchestratorQueuedInputCreateRequest, OrchestratorQueuedInputUpdateRequest,
-        OrchestratorRunMetadataUpdateRequest, OrchestratorRunStartRequest,
-        OrchestratorRunTerminalSettlementRequest, OrchestratorSessionCleanupRequest,
-        OrchestratorSessionLineageUpdateRequest, OrchestratorSessionPinCreateRequest,
-        OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
-        OrchestratorStartupBackgroundTaskRecoveryReport, OrchestratorTapeAppendRequest,
-        OrchestratorUsageDelta, PersistedProcessLeaseRecord, ProgressDraftListFilter,
-        ProgressDraftTapeEventRequest, ProviderAttemptCompletionOutcome,
+        OrchestratorCancelRequest, OrchestratorCheckpointCreateRequest,
+        OrchestratorParentGenerationGuard, OrchestratorQueuedInputCreateRequest,
+        OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
+        OrchestratorRunStartRequest, OrchestratorRunTerminalSettlementRequest,
+        OrchestratorSessionBranchCommitRequest, OrchestratorSessionBranchKind,
+        OrchestratorSessionCleanupRequest, OrchestratorSessionLineageUpdateRequest,
+        OrchestratorSessionPinCreateRequest, OrchestratorSessionResolveRequest,
+        OrchestratorSessionUpsertRequest, OrchestratorStartupBackgroundTaskRecoveryReport,
+        OrchestratorTapeAppendRequest, OrchestratorUsageDelta, PersistedProcessLeaseRecord,
+        ProgressDraftListFilter, ProgressDraftTapeEventRequest, ProviderAttemptCompletionOutcome,
         ProviderAttemptCompletionRequest, ProviderAttemptStartRequest,
         ProviderConfigurationAttemptCompletionOutcome,
         ProviderConfigurationAttemptCompletionRequest, ProviderConfigurationAttemptStartRequest,
@@ -35758,6 +36146,37 @@ mod tests {
                 delegated_admission: None,
             })
             .expect("orchestrator run should be created");
+    }
+
+    fn settle_orchestrator_run_done(store: &JournalStore, session_id: &str, run_id: &str) {
+        activate_runtime_generation(
+            store,
+            session_id,
+            run_id,
+            RuntimeGenerationTransitionKind::Activated,
+        );
+        store
+            .update_orchestrator_run_state(run_id, RunLifecycleState::InProgress, None)
+            .expect("run should transition to in_progress");
+        store
+            .settle_orchestrator_run_terminal(&OrchestratorRunTerminalSettlementRequest {
+                run_id: run_id.to_owned(),
+                requested_state: RunLifecycleState::Done,
+                reason_code: "runtime.terminal.completed".to_owned(),
+                status_message: "completed".to_owned(),
+                actor: RuntimeActorRef {
+                    kind: RuntimeActorKind::System,
+                    id: "journal-test".to_owned(),
+                },
+                terminal_summary_payload_json: None,
+                terminal_tape_events: Vec::new(),
+                terminal_status_payload_json: json!({
+                    "kind": "done",
+                    "message": "completed",
+                })
+                .to_string(),
+            })
+            .expect("terminal settlement should succeed");
     }
 
     fn provider_runtime_events(store: &JournalStore, run_id: &str) -> Vec<RuntimeEventEnvelopeV2> {
@@ -51787,6 +52206,197 @@ mod tests {
             outcome.hits[0].semantic_rerank_state, "disabled",
             "lexical title ranking must be explicit when semantic reranking is disabled"
         );
+    }
+
+    #[test]
+    fn session_branch_commits_after_terminal_generation_settlement() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let source_session_id = "session_terminal_branch_source";
+        let source_run_id = "run_terminal_branch_source";
+        upsert_orchestrator_session(&store, source_session_id);
+        start_orchestrator_run(&store, source_session_id, source_run_id);
+        store
+            .upsert_session_project_context_state(&SessionProjectContextStateUpsertRequest {
+                session_id: source_session_id.to_owned(),
+                focus_paths: vec!["crates/palyra-daemon".to_owned()],
+                disabled_entry_ids: vec!["disabled-entry".to_owned()],
+                approved_entry_ids: vec!["approved-entry".to_owned()],
+                last_refreshed_at_unix_ms: Some(1_730_000_000_000),
+            })
+            .expect("source project context should persist");
+        settle_orchestrator_run_done(&store, source_session_id, source_run_id);
+        assert!(
+            store
+                .active_runtime_generation_for_run(source_run_id, RuntimeGenerationLane::Run)
+                .expect("generation lookup should succeed")
+                .is_none(),
+            "terminal settlement must close the execution generation before branching"
+        );
+
+        let outcome = store
+            .commit_orchestrator_session_branch(&OrchestratorSessionBranchCommitRequest {
+                source_session_id: source_session_id.to_owned(),
+                source_run_id: source_run_id.to_owned(),
+                session_label: Some("Investigation branch".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+                suggested_auto_title: None,
+                kind: OrchestratorSessionBranchKind::Branch,
+            })
+            .expect("terminal session branch should commit");
+
+        assert_eq!(outcome.session.branch_state, "active_branch");
+        assert_eq!(outcome.session.parent_session_id.as_deref(), Some(source_session_id));
+        assert_eq!(outcome.session.branch_origin_run_id.as_deref(), Some(source_run_id));
+        assert_eq!(outcome.checkpoint_restored_at_unix_ms, None);
+        let child_context = store
+            .session_project_context_state(outcome.session.session_id.as_str())
+            .expect("child project context should load")
+            .expect("child project context should be copied");
+        assert_eq!(child_context.focus_paths, vec!["crates/palyra-daemon"]);
+        assert_eq!(child_context.disabled_entry_ids, vec!["disabled-entry"]);
+        assert_eq!(child_context.approved_entry_ids, vec!["approved-entry"]);
+        let transcript = store
+            .list_orchestrator_session_transcript(source_session_id)
+            .expect("source transcript should load");
+        assert!(
+            transcript.iter().any(|event| event.event_type == "rollback.marker"),
+            "branch marker should remain visible in terminal-run history"
+        );
+        let source_branch_state: String = store
+            .connection
+            .lock()
+            .expect("journal lock should not be poisoned")
+            .query_row(
+                "SELECT branch_state FROM orchestrator_sessions WHERE session_ulid = ?1",
+                params![source_session_id],
+                |row| row.get(0),
+            )
+            .expect("source lineage should load");
+        assert_eq!(source_branch_state, "branch_source");
+    }
+
+    #[test]
+    fn checkpoint_restore_commits_with_terminal_marker_and_counter() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let source_session_id = "session_terminal_checkpoint_source";
+        let source_run_id = "run_terminal_checkpoint_source";
+        let checkpoint_id = "checkpoint_terminal_restore";
+        upsert_orchestrator_session(&store, source_session_id);
+        start_orchestrator_run(&store, source_session_id, source_run_id);
+        settle_orchestrator_run_done(&store, source_session_id, source_run_id);
+        store
+            .create_orchestrator_checkpoint(&OrchestratorCheckpointCreateRequest {
+                checkpoint_id: checkpoint_id.to_owned(),
+                session_id: source_session_id.to_owned(),
+                run_id: Some(source_run_id.to_owned()),
+                name: "Before changes".to_owned(),
+                tags_json: "[]".to_owned(),
+                note: None,
+                branch_state: "root".to_owned(),
+                parent_session_id: None,
+                referenced_compaction_ids_json: "[]".to_owned(),
+                workspace_paths_json: "[]".to_owned(),
+                created_by_principal: "user:ops".to_owned(),
+            })
+            .expect("checkpoint should persist");
+
+        let outcome = store
+            .commit_orchestrator_session_branch(&OrchestratorSessionBranchCommitRequest {
+                source_session_id: source_session_id.to_owned(),
+                source_run_id: source_run_id.to_owned(),
+                session_label: None,
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+                suggested_auto_title: Some("Restored branch".to_owned()),
+                kind: OrchestratorSessionBranchKind::CheckpointRestore {
+                    checkpoint_id: checkpoint_id.to_owned(),
+                },
+            })
+            .expect("terminal checkpoint restore should commit");
+
+        assert!(outcome.checkpoint_restored_at_unix_ms.is_some());
+        assert_eq!(outcome.session.parent_session_id.as_deref(), Some(source_session_id));
+        let checkpoints = store
+            .list_orchestrator_checkpoints(source_session_id)
+            .expect("checkpoints should load");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].restore_count, 1);
+        assert_eq!(checkpoints[0].last_restored_at_unix_ms, outcome.checkpoint_restored_at_unix_ms);
+        let transcript = store
+            .list_orchestrator_session_transcript(source_session_id)
+            .expect("source transcript should load");
+        assert!(
+            transcript.iter().any(|event| event.event_type == "checkpoint.restore"),
+            "restore marker should remain visible in terminal-run history"
+        );
+    }
+
+    #[test]
+    fn session_branch_rolls_back_every_mutation_when_marker_write_fails() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let source_session_id = "session_atomic_branch_source";
+        let source_run_id = "run_atomic_branch_source";
+        upsert_orchestrator_session(&store, source_session_id);
+        start_orchestrator_run(&store, source_session_id, source_run_id);
+        settle_orchestrator_run_done(&store, source_session_id, source_run_id);
+        store
+            .connection
+            .lock()
+            .expect("journal lock should not be poisoned")
+            .execute_batch(
+                r#"
+                    CREATE TRIGGER reject_branch_marker
+                    BEFORE INSERT ON orchestrator_tape
+                    WHEN NEW.event_type = 'rollback.marker'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced marker failure');
+                    END;
+                "#,
+            )
+            .expect("failure trigger should install");
+
+        let error = store
+            .commit_orchestrator_session_branch(&OrchestratorSessionBranchCommitRequest {
+                source_session_id: source_session_id.to_owned(),
+                source_run_id: source_run_id.to_owned(),
+                session_label: None,
+                principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+                suggested_auto_title: None,
+                kind: OrchestratorSessionBranchKind::Branch,
+            })
+            .expect_err("marker failure should reject the complete branch transaction");
+        assert!(matches!(error, JournalError::Sqlite(_)));
+
+        let guard = store.connection.lock().expect("journal lock should not be poisoned");
+        let session_count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM orchestrator_sessions", [], |row| row.get(0))
+            .expect("session count should load");
+        let source_branch_state: String = guard
+            .query_row(
+                "SELECT branch_state FROM orchestrator_sessions WHERE session_ulid = ?1",
+                params![source_session_id],
+                |row| row.get(0),
+            )
+            .expect("source lineage should load");
+        let lease_count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM orchestrator_session_write_leases", [], |row| {
+                row.get(0)
+            })
+            .expect("lease count should load");
+        assert_eq!(session_count, 1);
+        assert_eq!(source_branch_state, "root");
+        assert_eq!(lease_count, 0);
     }
 
     #[test]

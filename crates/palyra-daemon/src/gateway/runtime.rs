@@ -125,22 +125,22 @@ use crate::journal::{
     OrchestratorBackgroundTaskListFilter, OrchestratorBackgroundTaskRecord,
     OrchestratorBackgroundTaskUpdateRequest, OrchestratorBackgroundTaskWorkerUpdateRequest,
     OrchestratorCheckpointCreateRequest, OrchestratorCheckpointRecord,
-    OrchestratorCheckpointRestoreMarkRequest, OrchestratorCompactionArtifactCreateRequest,
-    OrchestratorCompactionArtifactRecord, OrchestratorParentGenerationGuard,
-    OrchestratorQueuedInputCreateRequest, OrchestratorQueuedInputRecord,
-    OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
-    OrchestratorRunTerminalSettlement, OrchestratorRunTerminalSettlementRequest,
-    OrchestratorSessionCleanupOutcome, OrchestratorSessionCleanupRequest,
-    OrchestratorSessionLineageUpdateRequest, OrchestratorSessionPinCreateRequest,
-    OrchestratorSessionPinRecord, OrchestratorSessionQueueControlRecord,
-    OrchestratorSessionQueueControlUpdateRequest, OrchestratorSessionRecord,
-    OrchestratorSessionTitleUpdateRequest, OrchestratorSessionTranscriptRecord,
-    OrchestratorStartupBackgroundTaskRecoveryReport, OrchestratorStartupRunRecoveryReport,
-    OrchestratorUsageQuery, OrchestratorUsageRunRecord, OrchestratorUsageSessionRecord,
-    OrchestratorUsageSummary, ParentSuspensionCreateRequest, ParentSuspensionReconcileReport,
-    ParentSuspensionRecord, ParentSuspensionWakeOutcome, PersistedProcessLeaseRecord,
-    ProgressDraftEventRecord, ProgressDraftListFilter, ProgressDraftRecord,
-    ProgressDraftTapeEventRequest, ProviderAttemptCompletionOutcome,
+    OrchestratorCompactionArtifactCreateRequest, OrchestratorCompactionArtifactRecord,
+    OrchestratorParentGenerationGuard, OrchestratorQueuedInputCreateRequest,
+    OrchestratorQueuedInputRecord, OrchestratorQueuedInputUpdateRequest,
+    OrchestratorRunMetadataUpdateRequest, OrchestratorRunTerminalSettlement,
+    OrchestratorRunTerminalSettlementRequest, OrchestratorSessionBranchCommitOutcome,
+    OrchestratorSessionBranchCommitRequest, OrchestratorSessionCleanupOutcome,
+    OrchestratorSessionCleanupRequest, OrchestratorSessionLineageUpdateRequest,
+    OrchestratorSessionPinCreateRequest, OrchestratorSessionPinRecord,
+    OrchestratorSessionQueueControlRecord, OrchestratorSessionQueueControlUpdateRequest,
+    OrchestratorSessionRecord, OrchestratorSessionTitleUpdateRequest,
+    OrchestratorSessionTranscriptRecord, OrchestratorStartupBackgroundTaskRecoveryReport,
+    OrchestratorStartupRunRecoveryReport, OrchestratorUsageQuery, OrchestratorUsageRunRecord,
+    OrchestratorUsageSessionRecord, OrchestratorUsageSummary, ParentSuspensionCreateRequest,
+    ParentSuspensionReconcileReport, ParentSuspensionRecord, ParentSuspensionWakeOutcome,
+    PersistedProcessLeaseRecord, ProgressDraftEventRecord, ProgressDraftListFilter,
+    ProgressDraftRecord, ProgressDraftTapeEventRequest, ProviderAttemptCompletionOutcome,
     ProviderAttemptCompletionRequest,
     ProviderAttemptRuntimeAuthority as JournalProviderAttemptRuntimeAuthority,
     ProviderAttemptStartRequest, ProviderConfigurationAttemptCompletionOutcome,
@@ -13941,6 +13941,33 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    fn commit_orchestrator_session_branch_blocking(
+        &self,
+        request: &OrchestratorSessionBranchCommitRequest,
+    ) -> Result<OrchestratorSessionBranchCommitOutcome, Status> {
+        self.journal_store.commit_orchestrator_session_branch(request).map_err(|error| {
+            map_orchestrator_store_error("commit orchestrator session branch", error)
+        })
+    }
+
+    /// Atomically creates a branch and commits its lineage/audit bookkeeping.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn commit_orchestrator_session_branch(
+        self: &Arc<Self>,
+        request: OrchestratorSessionBranchCommitRequest,
+    ) -> Result<OrchestratorSessionBranchCommitOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.commit_orchestrator_session_branch_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator session branch worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
     fn list_orchestrator_session_transcript_blocking(
         &self,
         session_id: &str,
@@ -14665,33 +14692,6 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("orchestrator checkpoint detail worker panicked"))?
-    }
-
-    #[allow(clippy::result_large_err)]
-    fn mark_orchestrator_checkpoint_restored_blocking(
-        &self,
-        request: &OrchestratorCheckpointRestoreMarkRequest,
-    ) -> Result<(), Status> {
-        self.journal_store.mark_orchestrator_checkpoint_restored(request).map_err(|error| {
-            map_orchestrator_store_error("mark orchestrator checkpoint restored", error)
-        })
-    }
-
-    /// Marks a checkpoint as restored.
-    ///
-    /// # Errors
-    /// Returns the mapped journal store error, or `internal` if the worker panicked.
-    #[allow(clippy::result_large_err)]
-    pub async fn mark_orchestrator_checkpoint_restored(
-        self: &Arc<Self>,
-        request: OrchestratorCheckpointRestoreMarkRequest,
-    ) -> Result<(), Status> {
-        let state = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
-            state.mark_orchestrator_checkpoint_restored_blocking(&request)
-        })
-        .await
-        .map_err(|_| Status::internal("orchestrator checkpoint restore worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

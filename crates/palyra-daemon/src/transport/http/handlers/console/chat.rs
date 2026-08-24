@@ -1663,75 +1663,20 @@ pub(crate) async fn console_chat_branch_handler(
 
     let branched = state
         .runtime
-        .resolve_orchestrator_session(journal::OrchestratorSessionResolveRequest {
-            session_id: None,
-            session_key: None,
+        .commit_orchestrator_session_branch(journal::OrchestratorSessionBranchCommitRequest {
+            source_session_id: source_session.session_id.clone(),
+            source_run_id: source_run_id.clone(),
             session_label: requested_session_label.clone(),
             principal: session.context.principal.clone(),
             device_id: session.context.device_id.clone(),
             channel: session.context.channel.clone(),
-            require_existing: false,
-            reset_session: false,
+            suggested_auto_title: Some(family_title_seed.suggested_title.clone()),
+            kind: journal::OrchestratorSessionBranchKind::Branch,
         })
         .await
         .map_err(runtime_status_response)?;
-    state
-        .runtime
-        .update_orchestrator_session_lineage(journal::OrchestratorSessionLineageUpdateRequest {
-            session_id: branched.session.session_id.clone(),
-            branch_state: "active_branch".to_owned(),
-            parent_session_id: Some(source_session.session_id.clone()),
-            branch_origin_run_id: Some(source_run_id.clone()),
-            suggested_auto_title: requested_session_label
-                .is_none()
-                .then(|| family_title_seed.suggested_title.clone()),
-        })
-        .await
-        .map_err(runtime_status_response)?;
-    state
-        .runtime
-        .update_orchestrator_session_lineage(journal::OrchestratorSessionLineageUpdateRequest {
-            session_id: source_session.session_id.clone(),
-            branch_state: "branch_source".to_owned(),
-            parent_session_id: source_session.parent_session_id.clone(),
-            branch_origin_run_id: source_session.branch_origin_run_id.clone(),
-            suggested_auto_title: None,
-        })
-        .await
-        .map_err(runtime_status_response)?;
-    state
-        .runtime
-        .append_orchestrator_tape_event(journal::OrchestratorTapeAppendRequest {
-            run_id: source_run_id.clone(),
-            seq: source_run.tape_events as i64,
-            event_type: "rollback.marker".to_owned(),
-            payload_json: json!({
-                "event": "rollback.marker",
-                "source_session_id": source_session.session_id,
-                "branched_session_id": branched.session.session_id,
-                "source_run_id": source_run_id,
-                "actor_principal": session.context.principal,
-            })
-            .to_string(),
-        })
-        .await
-        .map_err(runtime_status_response)?;
-    crate::application::project_context::copy_project_context_state(
-        &state.runtime,
-        source_session.session_id.as_str(),
-        branched.session.session_id.as_str(),
-    )
-    .await
-    .map_err(runtime_status_response)?;
-    let branch_session = load_console_chat_session(
-        &state,
-        &session.context,
-        branched.session.session_id.as_str(),
-        true,
-    )
-    .await?;
     Ok(Json(json!({
-        "session": branch_session,
+        "session": branched.session,
         "source_run_id": source_run_id,
         "suggested_session_label": family_title_seed.suggested_title,
         "action": "branch",
@@ -2209,107 +2154,33 @@ pub(crate) async fn console_chat_checkpoint_restore_handler(
     let requested_session_label = payload.session_label.and_then(trim_to_option);
     let family_title_seed =
         load_lineage_title_seed(&state, &session.context, &source_session).await?;
+    let source_run_id =
+        checkpoint.run_id.clone().or(source_session.last_run_id.clone()).ok_or_else(|| {
+            runtime_status_response(tonic::Status::failed_precondition(
+                "checkpoint restore requires a stored anchor run",
+            ))
+        })?;
     let restored = state
         .runtime
-        .resolve_orchestrator_session(journal::OrchestratorSessionResolveRequest {
-            session_id: None,
-            session_key: None,
+        .commit_orchestrator_session_branch(journal::OrchestratorSessionBranchCommitRequest {
+            source_session_id: source_session.session_id.clone(),
+            source_run_id,
             session_label: requested_session_label.clone(),
             principal: session.context.principal.clone(),
             device_id: session.context.device_id.clone(),
             channel: session.context.channel.clone(),
-            require_existing: false,
-            reset_session: false,
+            suggested_auto_title: Some(family_title_seed.suggested_title.clone()),
+            kind: journal::OrchestratorSessionBranchKind::CheckpointRestore {
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+            },
         })
         .await
         .map_err(runtime_status_response)?;
-    state
-        .runtime
-        .update_orchestrator_session_lineage(journal::OrchestratorSessionLineageUpdateRequest {
-            session_id: restored.session.session_id.clone(),
-            branch_state: "active_branch".to_owned(),
-            parent_session_id: Some(source_session.session_id.clone()),
-            branch_origin_run_id: checkpoint.run_id.clone().or(source_session.last_run_id.clone()),
-            suggested_auto_title: requested_session_label
-                .is_none()
-                .then(|| family_title_seed.suggested_title.clone()),
-        })
-        .await
-        .map_err(runtime_status_response)?;
-    state
-        .runtime
-        .update_orchestrator_session_lineage(journal::OrchestratorSessionLineageUpdateRequest {
-            session_id: source_session.session_id.clone(),
-            branch_state: "branch_source".to_owned(),
-            parent_session_id: source_session.parent_session_id.clone(),
-            branch_origin_run_id: source_session.branch_origin_run_id.clone(),
-            suggested_auto_title: None,
-        })
-        .await
-        .map_err(runtime_status_response)?;
-    if let Some(run_id) = checkpoint.run_id.clone().or(source_session.last_run_id.clone()) {
-        let run = state
-            .runtime
-            .orchestrator_run_status_snapshot(run_id.clone())
-            .await
-            .map_err(runtime_status_response)?
-            .ok_or_else(|| {
-                runtime_status_response(tonic::Status::not_found(format!(
-                    "checkpoint anchor run not found: {run_id}"
-                )))
-            })?;
-        state
-            .runtime
-            .append_orchestrator_tape_event(journal::OrchestratorTapeAppendRequest {
-                run_id: run_id.clone(),
-                seq: run.tape_events as i64,
-                event_type: "checkpoint.restore".to_owned(),
-                payload_json: json!({
-                    "event": "checkpoint.restore",
-                    "checkpoint_id": checkpoint.checkpoint_id,
-                    "source_session_id": source_session.session_id,
-                    "restored_session_id": restored.session.session_id,
-                    "anchor_run_id": run_id,
-                    "actor_principal": session.context.principal,
-                })
-                .to_string(),
-            })
-            .await
-            .map_err(runtime_status_response)?;
-    }
-    state
-        .runtime
-        .mark_orchestrator_checkpoint_restored(journal::OrchestratorCheckpointRestoreMarkRequest {
-            checkpoint_id: checkpoint.checkpoint_id.clone(),
-        })
-        .await
-        .map_err(runtime_status_response)?;
-    crate::application::project_context::copy_project_context_state(
-        &state.runtime,
-        source_session.session_id.as_str(),
-        restored.session.session_id.as_str(),
-    )
-    .await
-    .map_err(runtime_status_response)?;
-    let restored_session = load_console_chat_session(
-        &state,
-        &session.context,
-        restored.session.session_id.as_str(),
-        true,
-    )
-    .await?;
-    let checkpoint = state
-        .runtime
-        .get_orchestrator_checkpoint(checkpoint.checkpoint_id.clone())
-        .await
-        .map_err(runtime_status_response)?
-        .ok_or_else(|| {
-            runtime_status_response(tonic::Status::not_found(
-                "checkpoint disappeared after restore",
-            ))
-        })?;
+    let mut checkpoint = checkpoint;
+    checkpoint.restore_count = checkpoint.restore_count.saturating_add(1);
+    checkpoint.last_restored_at_unix_ms = restored.checkpoint_restored_at_unix_ms;
     Ok(Json(json!({
-        "session": restored_session,
+        "session": restored.session,
         "checkpoint": checkpoint,
         "suggested_session_label": family_title_seed.suggested_title,
         "action": "checkpoint_restore",
