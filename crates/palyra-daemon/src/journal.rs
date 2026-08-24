@@ -16558,18 +16558,8 @@ impl JournalStore {
             "commit_orchestrator_session_branch",
             false,
         );
-        let lease = acquire_session_write_lease_tx(&guard, &lease_request, now)?;
-        let transaction = match guard.transaction_with_behavior(TransactionBehavior::Immediate) {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                let _ = release_session_write_lease_record_tx(
-                    &guard,
-                    &lease,
-                    current_unix_ms().unwrap_or(now),
-                );
-                return Err(error.into());
-            }
-        };
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lease = acquire_session_write_lease_tx(&transaction, &lease_request, now)?;
 
         let mutation_result = (|| -> Result<Option<i64>, JournalError> {
             let source_session = load_orchestrator_session_by_id(&transaction, source_session_id)?
@@ -16806,11 +16796,6 @@ impl JournalStore {
             }
             Err(error) => {
                 drop(transaction);
-                let _ = release_session_write_lease_record_tx(
-                    &guard,
-                    &lease,
-                    current_unix_ms().unwrap_or(now),
-                );
                 return Err(error);
             }
         };
