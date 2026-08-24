@@ -1850,9 +1850,13 @@ openai_api_key_vault_ref = "global/missing_openai_key"
         "encrypted bundle should not expose exported profile details in plaintext"
     );
 
+    let import_state_root = workdir.path().join("isolated-import-state");
+    let import_state_root_string = import_state_root.to_string_lossy().into_owned();
     let imported = run_cli_with_stdin(
         &workdir,
         &[
+            "--state-root",
+            &import_state_root_string,
             "profile",
             "import",
             "--input",
@@ -1892,12 +1896,16 @@ openai_api_key_vault_ref = "global/missing_openai_key"
     );
     let imported_config = workdir
         .path()
-        .join("state-root")
+        .join("isolated-import-state")
         .join("profiles")
         .join("imported")
         .join("config")
         .join("palyra.toml");
     assert!(imported_config.exists(), "expected imported config snapshot");
+    assert!(
+        !workdir.path().join("state-root").join("profiles").join("imported").exists(),
+        "explicit import state root must prevent writes into PALYRA_STATE_ROOT"
+    );
     Ok(())
 }
 

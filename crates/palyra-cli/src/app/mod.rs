@@ -1014,7 +1014,7 @@ pub(crate) fn persist_cli_profiles_registry(
 /// # Errors
 /// Returns an error when the base CLI state root cannot be resolved.
 pub(crate) fn default_profile_state_root(profile_name: &str) -> Result<PathBuf> {
-    let base_state_root = resolve_cli_state_root(None)?;
+    let base_state_root = profile_namespace_root()?;
     Ok(base_state_root
         .join(PROFILE_STATE_ROOT_RELATIVE_PREFIX)
         .join(profile_name)
@@ -1027,12 +1027,24 @@ pub(crate) fn default_profile_state_root(profile_name: &str) -> Result<PathBuf> 
 /// # Errors
 /// Returns an error when the base CLI state root cannot be resolved.
 pub(crate) fn default_profile_config_path(profile_name: &str) -> Result<PathBuf> {
-    let base_state_root = resolve_cli_state_root(None)?;
+    let base_state_root = profile_namespace_root()?;
     Ok(base_state_root
         .join(PROFILE_STATE_ROOT_RELATIVE_PREFIX)
         .join(profile_name)
         .join(PROFILE_CONFIG_RELATIVE_DIR)
         .join(PROFILE_CONFIG_FILE_NAME))
+}
+
+/// Returns the profile namespace root for the active invocation.
+///
+/// Once root options have been installed, the bootstrap root is authoritative:
+/// it preserves an explicit `--state-root` even when `PALYRA_STATE_ROOT` points
+/// at another installation.
+fn profile_namespace_root() -> Result<PathBuf> {
+    match current_root_context() {
+        Some(context) => Ok(context.cli_state_root().to_path_buf()),
+        None => resolve_cli_state_root(None),
+    }
 }
 
 /// Validates and normalizes a profile name (trimmed, max 64 chars, lowercase
