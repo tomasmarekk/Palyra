@@ -3030,12 +3030,13 @@ async fn grpc_route_message_does_not_reuse_cached_tool_approval_from_run_stream(
         ScriptedOpenAiResponse::immediate(200, response_body),
     ])?;
     let (child, admin_port, grpc_port, journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy(
+        spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_in_safe_mode(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
             "palyra.process.run",
             1,
             750,
+            &["palyra.process.run"],
         )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
@@ -6058,13 +6059,14 @@ async fn grpc_route_message_pending_approval_records_execution_gate_report_when_
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
     let (child, admin_port, grpc_port, journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_execution_gate_rollout(
+        spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_execution_gate_rollout_in_safe_mode(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
             "palyra.process.run",
             2,
             750,
             true,
+            &["palyra.process.run"],
         )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
@@ -7959,12 +7961,13 @@ async fn grpc_run_stream_executes_memory_recall_tool_and_emits_memory_attestatio
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
-        spawn_palyrad_with_openai_provider_and_tool_policy(
+        spawn_palyrad_with_openai_provider_and_tool_policy_in_safe_mode(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
             "palyra.memory.recall",
             2,
             250,
+            &["palyra.memory.recall"],
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -8115,12 +8118,13 @@ async fn grpc_run_stream_memory_recall_without_session_uses_current_channel_dura
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
-        spawn_palyrad_with_openai_provider_and_tool_policy(
+        spawn_palyrad_with_openai_provider_and_tool_policy_in_safe_mode(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
             "palyra.memory.recall",
             2,
             250,
+            &["palyra.memory.recall"],
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -8649,7 +8653,8 @@ async fn grpc_run_stream_denies_non_allowlisted_tool_by_default() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
+async fn grpc_run_stream_denies_allowlisted_unsupported_tool_without_default_approval() -> Result<()>
+{
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
             200,
@@ -8734,11 +8739,14 @@ async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
                 _ => {}
             }
         }
-        if saw_approval_request && saw_deny_decision && saw_failed_result {
+        if saw_deny_decision && saw_failed_result {
             break;
         }
     }
-    assert!(saw_approval_request, "unsupported tool proposal should request explicit approval");
+    assert!(
+        !saw_approval_request,
+        "unsupported tool proposal must not inherit approval gating from the default posture"
+    );
     assert!(saw_deny_decision, "unsupported tool should be denied before execution");
     assert!(saw_failed_result, "denied tool should emit failed tool result");
 
@@ -8762,17 +8770,18 @@ async fn grpc_run_stream_bounds_unrelated_messages_during_approval_wait() -> Res
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
             200,
             openai_tool_call_response(
-                "custom.noop",
-                &serde_json::json!({"payload": "approval-noise"}),
+                "palyra.echo",
+                &serde_json::json!({"text": "approval-noise"}),
             )?,
         )])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
-        spawn_palyrad_with_openai_provider_and_tool_policy(
+        spawn_palyrad_with_openai_provider_and_tool_policy_in_safe_mode(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
-            "custom.noop",
+            "palyra.echo",
             2,
             250,
+            &["palyra.echo"],
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -8859,9 +8868,9 @@ async fn grpc_run_stream_bounds_unrelated_messages_during_approval_wait() -> Res
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_finalizes_under_stale_external_approval_flood() -> Result<()> {
     let response_body = openai_tool_call_response(
-        "custom.noop",
+        "palyra.echo",
         &serde_json::json!({
-            "payload": "external-approval-decision"
+            "text": "external-approval-decision"
         }),
     )?;
     let final_response =
@@ -8876,10 +8885,11 @@ async fn grpc_run_stream_finalizes_under_stale_external_approval_flood() -> Resu
         spawn_palyrad_with_openai_provider_tool_policy_and_console_principal(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
-            "custom.noop",
+            "palyra.echo",
             2,
             250,
             console_principal,
+            &["palyra.echo"],
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -8999,12 +9009,8 @@ async fn grpc_run_stream_finalizes_under_stale_external_approval_flood() -> Resu
                 }
                 common_v1::run_stream_event::Body::ToolResult(result) => {
                     assert!(
-                        !result.success,
-                        "custom.noop should resume and then fail at unsupported runtime execution"
-                    );
-                    assert!(
-                        result.error.contains("unsupported by runtime executor"),
-                        "resumed custom tool should reach runtime execution: {}",
+                        result.success,
+                        "palyra.echo should resume and execute after external approval: {}",
                         result.error
                     );
                     saw_tool_result = true;
@@ -9057,9 +9063,9 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
         i64::try_from(TIMEBOXED_APPROVAL_TTL.as_millis()).expect("test TTL should fit i64");
 
     let response_body = openai_tool_call_response(
-        "custom.noop",
+        "palyra.echo",
         &serde_json::json!({
-            "payload": "approval-cache-timeboxed"
+            "text": "approval-cache-timeboxed"
         }),
     )?;
     let final_response_body =
@@ -9074,12 +9080,13 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
         ScriptedOpenAiResponse::immediate(200, final_response_body),
     ])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
-        spawn_palyrad_with_openai_provider_and_tool_policy(
+        spawn_palyrad_with_openai_provider_and_tool_policy_in_safe_mode(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
-            "custom.noop",
+            "palyra.echo",
             1,
             250,
+            &["palyra.echo"],
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -9107,7 +9114,7 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
         .into_inner();
 
     let mut saw_first_approval_request = false;
-    let mut saw_first_failed_result = false;
+    let mut saw_first_tool_result = false;
     loop {
         let next_event = tokio::time::timeout(Duration::from_secs(5), first_response_stream.next())
             .await
@@ -9137,21 +9144,18 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
                         .context("failed to send first timeboxed approval response")?;
                     saw_first_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
-                    saw_first_failed_result = true;
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    saw_first_tool_result = true;
                 }
                 _ => {}
             }
         }
-        if saw_first_approval_request && saw_first_failed_result {
+        if saw_first_approval_request && saw_first_tool_result {
             break;
         }
     }
     assert!(saw_first_approval_request, "first run should request explicit approval");
-    assert!(
-        saw_first_failed_result,
-        "first run should produce failed tool result for unsupported tool"
-    );
+    assert!(saw_first_tool_result, "first run should execute the approved tool");
     drop(first_sender);
     wait_for_run_stream_done(&mut first_response_stream, RUN_STREAM_TERMINAL_TIMEOUT)
         .await
@@ -9172,7 +9176,7 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
         .into_inner();
 
     let mut saw_second_approval_request = false;
-    let mut saw_second_failed_result = false;
+    let mut saw_second_tool_result = false;
     loop {
         let next_event =
             tokio::time::timeout(Duration::from_secs(5), second_response_stream.next())
@@ -9188,13 +9192,13 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
                     saw_second_approval_request = true;
                     break;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
-                    saw_second_failed_result = true;
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    saw_second_tool_result = true;
                 }
                 _ => {}
             }
         }
-        if saw_second_failed_result {
+        if saw_second_tool_result {
             break;
         }
     }
@@ -9202,10 +9206,7 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
         !saw_second_approval_request,
         "timeboxed approval should be reused while ttl is still active"
     );
-    assert!(
-        saw_second_failed_result,
-        "second run should still execute and fail unsupported tool without reprompt"
-    );
+    assert!(saw_second_tool_result, "second run should execute the tool without reprompt");
     wait_for_run_stream_done(&mut second_response_stream, RUN_STREAM_TERMINAL_TIMEOUT)
         .await
         .context("second timeboxed stream did not finish after cache hit")?;
@@ -9231,7 +9232,7 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
         .into_inner();
 
     let mut saw_third_approval_request = false;
-    let mut saw_third_failed_result = false;
+    let mut saw_third_tool_result = false;
     loop {
         let next_event = tokio::time::timeout(Duration::from_secs(5), third_response_stream.next())
             .await
@@ -9261,13 +9262,13 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
                         .context("failed to send third approval response after ttl expiry")?;
                     saw_third_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
-                    saw_third_failed_result = true;
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    saw_third_tool_result = true;
                 }
                 _ => {}
             }
         }
-        if saw_third_approval_request && saw_third_failed_result {
+        if saw_third_approval_request && saw_third_tool_result {
             break;
         }
     }
@@ -9275,7 +9276,7 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
         saw_third_approval_request,
         "approval should be requested again after timeboxed ttl expires"
     );
-    assert!(saw_third_failed_result, "third run should complete after approval re-prompt");
+    assert!(saw_third_tool_result, "third run should complete after approval re-prompt");
     drop(third_sender);
     wait_for_run_stream_done(&mut third_response_stream, RUN_STREAM_TERMINAL_TIMEOUT)
         .await
@@ -9296,9 +9297,9 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> {
     let response_body = openai_tool_call_response(
-        "custom.noop",
+        "palyra.echo",
         &serde_json::json!({
-            "payload": "approval-cache-reset"
+            "text": "approval-cache-reset"
         }),
     )?;
     let final_response_body =
@@ -9311,12 +9312,13 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
         ScriptedOpenAiResponse::immediate(200, final_response_body),
     ])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
-        spawn_palyrad_with_openai_provider_and_tool_policy(
+        spawn_palyrad_with_openai_provider_and_tool_policy_in_safe_mode(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
-            "custom.noop",
+            "palyra.echo",
             1,
             250,
+            &["palyra.echo"],
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -9344,7 +9346,7 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
         .into_inner();
 
     let mut saw_first_approval_request = false;
-    let mut saw_first_failed_result = false;
+    let mut saw_first_tool_result = false;
     loop {
         let next_event = tokio::time::timeout(Duration::from_secs(5), first_response_stream.next())
             .await
@@ -9374,21 +9376,18 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
                         .context("failed to send first approval reset response")?;
                     saw_first_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
-                    saw_first_failed_result = true;
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    saw_first_tool_result = true;
                 }
                 _ => {}
             }
         }
-        if saw_first_approval_request && saw_first_failed_result {
+        if saw_first_approval_request && saw_first_tool_result {
             break;
         }
     }
     assert!(saw_first_approval_request, "first run should request approval before cache seeding");
-    assert!(
-        saw_first_failed_result,
-        "first run should complete after approval with the unsupported-tool failure"
-    );
+    assert!(saw_first_tool_result, "first run should execute after approval");
     drop(first_sender);
     while let Some(event) =
         tokio::time::timeout(Duration::from_secs(5), first_response_stream.next())
@@ -9432,7 +9431,7 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
         .into_inner();
 
     let mut saw_second_approval_request = false;
-    let mut saw_second_failed_result = false;
+    let mut saw_second_tool_result = false;
     loop {
         let next_event =
             tokio::time::timeout(Duration::from_secs(5), second_response_stream.next())
@@ -9463,13 +9462,13 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
                         .context("failed to send second approval reset response")?;
                     saw_second_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
-                    saw_second_failed_result = true;
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    saw_second_tool_result = true;
                 }
                 _ => {}
             }
         }
-        if saw_second_approval_request && saw_second_failed_result {
+        if saw_second_approval_request && saw_second_tool_result {
             break;
         }
     }
@@ -9478,7 +9477,7 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
         "session reset must force a fresh approval request instead of reusing cached approval"
     );
     assert!(
-        saw_second_failed_result,
+        saw_second_tool_result,
         "second run should still complete after the fresh approval response"
     );
 
@@ -9505,10 +9504,9 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
             "message": {
                 "tool_calls": [{
                     "function": {
-                        "name": "custom.noop",
+                        "name": "palyra.echo",
                         "arguments": serde_json::to_string(&serde_json::json!({
-                            "payload": "secret-token",
-                            "cookie": "sessionid=abc123",
+                            "text": "secret-token token=abc cookie=sessionid=abc123",
                         }))
                         .context("failed to serialize deny-path tool arguments string")?,
                     }
@@ -9523,12 +9521,13 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
             ScriptedOpenAiResponse::immediate(200, response_body),
         ])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
-        spawn_palyrad_with_openai_provider_and_tool_policy(
+        spawn_palyrad_with_openai_provider_and_tool_policy_in_safe_mode(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
-            "custom.noop",
+            "palyra.echo",
             2,
             250,
+            &["palyra.echo"],
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -9606,7 +9605,7 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         limit: 20,
         since_unix_ms: 0,
         until_unix_ms: 0,
-        subject_id: "tool:custom.noop".to_owned(),
+        subject_id: "tool:palyra.echo".to_owned(),
         principal: "user:ops".to_owned(),
         decision: gateway_v1::ApprovalDecision::Deny as i32,
         subject_type: gateway_v1::ApprovalSubjectType::Tool as i32,
@@ -9662,7 +9661,7 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         limit: 50,
         since_unix_ms: 0,
         until_unix_ms: 0,
-        subject_id: "tool:custom.noop".to_owned(),
+        subject_id: "tool:palyra.echo".to_owned(),
         principal: "user:ops".to_owned(),
         decision: gateway_v1::ApprovalDecision::Deny as i32,
         subject_type: gateway_v1::ApprovalSubjectType::Tool as i32,
@@ -9808,7 +9807,7 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
         limit: 50,
         since_unix_ms: 0,
         until_unix_ms: 0,
-        subject_id: "tool:custom.noop".to_owned(),
+        subject_id: "tool:palyra.echo".to_owned(),
         principal: "user:ops".to_owned(),
         decision: gateway_v1::ApprovalDecision::Deny as i32,
         subject_type: gateway_v1::ApprovalSubjectType::Tool as i32,
@@ -10401,21 +10400,24 @@ async fn grpc_run_stream_denies_wasm_plugin_runtime_without_approval_channel() -
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
     let (child, admin_port, grpc_port, _journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(WasmRuntimeSpawnConfig {
-            openai_base_url: openai_base_url.as_str(),
-            openai_api_key: OPENAI_API_KEY,
-            allowed_tools: "palyra.plugin.run",
-            max_calls_per_run: 2,
-            execution_timeout_ms: 2_000,
-            allowed_http_hosts: "api.example.com",
-            allowed_secrets: "db_password",
-            allowed_storage_prefixes: "plugins/cache",
-            allowed_channels: "cli",
-            fuel_budget: 10_000_000,
-            max_memory_bytes: 64 * 1024 * 1024,
-            max_table_elements: 100_000,
-            max_instances: 256,
-        })?;
+        spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime_in_safe_mode(
+            WasmRuntimeSpawnConfig {
+                openai_base_url: openai_base_url.as_str(),
+                openai_api_key: OPENAI_API_KEY,
+                allowed_tools: "palyra.plugin.run",
+                max_calls_per_run: 2,
+                execution_timeout_ms: 2_000,
+                allowed_http_hosts: "api.example.com",
+                allowed_secrets: "db_password",
+                allowed_storage_prefixes: "plugins/cache",
+                allowed_channels: "cli",
+                fuel_budget: 10_000_000,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 256,
+            },
+            &["palyra.plugin.run"],
+        )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -10616,21 +10618,24 @@ async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability()
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
     let (child, admin_port, grpc_port, _journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(WasmRuntimeSpawnConfig {
-            openai_base_url: openai_base_url.as_str(),
-            openai_api_key: OPENAI_API_KEY,
-            allowed_tools: "palyra.plugin.run",
-            max_calls_per_run: 2,
-            execution_timeout_ms: 2_000,
-            allowed_http_hosts: "api.example.com",
-            allowed_secrets: "",
-            allowed_storage_prefixes: "",
-            allowed_channels: "",
-            fuel_budget: 10_000_000,
-            max_memory_bytes: 64 * 1024 * 1024,
-            max_table_elements: 100_000,
-            max_instances: 256,
-        })?;
+        spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime_in_safe_mode(
+            WasmRuntimeSpawnConfig {
+                openai_base_url: openai_base_url.as_str(),
+                openai_api_key: OPENAI_API_KEY,
+                allowed_tools: "palyra.plugin.run",
+                max_calls_per_run: 2,
+                execution_timeout_ms: 2_000,
+                allowed_http_hosts: "api.example.com",
+                allowed_secrets: "",
+                allowed_storage_prefixes: "",
+                allowed_channels: "",
+                fuel_budget: 10_000_000,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 256,
+            },
+            &["palyra.plugin.run"],
+        )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -13025,6 +13030,29 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy(
     )
 }
 
+fn spawn_palyrad_with_openai_provider_and_tool_policy_in_safe_mode(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    allowed_tools: &str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+    approval_required_tools: &[&str],
+) -> Result<(Child, u16, u16, PathBuf)> {
+    spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollout_retries_and_console(
+        openai_base_url,
+        openai_api_key,
+        allowed_tools,
+        max_calls_per_run,
+        execution_timeout_ms,
+        false,
+        0,
+        None,
+        None,
+        &[],
+        approval_required_tools,
+    )
+}
+
 fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollout(
     openai_base_url: &str,
     openai_api_key: &str,
@@ -13083,6 +13111,7 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout_and_
         None,
         Some(provider_request_timeout_ms),
         extra_env,
+        &[],
     )
 }
 
@@ -13106,6 +13135,7 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
         None,
         None,
         &[],
+        &[],
     )
 }
 
@@ -13117,6 +13147,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_console_principal(
     max_calls_per_run: u32,
     execution_timeout_ms: u64,
     bound_console_principal: &str,
+    approval_required_tools: &[&str],
 ) -> Result<(Child, u16, u16, PathBuf)> {
     spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollout_retries_and_console(
         openai_base_url,
@@ -13129,6 +13160,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_console_principal(
         Some(bound_console_principal),
         None,
         &[],
+        approval_required_tools,
     )
 }
 
@@ -13144,12 +13176,14 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
     bound_console_principal: Option<&str>,
     provider_request_timeout_ms: Option<u64>,
     extra_env: &[(&str, &str)],
+    approval_required_tools: &[&str],
 ) -> Result<(Child, u16, u16, PathBuf)> {
     let config_path = write_base_daemon_config()?;
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
     prepare_test_vault_dir(&vault_dir)?;
+    seed_explicit_tool_approval_posture(&identity_store_dir, approval_required_tools)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
     let command = apply_isolated_daemon_test_env(&mut command, &config_path);
     command
@@ -13407,6 +13441,27 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy(
         execution_timeout_ms,
         false,
         None,
+        &[],
+    )
+}
+
+fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_in_safe_mode(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    allowed_tools: &str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+    approval_required_tools: &[&str],
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    spawn_palyrad_with_openai_provider_and_channel_router_tool_policy_options(
+        openai_base_url,
+        openai_api_key,
+        allowed_tools,
+        max_calls_per_run,
+        execution_timeout_ms,
+        false,
+        None,
+        approval_required_tools,
     )
 }
 
@@ -13426,16 +13481,18 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_ca
         execution_timeout_ms,
         false,
         Some(catalog_exposure_mode),
+        &[],
     )
 }
 
-fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_execution_gate_rollout(
+fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_execution_gate_rollout_in_safe_mode(
     openai_base_url: &str,
     openai_api_key: &str,
     allowed_tools: &str,
     max_calls_per_run: u32,
     execution_timeout_ms: u64,
     execution_gate_rollout_enabled: bool,
+    approval_required_tools: &[&str],
 ) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     spawn_palyrad_with_openai_provider_and_channel_router_tool_policy_options(
         openai_base_url,
@@ -13445,6 +13502,7 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_ex
         execution_timeout_ms,
         execution_gate_rollout_enabled,
         None,
+        approval_required_tools,
     )
 }
 
@@ -13457,12 +13515,14 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_tool_policy_options(
     execution_timeout_ms: u64,
     execution_gate_rollout_enabled: bool,
     catalog_exposure_mode: Option<&str>,
+    approval_required_tools: &[&str],
 ) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     let config_path = write_channel_router_config()?;
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
     prepare_test_vault_dir(&vault_dir)?;
+    seed_explicit_tool_approval_posture(&identity_store_dir, approval_required_tools)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
     let command = apply_isolated_daemon_test_env(&mut command, &config_path)
         .args([
@@ -13741,6 +13801,20 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(
         config,
         config_path,
         "failed to start palyrad with wasm runtime policy",
+        &[],
+    )
+}
+
+fn spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime_in_safe_mode(
+    config: WasmRuntimeSpawnConfig<'_>,
+    approval_required_tools: &[&str],
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    let config_path = write_wasm_runtime_config(&config)?;
+    spawn_palyrad_with_openai_provider_tool_policy_config(
+        config,
+        config_path,
+        "failed to start palyrad with wasm runtime policy",
+        approval_required_tools,
     )
 }
 
@@ -13752,6 +13826,7 @@ fn spawn_palyrad_with_openai_provider_channel_router_tool_policy_and_wasm_runtim
         config,
         config_path,
         "failed to start palyrad with channel-router + wasm runtime policy",
+        &[],
     )
 }
 
@@ -13759,11 +13834,13 @@ fn spawn_palyrad_with_openai_provider_tool_policy_config(
     config: WasmRuntimeSpawnConfig<'_>,
     config_path: PathBuf,
     spawn_context: &'static str,
+    approval_required_tools: &[&str],
 ) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
     prepare_test_vault_dir(&vault_dir)?;
+    seed_explicit_tool_approval_posture(&identity_store_dir, approval_required_tools)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
     let mut child = apply_isolated_daemon_test_env(&mut command, &config_path)
         .args([
@@ -13882,6 +13959,50 @@ fn apply_isolated_daemon_test_env<'a>(
         .env_remove("https_proxy")
         .env_remove("no_proxy")
         .env_remove("all_proxy")
+}
+
+fn seed_explicit_tool_approval_posture(
+    identity_store_dir: &Path,
+    approval_required_tools: &[&str],
+) -> Result<()> {
+    if approval_required_tools.is_empty() {
+        return Ok(());
+    }
+    let state_root = identity_store_dir
+        .parent()
+        .context("test identity store should have a runtime state parent")?;
+    let registry_dir = state_root.join("tool-posture");
+    fs::create_dir_all(&registry_dir).with_context(|| {
+        format!("failed to create test tool posture directory at {}", registry_dir.display())
+    })?;
+    let overrides = approval_required_tools
+        .iter()
+        .map(|tool_name| {
+            serde_json::json!({
+                "tool_name": tool_name,
+                "scope_kind": "global",
+                "scope_id": "global",
+                "state": "ask_each_time",
+                "reason": "explicit safe mode for approval flow integration test",
+                "actor_principal": "test:harness",
+                "source": "integration_test_safe_mode",
+                "created_at_unix_ms": 1,
+                "updated_at_unix_ms": 1
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut payload = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 2,
+        "overrides": overrides,
+        "recommendation_actions": [],
+        "audit_events": []
+    }))
+    .context("failed to serialize test tool posture registry")?;
+    payload.push(b'\n');
+    let registry_path = registry_dir.join("registry.json");
+    fs::write(&registry_path, payload).with_context(|| {
+        format!("failed to write test tool posture registry at {}", registry_path.display())
+    })
 }
 
 fn write_wasm_runtime_config(config: &WasmRuntimeSpawnConfig<'_>) -> Result<PathBuf> {
