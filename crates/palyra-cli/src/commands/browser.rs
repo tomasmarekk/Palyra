@@ -4860,8 +4860,11 @@ fn browser_identifier_json_value(value: Option<&str>) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Returns the public browser session handle unchanged so CLI output can feed
+/// follow-up lifecycle commands. Authentication and principal checks, rather
+/// than identifier secrecy, protect the browser service.
 fn browser_session_handle_text(value: Option<&str>) -> String {
-    redacted_browser_identifier_text(value.map(str::trim), "session")
+    value.map(str::trim).filter(|candidate| !candidate.is_empty()).unwrap_or("-").to_owned()
 }
 
 /// Keeps the operator-supplied id in `session_id` so output stays reusable in
@@ -4949,7 +4952,7 @@ fn quoted_browser_text_field(value: &str) -> String {
 
 fn browser_identifier_kind_for_key(key: &str) -> Option<&'static str> {
     match key {
-        "session_id" | "runtime_session_id" => Some("session"),
+        "runtime_session_id" => Some("session"),
         "active_tab_id" | "tab_id" | "closed_tab_id" => Some("tab"),
         "profile_id" | "active_profile_id" => Some("profile"),
         "artifact_id" => Some("artifact"),
@@ -5832,7 +5835,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_session_list_text_redacts_reusable_session_id() {
+    fn browser_session_list_text_preserves_reusable_session_id() {
         let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let line = format_browser_session_summary_text(&browser_v1::BrowserSessionSummary {
             session_id: Some(common_v1::CanonicalId { ulid: session_id.to_owned() }),
@@ -5843,10 +5846,9 @@ mod tests {
         });
 
         assert!(
-            line.contains("session_id=session-"),
-            "session list text should use a redacted session handle: {line}"
+            line.contains(format!("session_id={session_id}").as_str()),
+            "session list text should expose a reusable session handle: {line}"
         );
-        assert!(!line.contains(session_id), "{line}");
     }
 
     #[test]
@@ -5876,8 +5878,7 @@ mod tests {
             None,
         );
 
-        assert!(text.contains("browser.console session_id=session-"));
-        assert!(!text.contains(session_id), "{text}");
+        assert!(text.contains(format!("browser.console session_id={session_id}").as_str()));
         assert!(text.contains("entries=2"));
         assert!(text.contains("severity=info"));
         assert!(text.contains("source=\"console.log\""));
@@ -5887,7 +5888,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_output_redaction_hashes_reusable_session_id() {
+    fn browser_output_redaction_preserves_public_session_id() {
         let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let runtime_session_id = "session-b66347f61acd";
         let mut value = json!({
@@ -5898,13 +5899,7 @@ mod tests {
 
         redact_browser_output_value(&mut value, None);
 
-        assert!(
-            value
-                .get("session_id")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value.starts_with("session-") && value != session_id),
-            "session id should be redacted: {value}"
-        );
+        assert_eq!(value.get("session_id").and_then(Value::as_str), Some(session_id));
         assert!(
             value
                 .get("runtime_session_id")
@@ -5922,15 +5917,14 @@ mod tests {
     }
 
     #[test]
-    fn session_scoped_text_redacts_requested_session_id() {
+    fn session_scoped_text_preserves_requested_session_id() {
         let requested = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let text = format!(
             "browser.screenshot session_id={}",
             browser_session_handle_text(Some(requested))
         );
 
-        assert!(text.contains("session_id=session-"), "{text}");
-        assert!(!text.contains(requested), "{text}");
+        assert!(text.contains(format!("session_id={requested}").as_str()), "{text}");
         assert!(!text.contains("runtime_session_id="), "{text}");
     }
 

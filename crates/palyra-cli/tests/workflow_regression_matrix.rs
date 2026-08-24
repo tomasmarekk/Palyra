@@ -17,7 +17,6 @@ use std::{
 mod workflow_binaries;
 
 use anyhow::{Context, Result};
-use palyra_cli::proto::palyra::browser::v1 as browser_v1;
 use palyra_cli::proto::palyra::gateway::v1 as gateway_v1;
 use palyra_skills::{build_signed_skill_artifact, ArtifactFile, SkillArtifactBuildRequest};
 use reqwest::blocking::Client as BlockingClient;
@@ -994,17 +993,12 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
     let created_session_id = session_create_payload
         .get("session_id")
         .and_then(Value::as_str)
-        .context("browser session create should return a redacted session_id")?;
+        .context("browser session create should return a reusable session_id")?;
     assert!(
-        created_session_id.starts_with("session-") && created_session_id.len() == 20,
-        "browser session create should return a stable redacted handle: {created_session_id}"
+        Ulid::from_string(created_session_id).is_ok(),
+        "browser session create should return a canonical ULID: {created_session_id}"
     );
-    let session_id =
-        latest_browser_session_id(browser_endpoint.as_str(), BROWSER_AUTH_TOKEN, "admin:local")?;
-    assert_ne!(
-        created_session_id, session_id,
-        "browser session create must not expose the internal canonical ULID"
-    );
+    let session_id = created_session_id.to_owned();
 
     let session_list_after =
         run_cli_json(&workdir, &["browser", "session", "list"], &browser_cli_env)?;
@@ -1021,7 +1015,7 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
     assert_eq!(
         sessions.first().and_then(|session| session.get("session_id")).and_then(Value::as_str),
         Some(created_session_id),
-        "session create and list should use the same stable redacted handle"
+        "session create and list should expose the same reusable canonical handle"
     );
     assert_eq!(
         sessions.first().and_then(|session| session.get("principal")).and_then(Value::as_str),
@@ -2025,42 +2019,6 @@ fn channel_admin_fixture_response(request_line: &str) -> Result<String> {
     };
 
     serde_json::to_string_pretty(&payload).context("fixture response should serialize to JSON")
-}
-
-fn latest_browser_session_id(grpc_url: &str, auth_token: &str, principal: &str) -> Result<String> {
-    let runtime = Runtime::new().context("failed to create Tokio runtime")?;
-    runtime.block_on(async move {
-        let channel = Endpoint::from_shared(grpc_url.to_owned())
-            .context("invalid browser gRPC endpoint")?
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(5))
-            .connect()
-            .await
-            .context("failed to connect browser gRPC endpoint")?;
-        let mut client = browser_v1::browser_service_client::BrowserServiceClient::new(channel);
-        let mut request = Request::new(browser_v1::ListSessionsRequest {
-            v: 1,
-            principal: String::new(),
-            limit: 10,
-        });
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from(format!("Bearer {auth_token}"))
-                .context("invalid authorization metadata")?,
-        );
-        request.metadata_mut().insert(
-            "x-palyra-principal",
-            MetadataValue::try_from(principal).context("invalid principal metadata")?,
-        );
-        let response =
-            client.list_sessions(request).await.context("list_sessions RPC failed")?.into_inner();
-        response
-            .sessions
-            .first()
-            .and_then(|summary| summary.session_id.as_ref())
-            .map(|value| value.ulid.clone())
-            .context("browser service returned no sessions after CLI create")
-    })
 }
 
 fn resolve_gateway_session_id(
