@@ -2311,7 +2311,7 @@ fn browser_tool_description(tool_name: &str) -> &'static str {
         "palyra.browser.type" => "Type text in a brokered browser session.",
         "palyra.browser.fill" => "Replace an element value in a brokered browser session.",
         "palyra.browser.upload" => {
-            "Set a file input from an audited workspace or launch-context file path."
+            "Set a file input from an audited workspace or explicitly approved OS-file root."
         }
         "palyra.browser.press" => "Press a key in a brokered browser session.",
         "palyra.browser.select" => "Select an option in a brokered browser session.",
@@ -2456,7 +2456,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             ));
             properties.push((
                 "file_path",
-                json!({"type":"string","description":"Workspace-relative path, absolute path inside active agent workspace roots, or explicit run-launch environment path prefix to upload. Implicit user-profile and temp roots are not readable by this tool. The daemon resolves and audits the path; protected system paths are denied."}),
+                json!({"type":"string","description":"Workspace-relative path, absolute path inside active agent workspace roots, or a path inside an operator-approved PALYRA_OS_FILE_ROOTS root. An explicit run-launch environment path prefix is accepted only as an alias and cannot grant access by itself. Implicit user-profile and temp roots are not readable by this tool. The daemon resolves the opened regular-file handle without following a final symlink or reparse point; protected system paths are denied."}),
             ));
             properties
                 .push(("capture_failure_screenshot", json!({"type":"boolean","default":true})));
@@ -3197,6 +3197,8 @@ mod tests {
             .expect("upload file_path description should be visible to models");
         assert!(file_path_description.contains("Workspace-relative path"));
         assert!(file_path_description.contains("run-launch environment path prefix"));
+        assert!(file_path_description.contains("PALYRA_OS_FILE_ROOTS"));
+        assert!(file_path_description.contains("regular-file handle"));
         assert!(file_path_description.contains("user-profile and temp roots are not readable"));
 
         let downloads_list =

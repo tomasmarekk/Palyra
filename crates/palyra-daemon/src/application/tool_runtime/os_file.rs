@@ -1397,6 +1397,41 @@ fn open_os_file_for_read(
     Ok((file, opened_path))
 }
 
+/// Opens a regular file without following its final symlink or reparse point,
+/// then reauthorizes the resolved handle against the supplied canonical roots.
+pub(crate) fn open_regular_file_for_read_under_roots(
+    tool_name: &str,
+    path: &Path,
+    input_path: &str,
+    allowed_roots: &[PathBuf],
+) -> Result<(File, PathBuf), String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_os_file_no_follow(&mut options);
+    let file = options
+        .open(path)
+        .map_err(|error| format!("{tool_name} failed to open input file {input_path}: {error}"))?;
+    let metadata = file.metadata().map_err(|error| {
+        format!("{tool_name} failed to inspect opened input file {input_path}: {error}")
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{tool_name} refused symlink input file {input_path}"));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{tool_name} input path is not a regular file: {input_path}"));
+    }
+    let opened_path = canonicalize_open_file_path(tool_name, &file, input_path)?;
+    if protected_os_path(opened_path.as_path()) {
+        return Err(format!("{tool_name} denied protected OS path"));
+    }
+    if !allowed_roots.iter().any(|root| path_starts_with(opened_path.as_path(), root.as_path())) {
+        return Err(format!(
+            "{tool_name} opened input file is outside agent workspace roots and approved user-owned OS roots"
+        ));
+    }
+    Ok((file, opened_path))
+}
+
 fn open_os_file_for_write(
     policy: &OsFilePolicy,
     path: &Path,
@@ -1463,7 +1498,7 @@ fn ensure_open_os_file_allowed(
     if !metadata.is_file() {
         return Err(format!("{OS_FILE_TOOL_NAME} target is not a regular file: {input_path}"));
     }
-    let opened_path = canonicalize_open_os_file_path(file, input_path)?;
+    let opened_path = canonicalize_open_file_path(OS_FILE_TOOL_NAME, file, input_path)?;
     ensure_os_path_allowed(
         policy,
         &ResolvedOsPath {
@@ -1495,15 +1530,22 @@ fn configure_os_file_no_follow(_options: &mut OpenOptions) {}
 /// Resolves the actual target held by an open descriptor rather than trusting
 /// a path that may have changed since its pre-open policy check.
 #[cfg(target_os = "linux")]
-fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
+fn canonicalize_open_file_path(
+    tool_name: &str,
+    file: &File,
+    input_path: &str,
+) -> Result<PathBuf, String> {
     let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
-    fs::canonicalize(fd_path).map_err(|error| {
-        format!("{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: {error}")
-    })
+    fs::canonicalize(fd_path)
+        .map_err(|error| format!("{tool_name} failed to resolve opened file {input_path}: {error}"))
 }
 
 #[cfg(target_os = "macos")]
-fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
+fn canonicalize_open_file_path(
+    tool_name: &str,
+    file: &File,
+    input_path: &str,
+) -> Result<PathBuf, String> {
     let mut buffer = vec![0 as libc::c_char; libc::PATH_MAX as usize];
     let result = unsafe {
         // SAFETY: The descriptor is borrowed from a live File and the buffer
@@ -1512,7 +1554,7 @@ fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathB
     };
     if result == -1 {
         return Err(format!(
-            "{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: {}",
+            "{tool_name} failed to resolve opened file {input_path}: {}",
             std::io::Error::last_os_error()
         ));
     }
@@ -1521,21 +1563,27 @@ fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathB
         std::ffi::CStr::from_ptr(buffer.as_ptr())
     };
     let opened_path = PathBuf::from(std::ffi::OsString::from_vec(opened_path.to_bytes().to_vec()));
-    fs::canonicalize(opened_path).map_err(|error| {
-        format!("{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: {error}")
-    })
+    fs::canonicalize(opened_path)
+        .map_err(|error| format!("{tool_name} failed to resolve opened file {input_path}: {error}"))
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
+fn canonicalize_open_file_path(
+    tool_name: &str,
+    file: &File,
+    input_path: &str,
+) -> Result<PathBuf, String> {
     let fd_path = format!("/dev/fd/{}", file.as_raw_fd());
-    fs::canonicalize(fd_path).map_err(|error| {
-        format!("{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: {error}")
-    })
+    fs::canonicalize(fd_path)
+        .map_err(|error| format!("{tool_name} failed to resolve opened file {input_path}: {error}"))
 }
 
 #[cfg(windows)]
-fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
+fn canonicalize_open_file_path(
+    tool_name: &str,
+    file: &File,
+    input_path: &str,
+) -> Result<PathBuf, String> {
     use windows_sys::Win32::Storage::FileSystem::{
         GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
     };
@@ -1554,13 +1602,13 @@ fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathB
         };
         if length == 0 {
             return Err(format!(
-                "{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: {}",
+                "{tool_name} failed to resolve opened file {input_path}: {}",
                 std::io::Error::last_os_error()
             ));
         }
         let length = usize::try_from(length).map_err(|_| {
             format!(
-                "{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: path length exceeds platform limits"
+                "{tool_name} failed to resolve opened file {input_path}: path length exceeds platform limits"
             )
         })?;
         if length < buffer.len() {
@@ -1572,10 +1620,12 @@ fn canonicalize_open_os_file_path(file: &File, input_path: &str) -> Result<PathB
 }
 
 #[cfg(not(any(unix, windows)))]
-fn canonicalize_open_os_file_path(_file: &File, input_path: &str) -> Result<PathBuf, String> {
-    Err(format!(
-        "{OS_FILE_TOOL_NAME} failed to resolve opened file {input_path}: unsupported platform"
-    ))
+fn canonicalize_open_file_path(
+    tool_name: &str,
+    _file: &File,
+    input_path: &str,
+) -> Result<PathBuf, String> {
+    Err(format!("{tool_name} failed to resolve opened file {input_path}: unsupported platform"))
 }
 
 /// Central containment gate: every operation must pass its resolved path

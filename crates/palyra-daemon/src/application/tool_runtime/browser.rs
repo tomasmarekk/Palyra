@@ -15,7 +15,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -38,10 +38,13 @@ use ulid::Ulid;
 
 use crate::{
     agents::{AgentResolutionSource, AgentResolveRequest},
-    application::tool_runtime::workspace_scope::{
-        relative_path_already_targets_active_root, relative_path_should_use_active_root,
-        run_launch_context_path_env, session_active_workspace_root,
-        workspace_roots_with_run_launch_context_for_agent_source, ActiveWorkspaceRoot,
+    application::tool_runtime::{
+        os_file::open_regular_file_for_read_under_roots,
+        workspace_scope::{
+            relative_path_already_targets_active_root, relative_path_should_use_active_root,
+            run_launch_context_path_env, session_active_workspace_root,
+            workspace_roots_with_run_launch_context_for_agent_source, ActiveWorkspaceRoot,
+        },
     },
     gateway::{
         current_unix_ms, truncate_with_ellipsis, BrowserServiceRuntimeConfig, GatewayRuntimeState,
@@ -673,39 +676,57 @@ async fn read_browser_upload_file(
     let workspace_roots =
         resolve_browser_read_workspace_roots(runtime_state, context, BROWSER_UPLOAD_TOOL_NAME)
             .await?;
+    let user_owned_roots = browser_upload_approved_os_roots();
     let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
-    let canonical = resolve_browser_upload_path(file_path, workspace_roots.as_slice(), &path_env)?;
-    let metadata = fs::metadata(canonical.as_path()).map_err(|error| {
+    let canonical = resolve_browser_upload_path(
+        file_path,
+        workspace_roots.as_slice(),
+        user_owned_roots.as_slice(),
+        &path_env,
+    )?;
+    let mut allowed_roots = workspace_roots;
+    allowed_roots.extend(user_owned_roots);
+    let (file, opened_path) = open_regular_file_for_read_under_roots(
+        BROWSER_UPLOAD_TOOL_NAME,
+        canonical.as_path(),
+        file_path,
+        allowed_roots.as_slice(),
+    )?;
+    let metadata = file.metadata().map_err(|error| {
         format!(
             "{BROWSER_UPLOAD_TOOL_NAME} failed to inspect upload file {}: {error}",
-            canonical.display()
+            opened_path.display()
         )
     })?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "{BROWSER_UPLOAD_TOOL_NAME} upload path is not a regular file: {}",
-            canonical.display()
-        ));
-    }
     if metadata.len() > BROWSER_UPLOAD_MAX_FILE_BYTES {
         return Err(format!(
             "{BROWSER_UPLOAD_TOOL_NAME} upload file exceeds max bytes ({} > {BROWSER_UPLOAD_MAX_FILE_BYTES})",
             metadata.len()
         ));
     }
-    let file_name = canonical
+    let file_name = opened_path
         .file_name()
         .and_then(|value| value.to_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("{BROWSER_UPLOAD_TOOL_NAME} upload path has no file name"))?
         .to_owned();
-    let file_bytes = fs::read(canonical.as_path()).map_err(|error| {
-        format!(
-            "{BROWSER_UPLOAD_TOOL_NAME} failed to read upload file {}: {error}",
-            canonical.display()
-        )
-    })?;
+    let mut file_bytes = Vec::with_capacity(
+        usize::try_from(metadata.len().min(BROWSER_UPLOAD_MAX_FILE_BYTES)).unwrap_or(0),
+    );
+    file.take(BROWSER_UPLOAD_MAX_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut file_bytes)
+        .map_err(|error| {
+            format!(
+                "{BROWSER_UPLOAD_TOOL_NAME} failed to read upload file {}: {error}",
+                opened_path.display()
+            )
+        })?;
+    if file_bytes.len() as u64 > BROWSER_UPLOAD_MAX_FILE_BYTES {
+        return Err(format!(
+            "{BROWSER_UPLOAD_TOOL_NAME} upload file exceeds max bytes while reading"
+        ));
+    }
     Ok((file_name, file_bytes))
 }
 
@@ -713,15 +734,16 @@ async fn read_browser_upload_file(
 /// roots.
 ///
 /// Resolution order: launch-env-prefixed paths expand first, then every
-/// absolute result must fall inside an authorized workspace root. Launch env
-/// values are path aliases, not additional read grants. Relative paths are
-/// confined to the first workspace root.
+/// absolute result must fall inside an authorized workspace or approved
+/// user-owned OS root. Launch env values are path aliases, not additional read
+/// grants. Relative paths are confined to the first workspace root.
 /// Uploads intentionally do not fall back to daemon process env because those
 /// variables commonly point at credential files.
 /// Protected OS locations are denied regardless of root membership.
 fn resolve_browser_upload_path(
     file_path: &str,
     workspace_roots: &[PathBuf],
+    user_owned_roots: &[PathBuf],
     path_env: &BTreeMap<String, PathBuf>,
 ) -> Result<PathBuf, String> {
     let requested = expand_browser_env_prefixed_path(
@@ -750,9 +772,9 @@ fn resolve_browser_upload_path(
             canonical.display()
         ));
     }
-    if !canonical_file_path_is_inside_workspace_roots(canonical.as_path(), workspace_roots) {
+    if !workspace_roots.iter().chain(user_owned_roots).any(|root| canonical.starts_with(root)) {
         return Err(format!(
-            "{BROWSER_UPLOAD_TOOL_NAME} upload file {} is outside agent workspace roots; launch environment aliases do not grant file access",
+            "{BROWSER_UPLOAD_TOOL_NAME} upload file {} is outside agent workspace roots and approved user-owned OS roots; launch environment aliases do not grant file access",
             canonical.display()
         ));
     }
@@ -1257,6 +1279,20 @@ fn configured_browser_user_os_roots() -> Option<Vec<PathBuf>> {
     } else {
         Some(roots)
     }
+}
+
+/// Browser uploads admit only roots explicitly configured for OS-file access.
+///
+/// Unlike artifact outputs, uploads read bytes that a page can transmit, so
+/// implicit profile and temp roots do not become browser input authority.
+fn browser_upload_approved_os_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(configured_roots) = configured_browser_user_os_roots() {
+        for root in configured_roots {
+            push_browser_canonical_root(&mut roots, root);
+        }
+    }
+    roots
 }
 
 #[cfg(windows)]
@@ -6713,6 +6749,7 @@ mod tests {
         let resolved = resolve_browser_upload_path(
             "$PALYRA_E2E_OS_ROOT/downloads/upload-input.csv",
             std::slice::from_ref(&canonical_root),
+            &[],
             &path_env,
         )
         .expect("env-prefixed upload file should resolve inside an authorized workspace root");
@@ -6738,7 +6775,7 @@ mod tests {
             ScopedEnvVar::set("AWS_SHARED_CREDENTIALS_FILE", credentials_file.as_path());
 
         let error =
-            resolve_browser_upload_path("$AWS_SHARED_CREDENTIALS_FILE", &[], &BTreeMap::new())
+            resolve_browser_upload_path("$AWS_SHARED_CREDENTIALS_FILE", &[], &[], &BTreeMap::new())
                 .expect_err("browser upload must not expand daemon process env locators");
 
         assert!(
@@ -6767,6 +6804,7 @@ mod tests {
         let error = resolve_browser_upload_path(
             canonical_upload.to_string_lossy().as_ref(),
             std::slice::from_ref(&canonical_workspace),
+            &[],
             &path_env,
         )
         .expect_err("request-supplied launch env root must not grant browser upload access");
@@ -6789,6 +6827,7 @@ mod tests {
         let error = resolve_browser_upload_path(
             upload.to_string_lossy().as_ref(),
             std::slice::from_ref(&canonical_agent),
+            &[],
             &BTreeMap::new(),
         )
         .expect_err("launch cwd must not implicitly authorize browser upload reads");
@@ -6817,11 +6856,50 @@ mod tests {
         let error = resolve_browser_upload_path(
             key_file.to_string_lossy().as_ref(),
             std::slice::from_ref(&canonical_workspace),
+            &[],
             &BTreeMap::new(),
         )
         .expect_err("implicit home roots must not authorize browser upload reads");
 
         assert!(error.contains("outside agent workspace roots"), "{error}");
+    }
+
+    #[test]
+    fn browser_upload_path_accepts_explicitly_approved_os_root() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        let approved = temp.path().join("approved");
+        let adjacent = temp.path().join("adjacent");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        std::fs::create_dir_all(approved.as_path()).expect("approved root should exist");
+        std::fs::create_dir_all(adjacent.as_path()).expect("adjacent root should exist");
+        let upload = approved.join("upload-input.csv");
+        let denied = adjacent.join("denied.csv");
+        std::fs::write(upload.as_path(), "sku,qty\nE2E-WIDGET,1\n")
+            .expect("approved upload should exist");
+        std::fs::write(denied.as_path(), "secret\n").expect("adjacent upload should exist");
+        let canonical_workspace = workspace.canonicalize().expect("workspace should canonicalize");
+        let canonical_approved =
+            approved.canonicalize().expect("approved root should canonicalize");
+        let canonical_upload = upload.canonicalize().expect("upload should canonicalize");
+
+        let resolved = resolve_browser_upload_path(
+            upload.to_string_lossy().as_ref(),
+            std::slice::from_ref(&canonical_workspace),
+            std::slice::from_ref(&canonical_approved),
+            &BTreeMap::new(),
+        )
+        .expect("explicitly approved OS file should be accepted");
+        assert_eq!(resolved, canonical_upload);
+
+        let error = resolve_browser_upload_path(
+            denied.to_string_lossy().as_ref(),
+            std::slice::from_ref(&canonical_workspace),
+            std::slice::from_ref(&canonical_approved),
+            &BTreeMap::new(),
+        )
+        .expect_err("adjacent OS file should remain denied");
+        assert!(error.contains("approved user-owned OS roots"), "{error}");
     }
 
     #[test]
