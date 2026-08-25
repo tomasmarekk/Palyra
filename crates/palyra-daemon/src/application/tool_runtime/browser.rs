@@ -41,8 +41,8 @@ use crate::{
     application::tool_runtime::{
         os_file::open_regular_file_for_read_under_roots,
         workspace_scope::{
-            relative_path_already_targets_active_root, relative_path_should_use_active_root,
-            run_launch_context_path_env, session_active_workspace_root,
+            relative_path_already_targets_active_root, run_launch_context_path_env,
+            session_active_workspace_root,
             workspace_roots_with_run_launch_context_for_agent_source, ActiveWorkspaceRoot,
         },
     },
@@ -1095,13 +1095,13 @@ fn browser_relative_output_base_root(
     active_workspace_root: Option<&ActiveWorkspaceRoot>,
 ) -> Option<PathBuf> {
     let active_workspace_root = active_workspace_root?;
-    if relative_path_should_use_active_root(output_path, active_workspace_root) {
-        return Some(active_workspace_root.root.clone());
-    }
     if relative_path_already_targets_active_root(output_path, active_workspace_root) {
         return workspace_root_for_active_relative_path(workspace_roots, active_workspace_root);
     }
-    None
+    // Browser artifacts intentionally follow the active work directory. File
+    // and patch tools use a stricter existence-based heuristic because their
+    // relative paths describe source targets rather than generated evidence.
+    Some(active_workspace_root.root.clone())
 }
 
 /// Finds the workspace root under which the active workspace's relative path

@@ -14479,11 +14479,12 @@ mod tests {
             .expect("workspace fixture should be written");
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
             .expect("workspace root should canonicalize");
-        let expected_script = canonical_workspace
-            .join("e2e-file-workflow")
-            .join("test.js")
-            .to_string_lossy()
-            .to_string();
+        let expected_workspace = super::child_process_path(canonical_workspace.as_path());
+        let expected_script = super::child_process_path(
+            canonical_workspace.join("e2e-file-workflow").join("test.js").as_path(),
+        )
+        .to_string_lossy()
+        .to_string();
         let policy = sandbox_policy_with_allowed_executables(
             canonical_workspace.clone(),
             vec!["node".into()],
@@ -14520,7 +14521,7 @@ mod tests {
         let args =
             command.get_args().map(|arg| arg.to_string_lossy().to_string()).collect::<Vec<_>>();
 
-        assert_eq!(args[0], canonical_workspace.to_string_lossy());
+        assert_eq!(args[0], expected_workspace.to_string_lossy());
         assert_eq!(args[1], format!("--config={expected_script}"));
 
         let _ = fs::remove_dir_all(workspace.as_path());
@@ -20885,7 +20886,9 @@ api key: qwerty
         assert_eq!(rewritten[1], "-File");
         assert_eq!(
             rewritten[2],
-            workspace_root.join("scripts").join("check.ps1").display().to_string()
+            super::child_process_path(workspace_root.join("scripts").join("check.ps1").as_path())
+                .display()
+                .to_string()
         );
 
         let _ = fs::remove_dir_all(workspace.as_path());

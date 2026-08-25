@@ -2061,20 +2061,20 @@ mod tests {
         );
 
         assert!(
-            patch_should_use_active_root(audit_patch, &active),
-            "same-looking relative paths must remain anchored to the active focus"
+            !patch_should_use_active_root(audit_patch, &active),
+            "an existing sibling path must retain its agent-root-relative meaning"
         );
         assert!(
             patch_should_use_active_root(nested_patch, &active),
             "missing nested active-root parents must not fall back to the broader workspace"
         );
         assert!(
-            patch_should_use_active_root(report_patch, &active),
-            "single-file writes without an explicit prefix should still target the active focus"
+            !patch_should_use_active_root(report_patch, &active),
+            "a missing single-file target must not inherit an unrelated active focus"
         );
         assert!(
-            patch_should_use_active_root(unified_patch, &active),
-            "unified diffs must use the same active-root decision as canonical patches"
+            !patch_should_use_active_root(unified_patch, &active),
+            "unified diffs must retain missing agent-root-relative targets"
         );
         assert!(
             !patch_should_use_active_root(explicit_active_unified_patch, &active),
