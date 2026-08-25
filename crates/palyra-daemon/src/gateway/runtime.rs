@@ -348,6 +348,22 @@ fn process_reconciliation_report_id(
     format!("process-reconcile:{}", &digest[..32])
 }
 
+fn process_reconciliation_replay_is_superseded(
+    stored: &RuntimeHandleDescriptorV1,
+    projected: &RuntimeHandleDescriptorV1,
+    report_replayed: bool,
+) -> bool {
+    report_replayed
+        && matches!(
+            stored.state,
+            RuntimeHandleState::Closed
+                | RuntimeHandleState::Orphaned
+                | RuntimeHandleState::Quarantined
+        )
+        && stored.updated_at_unix_ms >= projected.updated_at_unix_ms
+        && stored != projected
+}
+
 fn provider_health_component_id(
     provider_id: &str,
 ) -> Result<RuntimeInstanceId, palyra_common::runtime_contracts::RuntimeIdentityError> {
@@ -5962,9 +5978,27 @@ impl GatewayRuntimeState {
                     "exact process reconciliation report conflicts with current durable evidence",
                 ));
             }
-            let mut descriptor = record.descriptor;
+            let mut descriptor = record.descriptor.clone();
             descriptor.state = handle_state;
             descriptor.updated_at_unix_ms = completed_at_unix_ms;
+            if process_reconciliation_replay_is_superseded(
+                &record.descriptor,
+                &descriptor,
+                replayed_report.is_some(),
+            ) {
+                // The exact observation is already durable, but a later reconciliation moved the
+                // unresolved handle forward. Replaying the older report must not roll back that
+                // terminal descriptor or turn a safe restart into an admission failure.
+                warn!(
+                    instance_id = %record.descriptor.instance_id.as_str(),
+                    report_id = %report.report_id,
+                    stored_state = %record.descriptor.state.as_str(),
+                    projected_state = %descriptor.state.as_str(),
+                    reason_code = "runtime.cleanup.superseded_replay_skipped",
+                    "skipping superseded process reconciliation report replay"
+                );
+                continue;
+            }
             let cleanup_run_id =
                 descriptor.run_id.as_ref().map(|run_id| run_id.as_str().to_owned());
             self.journal_store.finalize_process_cleanup(&descriptor, &report).map_err(|error| {

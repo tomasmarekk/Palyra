@@ -2165,6 +2165,76 @@ fn expired_unverifiable_process_lease_remains_orphaned_and_retained() {
     assert_eq!(repeated_diagnostics.cleanup_reports_by_outcome.get("unknown"), Some(&1));
 }
 
+#[test]
+fn process_reconciliation_ignores_superseded_exact_report_replay() {
+    let state = build_test_runtime_state(false);
+    let pid = 3_760_000_u32.saturating_add(std::process::id());
+    persist_gateway_process_lease(&state, 10_001, pid, 2);
+
+    let first = state
+        .reconcile_persisted_process_leases()
+        .expect("initial unresolved reconciliation should succeed");
+    assert_eq!(first.inspected_count, 1);
+    assert_eq!(first.orphaned_count, 1);
+    let retained = state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("initial unresolved lease should remain durable")
+        .into_iter()
+        .next()
+        .expect("initial unresolved lease should remain present");
+    assert_eq!(retained.descriptor.state, RuntimeHandleState::Orphaned);
+
+    let newer_at_unix_ms = retained.descriptor.updated_at_unix_ms.saturating_add(1);
+    let mut newer_descriptor = retained.descriptor.clone();
+    newer_descriptor.state = RuntimeHandleState::Quarantined;
+    newer_descriptor.updated_at_unix_ms = newer_at_unix_ms;
+    state
+        .journal_store
+        .finalize_process_cleanup(
+            &newer_descriptor,
+            &CleanupReportV1 {
+                schema_version: 1,
+                report_id: "process-reconcile:newer-quarantine-evidence".to_owned(),
+                instance_id: newer_descriptor.instance_id.clone(),
+                lease_id: Some(retained.lease.lease_id.clone()),
+                outcome: CleanupOutcome::Unknown,
+                steps: vec![CleanupStepRecord {
+                    ordinal: 0,
+                    step: CleanupStepKind::VerifyAbsence,
+                    disposition: CleanupStepDisposition::Unknown,
+                    reason_code: "runtime.cleanup.restart_provenance_mismatch".to_owned(),
+                    evidence_sha256: None,
+                    completed_at_unix_ms: newer_at_unix_ms,
+                }],
+                reason_code: "runtime.cleanup.restart_provenance_mismatch".to_owned(),
+                completed_at_unix_ms: newer_at_unix_ms,
+            },
+        )
+        .expect("newer quarantine evidence should advance the unresolved handle");
+
+    let replay = state
+        .reconcile_persisted_process_leases()
+        .expect("older exact reconciliation replay must not block startup");
+
+    assert_eq!(replay.inspected_count, 1);
+    let after_replay = state
+        .journal_store
+        .list_persisted_process_leases(1)
+        .expect("unverified lease should remain durable")
+        .into_iter()
+        .next()
+        .expect("unverified lease should remain present");
+    assert_eq!(after_replay.descriptor.state, RuntimeHandleState::Quarantined);
+    assert_eq!(after_replay.descriptor.updated_at_unix_ms, newer_at_unix_ms);
+    assert_eq!(after_replay.lease, retained.lease);
+    let diagnostics = state
+        .journal_store
+        .shared_runtime_diagnostics()
+        .expect("replayed cleanup diagnostics should load");
+    assert_eq!(diagnostics.cleanup_reports_by_outcome.get("unknown"), Some(&2));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn admit_session_queued_input_persists_followup_for_active_run() {
     let state = build_test_runtime_state(false);
