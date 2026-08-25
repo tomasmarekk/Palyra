@@ -3895,8 +3895,10 @@ fn build_optional_delegated_run_context(
 ///
 /// `seq` is the run snapshot's current event count; `AlreadyExists` means a
 /// concurrent writer claimed it, so the snapshot is re-read (3 attempts).
-/// Events are dropped, not errored, when the parent run is missing or still
-/// active.
+/// Events are dropped, not errored, when the parent run is missing, still
+/// active, or already terminal with its Run generation closed. The durable
+/// background task remains authoritative in that last case; an optional
+/// observability projection must not invalidate an attached child.
 async fn append_parent_tape_event(
     runtime: &Arc<GatewayRuntimeState>,
     parent_run_id: &str,
@@ -3914,6 +3916,15 @@ async fn append_parent_tape_event(
                 state = %run.state,
                 event_type,
                 "skipping background parent tape append while parent run is active"
+            );
+            return Ok(());
+        }
+        if runtime.runtime_generation_for_run(parent_run_id.to_owned()).await?.is_none() {
+            warn!(
+                parent_run_id,
+                state = %run.state,
+                event_type,
+                "skipping background parent tape append after the parent generation closed"
             );
             return Ok(());
         }
@@ -4087,15 +4098,16 @@ fn is_terminal_run_state(state: &str) -> bool {
 mod tests {
     use super::{
         advance_tape_cursor, append_artifact_references, append_delegation_model_token,
-        attach_background_task_child_run, background_task_heartbeat_update,
-        background_task_terminal_state_from_run, build_optional_delegated_run_context,
-        build_parameter_delta_bytes, categorize_child_failure, child_merge_lifecycle_details,
-        delegated_child_timeout_message, dispatch_auxiliary_executor_task,
-        ensure_child_task_context_permits_dispatch, ensure_delegation_tape_replay_budget,
-        evaluate_delegation_scheduler_limits, expire_child_task_cancellation_context,
-        finalize_task_from_run, finalize_task_from_run_if_parent_generation_current,
-        inject_background_metadata, parent_tape_accepts_background_event,
-        pending_child_cancel_reason, post_run_reflection_terminal_update, process_background_task,
+        append_parent_tape_event, attach_background_task_child_run,
+        background_task_heartbeat_update, background_task_terminal_state_from_run,
+        build_optional_delegated_run_context, build_parameter_delta_bytes,
+        categorize_child_failure, child_merge_lifecycle_details, delegated_child_timeout_message,
+        dispatch_auxiliary_executor_task, ensure_child_task_context_permits_dispatch,
+        ensure_delegation_tape_replay_budget, evaluate_delegation_scheduler_limits,
+        expire_child_task_cancellation_context, finalize_task_from_run,
+        finalize_task_from_run_if_parent_generation_current, inject_background_metadata,
+        parent_tape_accepts_background_event, pending_child_cancel_reason,
+        post_run_reflection_terminal_update, process_background_task,
         reconcile_attached_child_with_invalid_contract, replace_background_task_snapshot,
         request_attached_child_expiry_cancel, run_background_task_stream,
         running_delegated_children_for_parent, running_task_should_wait_for_in_flight_work,
@@ -4126,7 +4138,8 @@ mod tests {
             OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskRecord,
             OrchestratorBackgroundTaskUpdateRequest, OrchestratorBackgroundTaskWorkerUpdateRequest,
             OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot,
-            OrchestratorSessionUpsertRequest, ORCHESTRATOR_BACKGROUND_TASK_LIST_LIMIT_MAX,
+            OrchestratorSessionUpsertRequest, RuntimeGenerationInvalidateRequest,
+            ORCHESTRATOR_BACKGROUND_TASK_LIST_LIMIT_MAX,
         },
         model_provider::{
             AudioTranscriptionRequest, AudioTranscriptionResponse, ModelProvider, ProviderError,
@@ -4137,7 +4150,7 @@ mod tests {
     };
     use palyra_common::runtime_contracts::{
         AuxiliaryTaskKind, AuxiliaryTaskState, CancellationContextV1, CancellationScopeKind,
-        RuntimeOperationId,
+        RuntimeGenerationLane, RuntimeGenerationTransitionKind, RuntimeOperationId,
     };
     use serde_json::{json, Value};
     use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
@@ -4898,6 +4911,146 @@ mod tests {
                 panic!("concurrency pressure should defer, not fail");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn closed_parent_projection_cannot_invalidate_recovery_child_attachment() {
+        let state = build_test_runtime_state(false);
+        let session_id = Ulid::generate().to_string();
+        let parent_run_id = Ulid::generate().to_string();
+        let child_run_id = Ulid::generate().to_string();
+        let task_id = Ulid::generate().to_string();
+        state
+            .journal_store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: session_id.clone(),
+                session_key: format!("startup-recovery-attachment:{session_id}"),
+                session_label: Some("Startup recovery attachment".to_owned()),
+                principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+            })
+            .expect("startup-recovery session should upsert");
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: parent_run_id.clone(),
+                session_id: session_id.clone(),
+                origin_kind: "manual".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:test".to_owned()),
+                parameter_delta_json: None,
+                delegated_admission: None,
+            })
+            .await
+            .expect("interrupted parent should start");
+        let task = state
+            .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
+                task_id: task_id.clone(),
+                task_kind: AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned(),
+                session_id: session_id.clone(),
+                child_session_id: None,
+                parent_run_id: Some(parent_run_id.clone()),
+                target_run_id: None,
+                planned_child_run_id: Some(child_run_id.clone()),
+                queued_input_id: None,
+                owner_principal: "user:test".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("test".to_owned()),
+                state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+                priority: 100,
+                max_attempts: 1,
+                budget_tokens: 4_096,
+                delegation: None,
+                cancellation_context: None,
+                not_before_unix_ms: None,
+                expires_at_unix_ms: None,
+                notification_target_json: None,
+                input_text: Some("continue from durable recovery evidence".to_owned()),
+                payload_json: Some(
+                    json!({
+                        "schema_version": 1,
+                        "entry_point": "startup_recovery",
+                        "recovered_from_run_id": parent_run_id,
+                    })
+                    .to_string(),
+                ),
+            })
+            .await
+            .expect("startup-recovery task should be created");
+        let task = state
+            .claim_orchestrator_background_task(OrchestratorBackgroundTaskClaimRequest {
+                task_id,
+                expected_revision: task.revision,
+                started_at_unix_ms: crate::gateway::current_unix_ms(),
+            })
+            .await
+            .expect("startup-recovery task should be claimed");
+        state
+            .update_orchestrator_run_state(
+                parent_run_id.clone(),
+                crate::orchestrator::RunLifecycleState::Failed,
+                Some("interrupted run superseded by a durable startup continuation".to_owned()),
+            )
+            .await
+            .expect("interrupted parent should terminalize");
+        state
+            .journal_store
+            .invalidate_runtime_generation(&RuntimeGenerationInvalidateRequest {
+                session_id: session_id.clone(),
+                run_id: Some(parent_run_id.clone()),
+                lane: RuntimeGenerationLane::Run,
+                transition_kind: RuntimeGenerationTransitionKind::Released,
+                reason_code: "runtime.generation.run_startup_recovered".to_owned(),
+            })
+            .expect("startup recovery should close the interrupted Run generation");
+        assert!(state
+            .runtime_generation_for_run(parent_run_id.clone())
+            .await
+            .expect("parent generation lookup should succeed")
+            .is_none());
+        state
+            .start_orchestrator_run(OrchestratorRunStartRequest {
+                run_id: child_run_id.clone(),
+                session_id,
+                origin_kind: "background".to_owned(),
+                origin_run_id: Some(parent_run_id.clone()),
+                triggered_by_principal: Some("user:test".to_owned()),
+                parameter_delta_json: Some(
+                    String::from_utf8(
+                        build_parameter_delta_bytes(&task)
+                            .expect("startup-recovery parameter delta should encode"),
+                    )
+                    .expect("startup-recovery parameter delta should be UTF-8"),
+                ),
+                delegated_admission: None,
+            })
+            .await
+            .expect("startup continuation should start");
+
+        attach_background_task_child_run(&state, &task, child_run_id.as_str())
+            .await
+            .expect("closed parent projection must not reject child attachment");
+        append_parent_tape_event(
+            &state,
+            parent_run_id.as_str(),
+            "child_progress",
+            json!({"child_run_id": child_run_id}),
+        )
+        .await
+        .expect("later recovery progress projection should remain best effort");
+
+        let attached = state
+            .get_orchestrator_background_task(task.task_id)
+            .await
+            .expect("startup-recovery task lookup should succeed")
+            .expect("startup-recovery task should remain present");
+        assert_eq!(attached.target_run_id.as_deref(), Some(child_run_id.as_str()));
+        let child = state
+            .orchestrator_run_status_snapshot(child_run_id)
+            .await
+            .expect("startup continuation lookup should succeed")
+            .expect("startup continuation should remain present");
+        assert!(!child.cancel_requested);
     }
 
     #[test]
