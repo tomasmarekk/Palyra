@@ -5488,7 +5488,8 @@ async fn grpc_memory_purge_all_requires_elevated_principal_before_scope_evaluati
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_memory_delete_rejects_cross_channel_access() -> Result<()> {
+async fn grpc_memory_delete_targets_principal_scope_and_rejects_cross_channel_access() -> Result<()>
+{
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -5498,6 +5499,87 @@ async fn grpc_memory_delete_rejects_cross_channel_access() -> Result<()> {
         memory_v1::memory_service_client::MemoryServiceClient::connect(endpoint)
             .await
             .context("failed to connect memory gRPC client")?;
+
+    let mut principal_ingest = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "principal memory selected for targeted delete".to_owned(),
+        channel: String::new(),
+        session_id: None,
+        tags: Vec::new(),
+        confidence: 0.8,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata_with_principal(principal_ingest.metadata_mut(), "user:ops")?;
+    let principal_memory_id = memory_client
+        .ingest_memory(principal_ingest)
+        .await
+        .context("failed to ingest principal-scoped memory")?
+        .into_inner()
+        .item
+        .and_then(|item| item.memory_id)
+        .map(|id| id.ulid)
+        .context("principal ingest should return memory id")?;
+
+    let mut surviving_ingest = tonic::Request::new(memory_v1::IngestMemoryRequest {
+        v: 1,
+        source: memory_v1::MemorySource::Manual as i32,
+        content_text: "unrelated principal memory that must survive".to_owned(),
+        channel: String::new(),
+        session_id: None,
+        tags: Vec::new(),
+        confidence: 0.8,
+        ttl_unix_ms: 0,
+    });
+    authorize_metadata_with_principal(surviving_ingest.metadata_mut(), "user:ops")?;
+    let surviving_memory_id = memory_client
+        .ingest_memory(surviving_ingest)
+        .await
+        .context("failed to ingest surviving principal-scoped memory")?
+        .into_inner()
+        .item
+        .and_then(|item| item.memory_id)
+        .map(|id| id.ulid)
+        .context("surviving principal ingest should return memory id")?;
+
+    let mut principal_delete = tonic::Request::new(memory_v1::DeleteMemoryItemRequest {
+        v: 1,
+        memory_id: Some(common_v1::CanonicalId { ulid: principal_memory_id.clone() }),
+    });
+    authorize_metadata_with_principal_and_channel(
+        principal_delete.metadata_mut(),
+        "user:ops",
+        "cli",
+    )?;
+    let deleted = memory_client
+        .delete_memory_item(principal_delete)
+        .await
+        .context("owning cli context should delete principal-scoped memory")?
+        .into_inner();
+    assert!(deleted.deleted, "targeted principal-scoped delete should remove the item");
+
+    let mut deleted_get = tonic::Request::new(memory_v1::GetMemoryItemRequest {
+        v: 1,
+        memory_id: Some(common_v1::CanonicalId { ulid: principal_memory_id }),
+    });
+    authorize_metadata_with_principal_and_channel(deleted_get.metadata_mut(), "user:ops", "cli")?;
+    let deleted_error = memory_client
+        .get_memory_item(deleted_get)
+        .await
+        .expect_err("deleted principal memory should be absent");
+    assert_eq!(deleted_error.code(), Code::NotFound);
+
+    let mut surviving_get = tonic::Request::new(memory_v1::GetMemoryItemRequest {
+        v: 1,
+        memory_id: Some(common_v1::CanonicalId { ulid: surviving_memory_id }),
+    });
+    authorize_metadata_with_principal_and_channel(surviving_get.metadata_mut(), "user:ops", "cli")?;
+    let surviving = memory_client
+        .get_memory_item(surviving_get)
+        .await
+        .context("unrelated principal memory should survive targeted delete")?
+        .into_inner();
+    assert!(surviving.item.is_some(), "targeted delete must preserve unrelated principal memory");
 
     let mut ingest_request = tonic::Request::new(memory_v1::IngestMemoryRequest {
         v: 1,

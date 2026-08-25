@@ -36,8 +36,8 @@ use crate::{
     agents::AgentResolveRequest,
     application::{
         memory::{
-            classify_memory_write, enforce_memory_item_delete_scope, enforce_memory_item_scope,
-            lifecycle_item_write_category, lifecycle_tags, normalize_lifecycle_content,
+            classify_memory_write, enforce_memory_item_scope, lifecycle_item_write_category,
+            lifecycle_tags, memory_item_delete_channel, normalize_lifecycle_content,
             redact_memory_text_for_output, reflect_memory_candidates, ttl_unix_ms_from_input,
             MemoryLifecycleProvider, MemoryLifecycleRetainOutcome, MemoryLifecycleRetainRequest,
             MemoryLifecycleScope, MemoryLifecycleStatus, MemoryReflectionCategory,
@@ -1665,22 +1665,24 @@ pub(crate) async fn execute_memory_delete_tool(
         );
     }
     let mut memory_item_exists = false;
-    let delete_channel = context.channel.map(str::to_owned);
+    let mut delete_channel = context.channel.map(str::to_owned);
     match runtime_state.memory_item(memory_id.clone()).await {
         Ok(Some(item)) => {
             memory_item_exists = true;
-            if let Err(error) =
-                enforce_memory_item_delete_scope(&item, context.principal, context.channel)
-            {
-                return memory_tool_execution_outcome(
-                    namespace,
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    format!("palyra.memory.delete {}", error.message()),
-                );
-            }
+            delete_channel =
+                match memory_item_delete_channel(&item, context.principal, context.channel) {
+                    Ok(delete_channel) => delete_channel,
+                    Err(error) => {
+                        return memory_tool_execution_outcome(
+                            namespace,
+                            proposal_id,
+                            input_json,
+                            false,
+                            b"{}".to_vec(),
+                            format!("palyra.memory.delete {}", error.message()),
+                        );
+                    }
+                };
         }
         Ok(None) => {}
         Err(error) => {

@@ -137,28 +137,24 @@ pub(crate) fn enforce_memory_item_scope(
     Ok(())
 }
 
-/// Enforces destructive scope for deleting an existing memory item.
+/// Resolves the storage scope for deleting an existing memory item.
 ///
-/// The authenticated channel must exactly match the item's channel. Therefore
-/// principal-scoped memory requires an unscoped principal context, while
-/// channel-scoped memory requires that same channel context.
+/// Principal-scoped items can be deleted from any authenticated channel owned
+/// by the same principal. Channel-scoped items still require that exact
+/// authenticated channel. The returned value is the item's persisted channel,
+/// which callers must use as the storage delete filter.
 ///
 /// # Errors
-/// Returns `PermissionDenied` when the principal or exact destructive scope
-/// does not match the item being deleted.
+/// Returns `PermissionDenied` when the principal or channel scope does not
+/// authorize access to the item being deleted.
 #[allow(clippy::result_large_err)]
-pub(crate) fn enforce_memory_item_delete_scope(
+pub(crate) fn memory_item_delete_channel(
     item: &MemoryItemRecord,
     principal: &str,
     channel: Option<&str>,
-) -> Result<(), Status> {
+) -> Result<Option<String>, Status> {
     enforce_memory_item_scope(item, principal, channel)?;
-    if item.channel.as_deref() != channel {
-        return Err(Status::permission_denied(
-            "principal-scoped memory requires unscoped principal context for deletion",
-        ));
-    }
-    Ok(())
+    Ok(item.channel.clone())
 }
 
 /// Redacts memory text before it is returned to any caller or model.
@@ -2341,7 +2337,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_context_can_read_but_not_delete_principal_scoped_memory() {
+    fn owning_channel_can_delete_principal_scoped_memory() {
         let item = lifecycle_test_memory_item(
             "01ARZ3NDEKTSV4RRFFQ69G5W06",
             None,
@@ -2351,12 +2347,30 @@ mod tests {
 
         enforce_memory_item_scope(&item, "user:ops", Some("cli"))
             .expect("principal memory should remain visible from an owning channel");
-        let error = enforce_memory_item_delete_scope(&item, "user:ops", Some("cli"))
-            .expect_err("channel context must not delete principal-scoped memory");
+        let delete_channel = memory_item_delete_channel(&item, "user:ops", Some("cli"))
+            .expect("owning channel should delete principal-scoped memory");
 
+        assert_eq!(delete_channel, None);
+    }
+
+    #[test]
+    fn channel_scoped_memory_delete_requires_the_matching_channel() {
+        let item = lifecycle_test_memory_item(
+            "01ARZ3NDEKTSV4RRFFQ69G5W07",
+            Some("slack"),
+            None,
+            "Channel-scoped preference",
+        );
+
+        let error = memory_item_delete_channel(&item, "user:ops", Some("cli"))
+            .expect_err("different channel must not delete channel-scoped memory");
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
-        enforce_memory_item_delete_scope(&item, "user:ops", None)
-            .expect("unscoped principal context should delete principal-scoped memory");
+        assert_eq!(
+            memory_item_delete_channel(&item, "user:ops", Some("slack"))
+                .expect("matching channel should delete channel-scoped memory")
+                .as_deref(),
+            Some("slack")
+        );
     }
 
     #[test]

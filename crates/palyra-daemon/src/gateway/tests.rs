@@ -17181,10 +17181,11 @@ async fn memory_delete_tool_deletes_workspace_document_id_from_search() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn memory_delete_tool_rejects_channel_context_for_principal_scoped_memory() {
+async fn memory_delete_tool_removes_one_principal_item_from_owning_channel() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
     let memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FDF";
+    let surviving_memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FE1";
     state
         .ingest_memory_item(MemoryItemCreateRequest {
             memory_id: memory_id.to_owned(),
@@ -17199,10 +17200,24 @@ async fn memory_delete_tool_rejects_channel_context_for_principal_scoped_memory(
         })
         .await
         .expect("principal memory should be indexed");
+    state
+        .ingest_memory_item(MemoryItemCreateRequest {
+            memory_id: surviving_memory_id.to_owned(),
+            principal: context.principal.to_owned(),
+            channel: None,
+            session_id: None,
+            source: MemorySource::Manual,
+            content_text: "Unrelated principal preference must survive targeted delete".to_owned(),
+            tags: vec!["memory_write:preference".to_owned()],
+            confidence: Some(0.9),
+            ttl_unix_ms: None,
+        })
+        .await
+        .expect("unrelated principal memory should be indexed");
 
     let input_json =
         serde_json::to_vec(&json!({ "memory_id": memory_id })).expect("delete input serializes");
-    let channel_delete = execute_memory_delete_tool(
+    let delete = execute_memory_delete_tool(
         &state,
         context,
         "01ARZ3NDEKTSV4RRFFQ69G5FE0",
@@ -17210,19 +17225,24 @@ async fn memory_delete_tool_rejects_channel_context_for_principal_scoped_memory(
     )
     .await;
 
-    assert!(!channel_delete.success, "channel-scoped delete must be denied");
-    assert!(
-        channel_delete.error.contains("requires unscoped principal context"),
-        "unexpected error: {}",
-        channel_delete.error
-    );
+    assert!(delete.success, "owning channel delete should succeed: {}", delete.error);
+    let payload = parse_tool_output_json(&delete);
+    assert_eq!(payload.get("deleted").and_then(Value::as_bool), Some(true));
     assert!(
         state
             .memory_item(memory_id.to_owned())
             .await
             .expect("memory lookup should succeed")
+            .is_none(),
+        "targeted principal-scoped memory should be deleted"
+    );
+    assert!(
+        state
+            .memory_item(surviving_memory_id.to_owned())
+            .await
+            .expect("surviving memory lookup should succeed")
             .is_some(),
-        "principal-scoped memory must survive a channel-scoped delete"
+        "targeted delete must preserve unrelated principal-scoped memory"
     );
 }
 

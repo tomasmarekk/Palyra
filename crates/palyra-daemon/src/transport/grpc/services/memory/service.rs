@@ -13,7 +13,7 @@ use ulid::Ulid;
 use crate::{
     application::{
         memory::{
-            enforce_memory_item_delete_scope, enforce_memory_item_scope, memory_item_message,
+            enforce_memory_item_scope, memory_item_delete_channel, memory_item_message,
             memory_search_hit_message, memory_source_from_proto, resolve_memory_channel_scope,
         },
         service_authorization::{authorize_memory_action, authorize_memory_purge_action},
@@ -198,16 +198,16 @@ impl memory_v1::memory_service_server::MemoryService for MemoryServiceImpl {
             "memory.delete",
             format!("memory:{memory_id}").as_str(),
         )?;
-        let delete_channel = context.channel;
-        if let Some(item) = self.state.memory_item(memory_id.clone()).await? {
-            enforce_memory_item_delete_scope(
+        let deleted = if let Some(item) = self.state.memory_item(memory_id.clone()).await? {
+            let delete_channel = memory_item_delete_channel(
                 &item,
                 context.principal.as_str(),
-                delete_channel.as_deref(),
+                context.channel.as_deref(),
             )?;
-        }
-        let deleted =
-            self.state.delete_memory_item(memory_id, context.principal, delete_channel).await?;
+            self.state.delete_memory_item(memory_id, context.principal, delete_channel).await?
+        } else {
+            false
+        };
         Ok(Response::new(memory_v1::DeleteMemoryItemResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             deleted,
