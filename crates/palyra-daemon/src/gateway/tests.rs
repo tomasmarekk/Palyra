@@ -48,6 +48,9 @@ use tokio::{
 use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 
 use crate::agents::{AgentBindingRequest, AgentCreateRequest};
+use crate::application::turn_control::{
+    ControlActivePhase, TurnControlOperation, TurnControlRequest,
+};
 use crate::feature_usage::{
     FeatureUsageCapability, FeatureUsageCapabilitySnapshot, FeatureUsagePath, FeatureUsageReason,
 };
@@ -2263,6 +2266,15 @@ async fn admit_session_queued_input_persists_followup_for_active_run() {
         .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::InProgress, None)
         .await
         .expect("active run should enter in-progress state");
+    state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.clone(),
+            seq: 0,
+            event_type: "run_stream.live_cursor.initial".to_owned(),
+            payload_json: "{}".to_owned(),
+        })
+        .await
+        .expect("initial live tape event should persist");
 
     let outcome = state
         .admit_session_queued_input(SessionQueueAdmissionRequest {
@@ -2318,6 +2330,104 @@ async fn admit_session_queued_input_persists_followup_for_active_run() {
     assert_eq!(queued_inputs[0].queue_mode, QueueMode::Followup.as_str());
     assert_eq!(queued_inputs[0].delivery_boundary, QueuedInputDeliveryBoundary::NextTurn.as_str());
     assert_eq!(queued_inputs[0].queue_outcome_json, outcome.queued_input.queue_outcome_json);
+    let after_admission = state
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .expect("run snapshot should load")
+        .expect("run should remain present");
+    assert_eq!(after_admission.tape_events, 1);
+    state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id,
+            seq: 1,
+            event_type: "run_stream.live_cursor.after_queue_admission".to_owned(),
+            payload_json: "{}".to_owned(),
+        })
+        .await
+        .expect("out-of-band queue admission must not claim the live tape sequence");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redirect_control_preserves_active_run_tape_cursor() {
+    let state = build_test_runtime_state(false);
+    let context = RequestContext {
+        principal: "user:ops".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAB".to_owned(),
+        channel: Some("cli".to_owned()),
+    };
+    let session_id = Ulid::generate().to_string();
+    let run_id = Ulid::generate().to_string();
+    upsert_test_orchestrator_session(&state, &context, session_id.as_str());
+    state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+            origin_kind: "turn-control-redirect-test".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some(context.principal.clone()),
+            parameter_delta_json: None,
+            delegated_admission: None,
+        })
+        .await
+        .expect("active run should start");
+    state
+        .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::InProgress, None)
+        .await
+        .expect("active run should enter in-progress state");
+    state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.clone(),
+            seq: 0,
+            event_type: "run_stream.live_cursor.initial".to_owned(),
+            payload_json: "{}".to_owned(),
+        })
+        .await
+        .expect("initial live tape event should persist");
+
+    let outcome = state
+        .apply_turn_control(TurnControlRequest {
+            operation: TurnControlOperation::RedirectRun,
+            actor_principal: context.principal,
+            active_phase: Some(ControlActivePhase::ProviderStream),
+            session_id: Some(session_id.clone()),
+            run_id: Some(run_id.clone()),
+            queued_input_id: None,
+            priority_lane: None,
+            instruction: Some("switch to the corrected target".to_owned()),
+            reason: Some("operator corrected the active task".to_owned()),
+            dry_run: false,
+        })
+        .await
+        .expect("redirect control should be accepted");
+
+    assert!(outcome.decision.accepted);
+    assert_eq!(outcome.effect["redirect_queued"], json!(true));
+    let queued = state
+        .list_orchestrator_queued_inputs(session_id)
+        .await
+        .expect("redirect input should be readable");
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].state, QueuedInputState::Pending.as_str());
+    assert_eq!(queued[0].queue_mode, QueueMode::Interrupt.as_str());
+    assert_eq!(
+        queued[0].delivery_boundary,
+        QueuedInputDeliveryBoundary::CancelThenNextTurn.as_str()
+    );
+    let after_redirect = state
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .expect("run snapshot should load")
+        .expect("run should remain present");
+    assert_eq!(after_redirect.tape_events, 1);
+    state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id,
+            seq: 1,
+            event_type: "run_stream.live_cursor.after_redirect".to_owned(),
+            payload_json: "{}".to_owned(),
+        })
+        .await
+        .expect("redirect control must not claim the live tape sequence");
 }
 
 #[test]

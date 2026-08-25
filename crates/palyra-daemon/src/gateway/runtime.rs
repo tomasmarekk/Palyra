@@ -12950,17 +12950,12 @@ impl GatewayRuntimeState {
             None,
             Some(session_id.as_str()),
             Some(run_id),
-            runtime_decision.clone(),
+            runtime_decision,
         )
         .await?;
-        let mut tape_seq = snapshot.tape_events as i64;
-        crate::application::run_stream::tape::append_runtime_decision_tape_event(
-            self,
-            run_id,
-            &mut tape_seq,
-            &runtime_decision,
-        )
-        .await?;
+        // The active RunStream exclusively owns its tape cursor. The queued
+        // input and runtime-decision journal event remain durable until that
+        // owner records the steering receipt and injection at a safe boundary.
         Ok(json!({
             "redirect_queued": queue_decision.accepted,
             "queued_input": queued,
@@ -13126,18 +13121,10 @@ impl GatewayRuntimeState {
             request.actor_channel.as_deref(),
             Some(request.session_id.as_str()),
             Some(request.run_id.as_str()),
-            runtime_decision.clone(),
+            runtime_decision,
         )
         .await?;
         self.observability.observe_runtime_queue_depth(observed_queue_depth);
-        let mut tape_seq = snapshot.tape_events as i64;
-        crate::application::run_stream::tape::append_runtime_decision_tape_event(
-            self,
-            request.run_id.as_str(),
-            &mut tape_seq,
-            &runtime_decision,
-        )
-        .await?;
 
         Ok(SessionQueueAdmissionOutcome { queued_input, decision, observed_queue_depth })
     }

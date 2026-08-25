@@ -3210,7 +3210,6 @@ pub(crate) async fn console_chat_queue_handler(
             .await
             .map_err(runtime_status_response)?;
     }
-    let mut queue_tape_seq = run.tape_events as i64;
     let queue_event_type = match queue_decision.decision {
         QueueDecision::Overflow => RuntimeDecisionEventType::QueueOverflow,
         QueueDecision::Steer | QueueDecision::SteerBacklog => RuntimeDecisionEventType::QueueSteer,
@@ -3258,7 +3257,7 @@ pub(crate) async fn console_chat_queue_handler(
             &session.context,
             Some(stream.session_id.as_str()),
             Some(run_id.as_str()),
-            queue_enqueue_payload.clone(),
+            queue_enqueue_payload,
         )
         .await
         .map_err(runtime_status_response)?;
@@ -3266,14 +3265,6 @@ pub(crate) async fn console_chat_queue_handler(
         current_depth,
         &queue_decision,
     ));
-    crate::application::run_stream::tape::append_runtime_decision_tape_event(
-        &state.runtime,
-        run_id.as_str(),
-        &mut queue_tape_seq,
-        &queue_enqueue_payload,
-    )
-    .await
-    .map_err(runtime_status_response)?;
     // Follow-ups enter the request stream behind the active turn. Steering
     // and interrupts stay journal-owned until the run loop claims them at
     // their generation-bound provider boundary.
@@ -3394,19 +3385,11 @@ pub(crate) async fn console_chat_queue_handler(
                 &session.context,
                 Some(stream.session_id.as_str()),
                 Some(run_id.as_str()),
-                delivery_failed_payload.clone(),
+                delivery_failed_payload,
             )
             .await
             .map_err(runtime_status_response)?;
         state.observability.observe_runtime_queue_depth(0);
-        crate::application::run_stream::tape::append_runtime_decision_tape_event(
-            &state.runtime,
-            run_id.as_str(),
-            &mut queue_tape_seq,
-            &delivery_failed_payload,
-        )
-        .await
-        .map_err(runtime_status_response)?;
         return Err(runtime_status_response(tonic::Status::failed_precondition(
             "failed to forward queued follow-up to the active run stream",
         )));
@@ -3470,19 +3453,11 @@ pub(crate) async fn console_chat_queue_handler(
             &session.context,
             Some(stream.session_id.as_str()),
             Some(run_id.as_str()),
-            forwarded_payload.clone(),
+            forwarded_payload,
         )
         .await
         .map_err(runtime_status_response)?;
     state.observability.observe_runtime_queue_depth(0);
-    crate::application::run_stream::tape::append_runtime_decision_tape_event(
-        &state.runtime,
-        run_id.as_str(),
-        &mut queue_tape_seq,
-        &forwarded_payload,
-    )
-    .await
-    .map_err(runtime_status_response)?;
     Ok(Json(json!({
         "queued_input": queued,
         "decision": queue_decision.explain_json(),

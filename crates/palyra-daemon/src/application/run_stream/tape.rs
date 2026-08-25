@@ -349,6 +349,8 @@ pub(crate) fn tool_attestation_event(
 ///
 /// A no-op unless the replay-capture preview capability is active and
 /// runtime-decision capture is switched on, so ordinary runs pay nothing.
+/// Callers must hold the active RunStream's tape cursor; out-of-band queue
+/// and control surfaces persist decisions in the runtime journal instead.
 ///
 /// # Errors
 ///
