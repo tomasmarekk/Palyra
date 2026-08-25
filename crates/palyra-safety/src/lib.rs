@@ -1191,7 +1191,10 @@ fn comparison_value_requires_redaction(classification: &str, value: &str) -> boo
     let Some(literal) = comparison_literal_value(value) else {
         return false;
     };
-    if literal.is_empty() || is_obvious_placeholder_secret_value(literal) {
+    if literal.is_empty()
+        || is_obvious_placeholder_secret_value(literal)
+        || is_explicit_test_credential_placeholder_value(literal)
+    {
         return false;
     }
     if classification == "token" {
@@ -1218,6 +1221,9 @@ fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
     let raw_key = line.get(..separator_index)?;
     let key = assignment_key_identifier(raw_key)?;
     let value = line.get(separator_index + 1..)?.trim();
+    if is_source_type_annotation(raw_key, value) {
+        return None;
+    }
     if is_scenario_completion_marker_assignment(raw_key, key.as_str(), value) {
         return None;
     }
@@ -1227,6 +1233,7 @@ fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
     if value.is_empty()
         || (key.ends_with("_ref") && !key.ends_with("vault_ref"))
         || (key.ends_with("vault_ref") && is_vault_reference_value(value))
+        || is_explicit_test_credential_placeholder_value(value)
         || is_safe_secret_reference_value(raw_key, key.as_str(), value)
     {
         return None;
@@ -1363,12 +1370,31 @@ fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool
         || is_env_getter_reference(reference, "env::var")
         || is_env_getter_reference(reference, "os.getenv")
         || is_os_environ_index_reference(reference)
+        || is_required_env_value_reference(reference)
         || is_env_identifier_reference_expression(key, reference)
         || is_safe_standalone_env_identifier_literal(key, reference)
         || (sensitive_assignment_key_allows_path_reference(key)
             && is_benign_path_reference_value(reference))
         || is_dom_input_value_reference(reference)
         || is_non_literal_source_expression_value(raw_key, normalized)
+}
+
+fn is_source_type_annotation(raw_key: &str, value: &str) -> bool {
+    let target = raw_key.trim();
+    if target.is_empty() || !target.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return false;
+    }
+    let annotation = value.trim().trim_end_matches([',', ';']).trim();
+    matches!(
+        annotation,
+        "str"
+            | "bytes"
+            | "String"
+            | "SecretStr"
+            | "SecretBytes"
+            | "Option<String>"
+            | "Optional[str]"
+    )
 }
 
 fn sensitive_assignment_key_allows_path_reference(key: &str) -> bool {
@@ -1540,6 +1566,24 @@ fn is_os_environ_index_reference(value: &str) -> bool {
     is_quoted_env_identifier(inner.trim())
 }
 
+fn is_required_env_value_reference(value: &str) -> bool {
+    let value = value.trim().trim_end_matches([',', ';']).trim();
+    let inner = ["_required_value(", "required_value("]
+        .iter()
+        .find_map(|prefix| value.strip_prefix(prefix).and_then(|rest| rest.strip_suffix(')')));
+    let Some(inner) = inner else {
+        return false;
+    };
+    let Some((mapping, name)) = inner.split_once(',') else {
+        return false;
+    };
+    if name.contains(',') {
+        return false;
+    }
+    matches!(mapping.trim(), "env" | "environment" | "values")
+        && is_quoted_env_identifier(name.trim())
+}
+
 /// Allows narrow expressions whose only string literals are env-var-style names:
 /// trusted env helper calls, or metadata assignments that store env names.
 fn is_env_identifier_reference_expression(key: &str, value: &str) -> bool {
@@ -1625,6 +1669,17 @@ fn is_obvious_placeholder_secret_value(value: &str) -> bool {
             | "replace_with_your_api_key"
             | "insert_api_key_here"
     )
+}
+
+fn is_explicit_test_credential_placeholder_value(value: &str) -> bool {
+    let normalized = value
+        .trim()
+        .trim_end_matches([',', ';', ')', ']', '}'])
+        .trim()
+        .trim_matches(['"', '\'', '`'])
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    normalized == "test_token"
 }
 
 fn is_benign_mock_credential_fixture_value(value: &str) -> bool {
@@ -3283,6 +3338,45 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn python_env_loader_identifiers_and_test_fixture_values_are_not_redacted() {
+        let source = "from dataclasses import dataclass\n\
+                      from typing import Mapping\n\
+                      @dataclass(frozen=True)\n\
+                      class Config:\n\
+                          service_api_token: str\n\
+                      def load_config(values: Mapping[str, str]) -> Config:\n\
+                          return Config(\n\
+                              service_api_token=_required_value(values, \"SERVICE_API_TOKEN\"),\n\
+                          )\n\
+                      fixture = {\"SERVICE_API_TOKEN\": \"test-token\"}\n\
+                      assert load_config(fixture).service_api_token == \"test-token\"";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted, "unexpected redaction: {}", outcome.redacted_text);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+
+        let credential = "SERVICE_API_TOKEN=prod-7fG9hK2mN8pQ4rSx";
+        let credential_outcome = redact_text_for_export(
+            credential,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+        assert!(credential_outcome.redacted);
+        assert_eq!(credential_outcome.redacted_text, "SERVICE_API_TOKEN=[REDACTED_SECRET]");
     }
 
     #[test]

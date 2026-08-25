@@ -3253,6 +3253,54 @@ mod tests {
     }
 
     #[test]
+    fn read_and_search_preserve_python_env_loader_identifiers() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = tempdir.path().join("config.py");
+        let config_contents = "from dataclasses import dataclass\n\
+                               @dataclass(frozen=True)\n\
+                               class Config:\n\
+                                   service_api_token: str\n\
+                               def load_config(values):\n\
+                                   return Config(\n\
+                                       service_api_token=_required_value(values, \"SERVICE_API_TOKEN\"),\n\
+                                   )\n";
+        fs::write(&config_path, config_contents).expect("workspace config should be written");
+        let test_contents = "fixture = {\"SERVICE_API_TOKEN\": \"test-token\"}\n\
+                             assert load_config(fixture).service_api_token == \"test-token\"\n";
+        fs::write(tempdir.path().join("test_config.py"), test_contents)
+            .expect("workspace test should be written");
+        let read_input = WorkspaceReadFileInput {
+            path: "config.py".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: None,
+            line_count: None,
+        };
+
+        let read_output =
+            read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &read_input)
+                .expect("workspace config should be readable");
+        assert!(!read_output.redacted);
+        assert_eq!(read_output.text.as_deref(), Some(config_contents));
+        assert_eq!(read_output.text_authoritative, None);
+        assert_eq!(read_output.redaction_reasons, None);
+
+        let search_input =
+            parse_workspace_search_input(br#"{"query":"SERVICE_API_TOKEN","max_matches":10}"#)
+                .expect("search input should parse");
+        let search_output =
+            search_workspace_from_roots(&[tempdir.path().to_path_buf()], &search_input)
+                .expect("workspace search should complete");
+        assert_eq!(search_output.matches.len(), 2);
+        assert!(search_output.matches.iter().all(|entry| !entry.redacted));
+        assert!(search_output
+            .matches
+            .iter()
+            .all(|entry| entry.line_text.contains("SERVICE_API_TOKEN")));
+    }
+
+    #[test]
     fn read_workspace_file_preserves_plural_token_parser_variables() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("parser.py");
