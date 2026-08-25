@@ -9051,7 +9051,7 @@ fn spawn_background_process(
     }
     #[cfg(windows)]
     if let Err(resume_error) = resume_windows_background_child(&child) {
-        let message = if windows_background_resume_was_superseded(
+        let message = if windows_background_startup_was_superseded(
             &registration_identity,
             startup_budget.saturating_sub(started_at.elapsed()),
         ) {
@@ -9132,7 +9132,7 @@ fn spawn_background_process(
                 "output monitor startup failure",
             )?;
             #[cfg(not(unix))]
-            terminate_background_child(child)?;
+            settle_background_registration_failure(child, &registration_identity)?;
             return Err(error);
         }
     };
@@ -9147,7 +9147,7 @@ fn spawn_background_process(
             "output monitor attachment failure",
         )?;
         #[cfg(not(unix))]
-        terminate_background_child(child)?;
+        settle_background_registration_failure(child, &registration_identity)?;
         return Err(error);
     }
     let Some(startup_check_wait) = bounded_background_process_wait(
@@ -9163,7 +9163,7 @@ fn spawn_background_process(
             "startup budget expiry",
         )?;
         #[cfg(not(unix))]
-        terminate_background_child(child)?;
+        settle_background_registration_failure(child, &registration_identity)?;
         return Err(background_process_startup_budget_expired_error(input, lifetime_ms));
     };
     thread::sleep(startup_check_wait);
@@ -9176,7 +9176,7 @@ fn spawn_background_process(
             "startup budget expiry",
         )?;
         #[cfg(not(unix))]
-        terminate_background_child(child)?;
+        settle_background_registration_failure(child, &registration_identity)?;
         return Err(background_process_startup_budget_expired_error(input, lifetime_ms));
     }
     let startup_status = match child.try_wait() {
@@ -9197,7 +9197,7 @@ fn spawn_background_process(
                 "startup status failure",
             )?;
             #[cfg(not(unix))]
-            terminate_background_child(child)?;
+            settle_background_registration_failure(child, &registration_identity)?;
             return Err(error);
         }
     };
@@ -9209,6 +9209,11 @@ fn spawn_background_process(
         )
         .unwrap_or(Duration::ZERO);
         let (stdout, stderr) = output_monitor.snapshot_after_startup_drain(startup_output_drain);
+        #[cfg(windows)]
+        let startup_was_superseded = windows_background_startup_was_superseded(
+            &registration_identity,
+            startup_budget.saturating_sub(started_at.elapsed()),
+        );
         #[cfg(unix)]
         terminate_unix_supervised_background_child(
             child,
@@ -9217,7 +9222,16 @@ fn spawn_background_process(
             "startup terminal status",
         )?;
         #[cfg(not(unix))]
-        terminate_background_child(child)?;
+        settle_background_registration_failure(child, &registration_identity)?;
+        #[cfg(windows)]
+        if startup_was_superseded {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "sandbox background process {pid} startup was superseded by verified Windows job termination before startup acknowledgement: {status}"
+                ),
+            });
+        }
         if status.success() {
             release_background_process_tracking_if_stopped(pid);
             return background_launcher_completed_successfully(
@@ -9252,7 +9266,7 @@ fn spawn_background_process(
             "startup output quota",
         )?;
         #[cfg(not(unix))]
-        terminate_background_child(child)?;
+        settle_background_registration_failure(child, &registration_identity)?;
         return Err(background_process_output_quota_error(policy, &stdout, &stderr));
     }
     let post_output_exit_check = bounded_background_process_wait(
@@ -9275,11 +9289,16 @@ fn spawn_background_process(
                     "post-output status failure",
                 )?;
                 #[cfg(not(unix))]
-                terminate_background_child(child)?;
+                settle_background_registration_failure(child, &registration_identity)?;
                 return Err(error);
             }
         };
     if let Some(status) = post_output_status {
+        #[cfg(windows)]
+        let startup_was_superseded = windows_background_startup_was_superseded(
+            &registration_identity,
+            startup_budget.saturating_sub(started_at.elapsed()),
+        );
         #[cfg(unix)]
         terminate_unix_supervised_background_child(
             child,
@@ -9288,7 +9307,16 @@ fn spawn_background_process(
             "post-output terminal status",
         )?;
         #[cfg(not(unix))]
-        terminate_background_child(child)?;
+        settle_background_registration_failure(child, &registration_identity)?;
+        #[cfg(windows)]
+        if startup_was_superseded {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "sandbox background process {pid} startup was superseded by verified Windows job termination before startup acknowledgement: {status}"
+                ),
+            });
+        }
         if status.success() {
             release_background_process_tracking_if_stopped(pid);
             return background_launcher_completed_successfully(
@@ -9317,7 +9345,7 @@ fn spawn_background_process(
             "lifetime expiry before monitor handoff",
         )?;
         #[cfg(not(unix))]
-        terminate_background_child(child)?;
+        settle_background_registration_failure(child, &registration_identity)?;
         return Err(background_process_lifetime_expired_error(input, lifetime_ms));
     };
     #[cfg(unix)]
@@ -10383,10 +10411,10 @@ fn resume_windows_background_child(child: &ManagedChildGuard) -> io::Result<()> 
     resume_suspended_windows_process(child.id())
 }
 
-// A successful exact Job Object termination distinguishes terminal cleanup from a missing
-// CREATE_SUSPENDED hold; only a subsequently inactive ownership domain may supersede startup.
+// A successful exact Job Object termination distinguishes terminal cleanup from an ordinary
+// startup exit; only a subsequently inactive ownership domain may supersede startup.
 #[cfg(windows)]
-fn windows_background_resume_was_superseded(
+fn windows_background_startup_was_superseded(
     identity: &BackgroundProcessIdentity,
     max_wait: Duration,
 ) -> bool {
@@ -10404,11 +10432,11 @@ fn windows_background_resume_was_superseded(
     )
     .ok()
     .flatten();
-    windows_background_resume_cleanup_is_authoritative(true, status)
+    windows_background_startup_cleanup_is_authoritative(true, status)
 }
 
 #[cfg(windows)]
-fn windows_background_resume_cleanup_is_authoritative(
+fn windows_background_startup_cleanup_is_authoritative(
     termination_succeeded: bool,
     status: Option<BackgroundProcessRuntimeStatus>,
 ) -> bool {
@@ -13692,7 +13720,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_resume_cleanup_classification_requires_verified_inactivity() {
+    fn windows_startup_cleanup_classification_requires_verified_inactivity() {
         let inactive = super::BackgroundProcessRuntimeStatus {
             direct_pid_alive: false,
             process_tree_alive: false,
@@ -13704,10 +13732,10 @@ mod tests {
             tracked_process_count: Some(1),
         };
 
-        assert!(super::windows_background_resume_cleanup_is_authoritative(true, Some(inactive)));
-        assert!(!super::windows_background_resume_cleanup_is_authoritative(false, Some(inactive)));
-        assert!(!super::windows_background_resume_cleanup_is_authoritative(true, Some(active)));
-        assert!(!super::windows_background_resume_cleanup_is_authoritative(true, None));
+        assert!(super::windows_background_startup_cleanup_is_authoritative(true, Some(inactive)));
+        assert!(!super::windows_background_startup_cleanup_is_authoritative(false, Some(inactive)));
+        assert!(!super::windows_background_startup_cleanup_is_authoritative(true, Some(active)));
+        assert!(!super::windows_background_startup_cleanup_is_authoritative(true, None));
     }
 
     #[cfg(not(target_os = "macos"))]

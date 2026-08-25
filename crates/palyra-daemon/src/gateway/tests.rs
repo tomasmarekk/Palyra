@@ -13898,6 +13898,9 @@ async fn terminal_cleanup_waits_for_durable_process_publication() {
         outcome.success
             || outcome.error.contains(
                 "startup was superseded by verified Windows job termination before resume acknowledgement"
+            )
+            || outcome.error.contains(
+                "startup was superseded by verified Windows job termination before startup acknowledgement"
             ),
         "terminal cleanup may win before the runner acknowledgement, but no other failure is valid: {}",
         outcome.error
