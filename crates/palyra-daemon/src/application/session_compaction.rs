@@ -30,7 +30,10 @@ use palyra_common::{
     redaction::{redact_auth_error, redact_url_segments_in_text},
     runtime_contracts::AgentHookKind,
 };
-use palyra_safety::{transform_text_for_prompt, SafetyContentKind, SafetySourceKind, TrustLabel};
+use palyra_safety::{
+    inspect_text, transform_text_for_prompt, SafetyContentKind, SafetyFindingCategory, SafetyPhase,
+    SafetySourceKind, TrustLabel,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tonic::Status;
@@ -179,6 +182,7 @@ pub(crate) struct SessionCompactionPlan {
     pub(crate) fallback_used: bool,
     pub(crate) degraded_reason: Option<String>,
     pub(crate) evidence_refs: Vec<String>,
+    pub(crate) evidence_backed_action_items: Vec<String>,
     pub(crate) active_task_summary: SessionActiveTaskSummary,
     pub(crate) checkpoint_metadata: SessionCompactionCheckpointMetadata,
     pub(crate) candidates: Vec<SessionCompactionCandidate>,
@@ -859,6 +863,7 @@ struct CompactionSafeguardBuildInput<'a> {
     session: &'a OrchestratorSessionRecord,
     plan_eligible: bool,
     blocked_reason: Option<&'a str>,
+    evidence_backed_action_items: &'a [String],
     active_task_summary: &'a SessionActiveTaskSummary,
     candidates: &'a [SessionCompactionCandidate],
     evidence_refs: &'a [String],
@@ -1264,6 +1269,7 @@ pub(crate) async fn apply_session_compaction(
             session: request.session,
             plan_eligible: plan.eligible,
             blocked_reason: plan.blocked_reason.as_deref(),
+            evidence_backed_action_items: plan.evidence_backed_action_items.as_slice(),
             active_task_summary: &plan.active_task_summary,
             candidates: plan.candidates.as_slice(),
             evidence_refs: plan.evidence_refs.as_slice(),
@@ -1556,11 +1562,14 @@ fn build_session_compaction_plan_with_metadata(
         .count();
     let review_candidate_count =
         candidates.iter().filter(|candidate| candidate.disposition == "review_required").count();
+    let evidence_backed_action_items =
+        collect_open_action_items(protected_records.as_slice(), condensed_records.as_slice());
     let active_task_summary = build_active_task_summary(
         session,
         protected_records.as_slice(),
         condensed_records.as_slice(),
         candidates.as_slice(),
+        evidence_backed_action_items.clone(),
     );
     let summary_text = build_summary_text(
         session,
@@ -1641,6 +1650,7 @@ fn build_session_compaction_plan_with_metadata(
         session,
         plan_eligible: eligible,
         blocked_reason: blocked_reason.as_deref(),
+        evidence_backed_action_items: evidence_backed_action_items.as_slice(),
         active_task_summary: &active_task_summary,
         candidates: candidates.as_slice(),
         evidence_refs: evidence_refs.as_slice(),
@@ -1737,6 +1747,7 @@ fn build_session_compaction_plan_with_metadata(
         fallback_used: false,
         degraded_reason: None,
         evidence_refs,
+        evidence_backed_action_items,
         active_task_summary,
         checkpoint_metadata,
         candidates,
@@ -2347,7 +2358,7 @@ fn build_compaction_safeguard_projection(
     let pre_checkpoint = PreCompactionCheckpoint {
         active_user_intent: input.active_task_summary.active_goal.clone(),
         explicit_constraints: input.active_task_summary.constraints.clone(),
-        pending_actions: input.active_task_summary.open_action_items.clone(),
+        pending_actions: input.evidence_backed_action_items.to_vec(),
         pending_approval_open: input
             .blocked_reason
             .is_some_and(|reason| reason.to_ascii_lowercase().contains("approval")),
@@ -2569,7 +2580,12 @@ fn compaction_safeguard_rollback_action(decision: CompactionSafeguardDecision) -
 }
 
 fn compaction_safeguard_blocks_apply(safeguard: &CompactionSafeguardProjection) -> bool {
+    // Rollout controls additional safeguard policy, but source-backed pending
+    // actions are baseline continuity authority and may never be discarded.
     safeguard.decision == CompactionSafeguardDecision::Failed
+        || safeguard.violations.iter().any(|violation| {
+            violation.reason_code == CompactionSafeguardReasonCode::PendingActionsDropped
+        })
 }
 
 #[cfg(test)]
@@ -3163,6 +3179,7 @@ fn build_active_task_summary(
     protected_records: &[SessionCompactionRecordSnapshot],
     condensed_records: &[SessionCompactionRecordSnapshot],
     candidates: &[SessionCompactionCandidate],
+    open_action_items: Vec<String>,
 ) -> SessionActiveTaskSummary {
     let active_goal = candidates
         .iter()
@@ -3182,7 +3199,6 @@ fn build_active_task_summary(
                 session.session_id
             )
         });
-    let open_action_items = collect_open_action_items(protected_records, condensed_records);
     let open_decisions = candidates
         .iter()
         .filter(|candidate| candidate_can_enter_trusted_compaction_summary(candidate))
@@ -4509,8 +4525,93 @@ fn looks_like_noise(content: &str) -> bool {
 }
 
 fn is_sensitive_candidate(content: &str) -> bool {
+    let scan = inspect_text(
+        content,
+        SafetyPhase::Export,
+        SafetySourceKind::Unknown,
+        SafetyContentKind::PlainText,
+        TrustLabel::TrustedLocal,
+    );
+    scan.has_category(SafetyFindingCategory::SecretLeak)
+        || contains_natural_language_secret_value(content)
+}
+
+// Credential nouns are safe continuity metadata until the surrounding text
+// supplies material. This catches prose-shaped assignments that the canonical
+// source/config scanner intentionally does not parse, without blocking tasks
+// such as "rotate the staging API token before Friday".
+fn contains_natural_language_secret_value(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
-    SENSITIVE_CANDIDATE_PATTERNS.iter().any(|pattern| lower.contains(pattern))
+    for marker in SENSITIVE_CANDIDATE_PATTERNS {
+        for (start, _) in lower.match_indices(marker) {
+            let marker_end = start + marker.len();
+            if !is_sensitive_marker_boundary(lower.as_str(), start, marker_end) {
+                continue;
+            }
+            let remainder = &lower[marker_end..];
+            let Some(value) = natural_language_secret_value(remainder) else {
+                continue;
+            };
+            if !is_non_material_secret_descriptor(value) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_sensitive_marker_boundary(content: &str, start: usize, end: usize) -> bool {
+    let before = content[..start].chars().next_back();
+    let after = content[end..].chars().next();
+    before.is_none_or(|ch| !is_identifier_character(ch))
+        && after.is_none_or(|ch| !is_identifier_character(ch))
+}
+
+fn is_identifier_character(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn natural_language_secret_value(remainder: &str) -> Option<&str> {
+    let remainder = remainder.trim_start();
+    let value = ["value is ", "equals ", "is ", "was "]
+        .iter()
+        .find_map(|connector| remainder.strip_prefix(connector))
+        .or_else(|| remainder.strip_prefix(':'))
+        .or_else(|| remainder.strip_prefix('='))?
+        .trim_start();
+    let value = value.split_whitespace().next()?.trim_matches(|ch: char| {
+        matches!(ch, '"' | '\'' | '`' | ',' | '.' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}')
+    });
+    (!value.is_empty()).then_some(value)
+}
+
+fn is_non_material_secret_descriptor(value: &str) -> bool {
+    matches!(
+        value,
+        "absent"
+            | "configured"
+            | "disabled"
+            | "empty"
+            | "enabled"
+            | "expired"
+            | "invalid"
+            | "managed"
+            | "missing"
+            | "not"
+            | "optional"
+            | "present"
+            | "protected"
+            | "redacted"
+            | "required"
+            | "rotated"
+            | "secret"
+            | "set"
+            | "stored"
+            | "unknown"
+            | "unavailable"
+            | "unset"
+            | "valid"
+    )
 }
 
 fn lines_look_contradictory(left: &str, right: &str) -> bool {
@@ -5309,6 +5410,56 @@ mod tests {
     }
 
     #[test]
+    fn compaction_safeguard_compares_artifact_actions_with_source_evidence() {
+        let evidence_backed_action_items = vec![
+            "Mira updates the release checklist by 2026-08-27.".to_owned(),
+            "Devon rotates the staging API token before 2026-08-28.".to_owned(),
+            "Irena schedules the customer migration dry-run for 2026-08-29.".to_owned(),
+        ];
+        let active_task_summary = super::SessionActiveTaskSummary {
+            active_goal: "Preserve every open release action item.".to_owned(),
+            open_decisions: Vec::new(),
+            open_action_items: vec![
+                evidence_backed_action_items[0].clone(),
+                evidence_backed_action_items[2].clone(),
+            ],
+            constraints: Vec::new(),
+            recent_steps: Vec::new(),
+            historical_notes: Vec::new(),
+        };
+        let session = session_record();
+        let evidence_refs = vec!["run-source:7:tool_result".to_owned()];
+
+        let safeguard =
+            super::build_compaction_safeguard_projection(super::CompactionSafeguardBuildInput {
+                session: &session,
+                plan_eligible: true,
+                blocked_reason: None,
+                evidence_backed_action_items: evidence_backed_action_items.as_slice(),
+                active_task_summary: &active_task_summary,
+                candidates: &[],
+                evidence_refs: evidence_refs.as_slice(),
+                source_event_count: 1,
+                summary_text: "bounded compaction summary",
+                lifecycle_state: "preview_ready",
+                rollout_enabled: false,
+            });
+
+        assert_eq!(safeguard.decision, CompactionSafeguardDecision::ObserveFailed);
+        assert_eq!(safeguard.pre_checkpoint.pending_actions.len(), 3);
+        assert_eq!(safeguard.post_artifact.preserved_pending_actions.len(), 2);
+        assert!(
+            safeguard.reason_codes.contains(&CompactionSafeguardReasonCode::PendingActionsDropped),
+            "source-backed middle action must make the safeguard fail: {:?}",
+            safeguard.reason_codes
+        );
+        assert!(
+            super::compaction_safeguard_blocks_apply(&safeguard),
+            "source-backed action loss is a core continuity failure even before rollout promotion"
+        );
+    }
+
+    #[test]
     fn compaction_summary_json_projects_retry_safety_report() {
         let transcript = (0..12)
             .map(|seq| {
@@ -5802,6 +5953,92 @@ Source: S078 fixture meeting notes
                 .pointer("/active_task_summary/open_action_items/0")
                 .and_then(serde_json::Value::as_str),
             plan.active_task_summary.open_action_items.first().map(String::as_str)
+        );
+    }
+
+    #[test]
+    fn active_task_summary_preserves_credential_rotation_reference_without_secret_material() {
+        let notes = "\
+# Release readiness meeting
+
+Date: 2026-08-25
+
+## Decisions
+
+- The migration remains opt-in until the dry-run is reviewed.
+- The release checklist stays the approval source of truth.
+
+## Open action items
+
+- Mira: update the release checklist by 2026-08-27.
+- Devon: rotate the staging API token before 2026-08-28.
+- Irena: schedule the customer migration dry-run for 2026-08-29.
+
+## Closed work
+
+- The rollback owner was confirmed.
+- The canary dashboard was published.
+";
+        let tool_result_payload = serde_json::json!({
+            "proposal_id": "proposal-s077",
+            "success": true,
+            "output_json": {
+                "path": "tasks/meeting-notes.md",
+                "content": notes,
+            },
+            "error": "",
+        })
+        .to_string();
+        let mut transcript = vec![
+            transcript_record(
+                0,
+                "message.received",
+                r#"{"text":"Preserve all open action items from tasks/meeting-notes.md."}"#,
+            ),
+            transcript_record(1, "tool_result", tool_result_payload.as_str()),
+        ];
+        transcript.extend((2..14).map(|seq| {
+            let payload = format!(r#"{{"text":"Reference filler context {seq}."}}"#);
+            transcript_record(seq, "message.received", payload.as_str())
+        }));
+
+        let plan = build_session_compaction_plan(
+            &session_record(),
+            transcript.as_slice(),
+            &[],
+            &[],
+            Some("manual_compaction"),
+            Some("s077_action_item_continuity"),
+        );
+        let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
+            .expect("summary JSON should decode");
+
+        assert!(plan.eligible);
+        assert_action_items_contain_text(
+            plan.active_task_summary.open_action_items.as_slice(),
+            &[
+                "Mira: update the release checklist by 2026-08-27.",
+                "Devon: rotate the staging API token before 2026-08-28.",
+                "Irena: schedule the customer migration dry-run for 2026-08-29.",
+            ],
+        );
+        assert_untrusted_tool_output_items(plan.active_task_summary.open_action_items.as_slice());
+        assert_eq!(plan.evidence_backed_action_items.len(), 3);
+        assert_eq!(plan.safeguard.pre_checkpoint.pending_actions.len(), 3);
+        assert_eq!(plan.safeguard.post_artifact.preserved_pending_actions.len(), 3);
+        assert_eq!(plan.safeguard.decision, CompactionSafeguardDecision::Passed);
+        assert_eq!(
+            summary
+                .pointer("/retry_safety_report/current_task/open_action_item_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            summary
+                .pointer("/compaction_safeguard/pre_checkpoint/pending_actions")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(3)
         );
     }
 
