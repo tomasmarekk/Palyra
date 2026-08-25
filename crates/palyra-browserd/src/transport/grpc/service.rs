@@ -3269,6 +3269,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     if let Some(session) = sessions.get_mut(session_id.as_str()) {
                         if let Some(tab) = session.tabs.get_mut(active_tab_id.as_str()) {
                             tab.last_page_body = snapshot.page_body;
+                            tab.last_observe_state_summary = snapshot.observe_state_summary;
                             tab.last_title = snapshot.title;
                             tab.last_url = Some(snapshot.page_url);
                         }

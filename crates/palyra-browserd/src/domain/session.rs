@@ -205,15 +205,18 @@ pub(crate) struct BrowserConsoleEntryInternal {
 
 /// In-memory and persisted state for one tab.
 ///
-/// Serialized verbatim inside [`PersistedSessionSnapshot`], so field names are on-disk format.
-/// `console_log` defaults on deserialize so snapshots written before console capture still
-/// load.
+/// Persisted fields retain their on-disk names inside [`PersistedSessionSnapshot`].
+/// Ephemeral observe metadata is skipped, and `console_log` defaults on deserialize so
+/// snapshots written before console capture still load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BrowserTabRecord {
     pub(crate) tab_id: String,
     pub(crate) last_title: String,
     pub(crate) last_url: Option<String>,
     pub(crate) last_page_body: String,
+    /// Bounded host-only metadata for action diagnostics; never projected as page markup.
+    #[serde(skip)]
+    pub(crate) last_observe_state_summary: String,
     pub(crate) scroll_x: i64,
     pub(crate) scroll_y: i64,
     pub(crate) typed_inputs: HashMap<String, String>,
@@ -230,6 +233,7 @@ impl BrowserTabRecord {
             last_title: String::new(),
             last_url: None,
             last_page_body: String::new(),
+            last_observe_state_summary: String::new(),
             scroll_x: 0,
             scroll_y: 0,
             typed_inputs: HashMap::new(),

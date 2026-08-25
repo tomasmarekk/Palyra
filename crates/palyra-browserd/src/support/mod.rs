@@ -517,7 +517,8 @@ pub(crate) fn redact_query_pairs(query: &str) -> String {
 /// Only a fixed allowlist of attributes is emitted, each value sanitized; returns the snapshot
 /// plus whether it was truncated to `max_bytes`.
 pub(crate) fn build_dom_snapshot(page_body: &str, max_bytes: usize) -> (String, bool) {
-    let lines = collect_opening_tags(page_body)
+    let structural_html = html_without_inert_markup(page_body);
+    let lines = collect_opening_tags(structural_html.as_str())
         .iter()
         .enumerate()
         .map(|(index, tag)| build_dom_line(index + 1, tag.as_str()))
@@ -592,8 +593,9 @@ pub(crate) fn build_accessibility_tree_snapshot(
     max_bytes: usize,
 ) -> (String, bool) {
     let max_candidates = max_bytes.saturating_add(1).clamp(1, MAX_ACCESSIBILITY_CANDIDATES);
+    let structural_html = html_without_inert_markup(page_body);
     let (candidates, candidate_budget_exhausted) =
-        collect_accessibility_candidates(page_body, max_candidates);
+        collect_accessibility_candidates(structural_html.as_str(), max_candidates);
     let mut lines = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
         if let Some(line) = build_accessibility_line(
@@ -938,6 +940,14 @@ fn strip_html_comments(input: &str) -> String {
     output
 }
 
+fn html_without_inert_markup(input: &str) -> String {
+    let mut output = strip_html_comments(input);
+    for tag_name in ["script", "style", "template", "noscript"] {
+        output = strip_tag_block_case_insensitive(output.as_str(), tag_name);
+    }
+    output
+}
+
 fn collect_opening_tags(html: &str) -> Vec<String> {
     let mut tags = Vec::new();
     let mut cursor = 0usize;
@@ -1002,6 +1012,46 @@ mod tests {
         );
         assert!(!accessibility_tree.contains("name=main-title"), "{accessibility_tree}");
         assert!(!accessibility_tree.contains("name=action"), "{accessibility_tree}");
+    }
+
+    #[test]
+    fn structural_snapshots_ignore_markup_embedded_in_inert_content() {
+        let html = r#"
+<html><body>
+  <main id="app"><h1>Settings</h1><button id="logout">Sign out</button></main>
+  <script>
+    const login = `<h1>Mock sign in</h1><form id="login-form"><button>Sign in</button></form>`;
+    const settings = `<h1>Settings</h1><button id="logout">Sign out</button>`;
+  </script>
+  <template><form id="historical-form"><button>Historical action</button></form></template>
+  <!-- <button id="comment-action">Comment action</button> -->
+</body></html>
+"#;
+
+        let (dom_snapshot, dom_truncated) = build_dom_snapshot(html, 8 * 1024);
+        let (accessibility_tree, accessibility_truncated) =
+            build_accessibility_tree_snapshot(html, 8 * 1024);
+
+        assert!(!dom_truncated);
+        assert!(!accessibility_truncated);
+        assert_eq!(dom_snapshot.matches("<h1>").count(), 1, "{dom_snapshot}");
+        assert_eq!(dom_snapshot.matches("id=\"logout\"").count(), 1, "{dom_snapshot}");
+        assert!(!dom_snapshot.contains("login-form"), "{dom_snapshot}");
+        assert!(!dom_snapshot.contains("historical-form"), "{dom_snapshot}");
+        assert!(!dom_snapshot.contains("comment-action"), "{dom_snapshot}");
+        assert_eq!(
+            accessibility_tree.matches("role=heading; name=Settings").count(),
+            1,
+            "{accessibility_tree}"
+        );
+        assert_eq!(
+            accessibility_tree.matches("role=button; name=Sign out").count(),
+            1,
+            "{accessibility_tree}"
+        );
+        assert!(!accessibility_tree.contains("Mock sign in"), "{accessibility_tree}");
+        assert!(!accessibility_tree.contains("Historical action"), "{accessibility_tree}");
+        assert!(!accessibility_tree.contains("Comment action"), "{accessibility_tree}");
     }
 
     #[test]

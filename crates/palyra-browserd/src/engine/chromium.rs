@@ -74,6 +74,7 @@ pub(crate) struct ChromiumDialogOutcome {
 #[derive(Debug)]
 pub(crate) struct ChromiumObserveSnapshot {
     pub(crate) page_body: String,
+    pub(crate) observe_state_summary: String,
     pub(crate) title: String,
     pub(crate) page_url: String,
 }
@@ -194,6 +195,7 @@ fn clamp_chromium_snapshot(
 ) -> ChromiumObserveSnapshot {
     ChromiumObserveSnapshot {
         page_body: truncate_utf8_bytes(snapshot.page_body.as_str(), max_response_bytes as usize),
+        observe_state_summary: snapshot.observe_state_summary,
         title: truncate_utf8_bytes(snapshot.title.as_str(), max_title_bytes as usize),
         page_url: snapshot.page_url,
     }
@@ -1047,16 +1049,9 @@ fn decode_chromium_observe_state_value(
         .map_err(|error| format!("failed to parse Chromium observe state: {error}"))
 }
 
-fn page_body_with_chromium_observe_state(payload: ChromiumObserveStatePayload) -> String {
+fn split_chromium_observe_state(payload: ChromiumObserveStatePayload) -> (String, String) {
     let summary = build_chromium_observe_state_summary(&payload);
-    let page_body = payload.html;
-    if summary.trim().is_empty() {
-        return page_body;
-    }
-    format!(
-        "{page_body}\n<section id=\"palyra-observe-state\" aria-label=\"Palyra observed browser state\"><pre>{}</pre></section>",
-        escape_html_text(summary.as_str())
-    )
+    (payload.html, summary)
 }
 
 fn build_chromium_observe_state_summary(payload: &ChromiumObserveStatePayload) -> String {
@@ -1159,19 +1154,6 @@ fn line_escape(value: &str) -> String {
             '\\' => output.push_str("\\\\"),
             '"' => output.push_str("\\\""),
             '\r' | '\n' | '\t' => output.push(' '),
-            _ => output.push(character),
-        }
-    }
-    output
-}
-
-fn escape_html_text(value: &str) -> String {
-    let mut output = String::new();
-    for character in value.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
             _ => output.push(character),
         }
     }
@@ -3192,12 +3174,15 @@ async fn chromium_selector_not_found_error(
     let sessions = runtime.sessions.lock().await;
     let cached_tab = sessions.get(session_id).and_then(|session| session.tabs.get(tab_id));
     let cached_body = cached_tab.map(|tab| tab.last_page_body.as_str()).unwrap_or_default();
+    let cached_state =
+        cached_tab.map(|tab| tab.last_observe_state_summary.as_str()).unwrap_or_default();
     let cached_url = cached_tab.and_then(|tab| tab.last_url.as_deref()).unwrap_or_default();
     selector_not_found_error_from_cached_snapshot(
         selector,
         action_name,
         tab_id,
         cached_body,
+        cached_state,
         cached_url,
     )
 }
@@ -3207,6 +3192,7 @@ fn selector_not_found_error_from_cached_snapshot(
     action_name: &str,
     tab_id: &str,
     cached_page_body: &str,
+    cached_observe_state: &str,
     cached_url: &str,
 ) -> String {
     if let Some(cached_tag) = find_matching_html_tag(selector, cached_page_body) {
@@ -3216,6 +3202,13 @@ fn selector_not_found_error_from_cached_snapshot(
         return format!(
             "selector '{selector}' was not found in the live Chromium DOM for {action_name}, but the last observe snapshot for {location} still contained it{}; call observe or reload to refresh the active tab, verify visibility/actionability, any local server state, and retry only if the selector is present and actionable in the current snapshot",
             state_hint.unwrap_or_default()
+        );
+    }
+    let selector_marker = format!("selector={}", line_quote(selector));
+    if cached_observe_state.lines().any(|line| line.contains(selector_marker.as_str())) {
+        let location = chromium_action_context(tab_id, cached_url);
+        return format!(
+            "selector '{selector}' was not found in the live Chromium DOM for {action_name}, but the last internal observe metadata for {location} described it; call observe to refresh the active tab and retry only if the selector is present and actionable in the current DOM or accessibility snapshot"
         );
     }
     format!("selector '{selector}' was not found")
@@ -3278,23 +3271,27 @@ pub(crate) async fn chromium_observe_snapshot(
     let tab = chromium_tab_for_session(runtime, session_id, tab_id).await?;
     let snapshot = run_chromium_blocking("chromium observe snapshot", move || {
         let observe_state_script = chromium_observe_state_script();
-        let page_body = match tab.evaluate(observe_state_script.as_str(), false) {
+        let (page_body, observe_state_summary) = match tab
+            .evaluate(observe_state_script.as_str(), false)
+        {
             Ok(result) => result
                 .value
                 .ok_or_else(|| "Chromium observe state returned no value".to_owned())
                 .and_then(decode_chromium_observe_state_value)
-                .map(page_body_with_chromium_observe_state)
+                .map(split_chromium_observe_state)
                 .or_else(|_| {
                     tab.get_content()
                         .map_err(|error| format!("failed to read Chromium DOM content: {error}"))
+                        .map(|page_body| (page_body, String::new()))
                 })?,
             Err(_) => tab
                 .get_content()
-                .map_err(|error| format!("failed to read Chromium DOM content: {error}"))?,
+                .map_err(|error| format!("failed to read Chromium DOM content: {error}"))
+                .map(|page_body| (page_body, String::new()))?,
         };
         let title = tab.get_title().unwrap_or_default();
         let page_url = tab.get_url();
-        Ok(ChromiumObserveSnapshot { page_body, title, page_url })
+        Ok(ChromiumObserveSnapshot { page_body, observe_state_summary, title, page_url })
     })
     .await?;
     enforce_chromium_remote_ip_guard(runtime, session_id).await?;
@@ -4562,6 +4559,7 @@ pub(crate) async fn chromium_refresh_tab_snapshot(
         return Err("tab_not_found".to_owned());
     };
     tab.last_page_body = snapshot.page_body;
+    tab.last_observe_state_summary = snapshot.observe_state_summary;
     tab.last_title = snapshot.title;
     tab.last_url = Some(snapshot.page_url);
     tab.console_log = clamp_console_log_entries(
@@ -4844,7 +4842,15 @@ pub(crate) async fn navigate_tab_with_chromium(
             format!("failed to read Chromium page HTML after navigation: {error}")
         })?;
         let title = tab.get_title().unwrap_or_default();
-        Ok((ChromiumObserveSnapshot { page_body, title, page_url }, warnings))
+        Ok((
+            ChromiumObserveSnapshot {
+                page_body,
+                observe_state_summary: String::new(),
+                title,
+                page_url,
+            },
+            warnings,
+        ))
     })
     .await;
     let (snapshot, navigation_warnings) = match chromium_snapshot {
@@ -6172,14 +6178,14 @@ mod tests {
         chromium_upload_staging_path, chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
         decode_chromium_bounded_json_script_value, decode_chromium_console_entries_value,
         decode_chromium_json_script_value, decode_chromium_network_entries_value,
-        decode_chromium_observe_state_value, page_body_with_chromium_observe_state,
-        parse_chromium_clear_storage_status, parse_chromium_client_download_entries,
-        parse_chromium_console_entries, parse_chromium_document_cookie_snapshot,
-        parse_chromium_element_captures, parse_chromium_local_storage_restore_status,
-        parse_chromium_local_storage_snapshot, parse_chromium_page_network_entries,
-        parse_chromium_viewport_metrics, parse_key_press_spec, reserve_chromium_upload_bytes,
-        selector_not_found_error_from_cached_snapshot, ChromiumLayoutMetrics,
-        ChromiumObserveSnapshot, ChromiumPrivateTargetPolicy, ChromiumStagedUpload,
+        decode_chromium_observe_state_value, parse_chromium_clear_storage_status,
+        parse_chromium_client_download_entries, parse_chromium_console_entries,
+        parse_chromium_document_cookie_snapshot, parse_chromium_element_captures,
+        parse_chromium_local_storage_restore_status, parse_chromium_local_storage_snapshot,
+        parse_chromium_page_network_entries, parse_chromium_viewport_metrics, parse_key_press_spec,
+        reserve_chromium_upload_bytes, selector_not_found_error_from_cached_snapshot,
+        split_chromium_observe_state, ChromiumLayoutMetrics, ChromiumObserveSnapshot,
+        ChromiumPrivateTargetPolicy, ChromiumStagedUpload,
         CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT, CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT,
         CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT, CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT,
         CHROMIUM_READ_CONSOLE_LOG_SCRIPT, CHROMIUM_SELECT_STATUS_DISABLED,
@@ -6207,6 +6213,7 @@ mod tests {
     fn clamp_chromium_snapshot_enforces_body_and_title_budgets() {
         let snapshot = ChromiumObserveSnapshot {
             page_body: "α".repeat(12),
+            observe_state_summary: "metadata".to_owned(),
             title: "ß".repeat(4),
             page_url: "https://example.invalid/oversized".to_owned(),
         };
@@ -6214,6 +6221,7 @@ mod tests {
         let clamped = clamp_chromium_snapshot(snapshot, 17, 5);
 
         assert_eq!(clamped.page_body, "α".repeat(8));
+        assert_eq!(clamped.observe_state_summary, "metadata");
         assert_eq!(clamped.title, "ß".repeat(2));
         assert_eq!(clamped.page_url, "https://example.invalid/oversized");
         assert!(clamped.page_body.len() <= 17);
@@ -6264,18 +6272,19 @@ mod tests {
         let payload =
             decode_chromium_observe_state_value(serde_json::Value::String(raw.to_string()))
                 .expect("observe state should parse");
-        let page_body = page_body_with_chromium_observe_state(payload);
+        let (page_body, summary) = split_chromium_observe_state(payload);
 
-        assert!(page_body.contains("browser_form_control"), "{page_body}");
-        assert!(page_body.contains("selected_options_count=1"), "{page_body}");
-        assert!(page_body.contains("localStorage") && page_body.contains("sessionStorage"));
-        assert!(page_body.contains("key=\"wizard\""), "{page_body}");
-        assert!(page_body.contains("value=\"&lt;redacted&gt;\""), "{page_body}");
+        assert!(!page_body.contains("browser_form_control"), "{page_body}");
+        assert!(summary.contains("browser_form_control"), "{summary}");
+        assert!(summary.contains("selected_options_count=1"), "{summary}");
+        assert!(summary.contains("localStorage") && summary.contains("sessionStorage"));
+        assert!(summary.contains("key=\"wizard\""), "{summary}");
+        assert!(summary.contains("value=\"<redacted>\""), "{summary}");
         assert!(
-            !page_body.contains("owner@example.test")
-                && !page_body.contains("eyJhbGci")
-                && !page_body.contains("secret session note"),
-            "observe state summary must not leak form or storage values: {page_body}"
+            !summary.contains("owner@example.test")
+                && !summary.contains("eyJhbGci")
+                && !summary.contains("secret session note"),
+            "observe state summary must not leak form or storage values: {summary}"
         );
     }
 
@@ -6311,13 +6320,14 @@ mod tests {
         let payload =
             decode_chromium_observe_state_value(serde_json::Value::String(raw.to_string()))
                 .expect("observe state should parse");
-        let page_body = page_body_with_chromium_observe_state(payload);
+        let (page_body, summary) = split_chromium_observe_state(payload);
 
-        assert!(page_body.contains("browser_state_element"), "{page_body}");
-        assert!(page_body.contains("selector=\"#stepTwo\""), "{page_body}");
-        assert!(page_body.contains("hidden=true"), "{page_body}");
-        assert!(page_body.contains("visible=false"), "{page_body}");
-        assert!(page_body.contains("reason=\"hidden_attribute\""), "{page_body}");
+        assert!(!page_body.contains("browser_state_element"), "{page_body}");
+        assert!(summary.contains("browser_state_element"), "{summary}");
+        assert!(summary.contains("selector=\"#stepTwo\""), "{summary}");
+        assert!(summary.contains("hidden=true"), "{summary}");
+        assert!(summary.contains("visible=false"), "{summary}");
+        assert!(summary.contains("reason=\"hidden_attribute\""), "{summary}");
     }
 
     #[test]
@@ -6346,12 +6356,12 @@ mod tests {
         let payload =
             decode_chromium_observe_state_value(serde_json::Value::String(raw.to_string()))
                 .expect("observe state should parse");
-        let page_body = page_body_with_chromium_observe_state(payload);
+        let (_page_body, summary) = split_chromium_observe_state(payload);
 
-        assert!(page_body.contains("value=\"&lt;redacted&gt;\""));
+        assert!(summary.contains("value=\"<redacted>\""));
         assert!(
-            !page_body.contains("supersecret"),
-            "observe state summary must not leak sensitive values: {page_body}"
+            !summary.contains("supersecret"),
+            "observe state summary must not leak sensitive values: {summary}"
         );
     }
 
@@ -6362,6 +6372,7 @@ mod tests {
             "highlight",
             "tab-active",
             r#"<html><body><button id="save-user">Save user</button></body></html>"#,
+            "",
             "http://127.0.0.1:8790/?token=secret",
         );
 
@@ -6382,11 +6393,28 @@ mod tests {
             "highlight",
             "tab-active",
             r#"<html><body><section id="stepTwo" hidden>Step two</section></body></html>"#,
+            "",
             "http://127.0.0.1:8790/",
         );
 
         assert!(error.contains("cached element appeared hidden or aria-hidden"), "{error}");
         assert!(error.contains("present and actionable"), "{error}");
+    }
+
+    #[test]
+    fn selector_not_found_error_keeps_internal_observe_state_out_of_page_evidence() {
+        let error = selector_not_found_error_from_cached_snapshot(
+            "#stepTwo",
+            "click",
+            "tab-active",
+            "<html><body><main>Current page</main></body></html>",
+            r##"browser_state_element selector="#stepTwo" tag="section" hidden=true visible=false"##,
+            "http://127.0.0.1:8790/",
+        );
+
+        assert!(error.contains("internal observe metadata"), "{error}");
+        assert!(error.contains("current DOM or accessibility snapshot"), "{error}");
+        assert!(!error.contains("browser_state_element"), "{error}");
     }
 
     #[test]
@@ -6456,6 +6484,7 @@ mod tests {
             "click",
             "tab-active",
             r#"<html><body><button id="cancel">Cancel</button></body></html>"#,
+            "",
             "http://127.0.0.1:8790/",
         );
 
