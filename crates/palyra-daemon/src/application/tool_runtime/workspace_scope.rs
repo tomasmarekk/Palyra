@@ -9,11 +9,13 @@
 //!
 //! Every dynamic root is canonicalized and validated before use: launch roots
 //! must be existing absolute directories outside the OS deny-list in
-//! `protected_launch_workspace_root` and must remain inside configured agent
-//! roots, while focus directories must resolve (symlinks included) to a strict
-//! descendant of a configured root. The containment decisions made here feed
-//! the security checks in `workspace_file` and `workspace_patch`; treat any
-//! semantic change as a security change.
+//! `protected_launch_workspace_root` and normally remain inside configured
+//! agent roots. A scheduled child run may instead use the exact workdir bound
+//! to its durable, same-owner cron job. Focus directories must resolve
+//! (symlinks included) to a strict descendant of a configured root. The
+//! containment decisions made here feed the security checks in
+//! `workspace_file` and `workspace_patch`; treat any semantic change as a
+//! security change.
 
 use std::{
     collections::BTreeMap,
@@ -40,6 +42,14 @@ pub(crate) struct ActiveWorkspaceRoot {
 #[derive(Debug, Deserialize)]
 struct RunLaunchParameterDelta {
     cli_context: Option<RunLaunchCliContext>,
+    routine: Option<RunLaunchRoutineContext>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunLaunchRoutineContext {
+    routine_id: String,
+    job_id: String,
+    workdir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +64,7 @@ struct RunLaunchCliContext {
 struct RunLaunchWorkspaceRoots {
     launch_cwd: Option<PathBuf>,
     extra_roots: Vec<PathBuf>,
+    routine_workdir_authoritative: bool,
 }
 
 /// Launch-context env keys whose values may contribute filesystem roots.
@@ -180,7 +191,71 @@ async fn run_launch_context_workspace_roots(
     else {
         return RunLaunchWorkspaceRoots::default();
     };
-    parameter_delta.cli_context.map(launch_workspace_roots_from_context).unwrap_or_default()
+    let mut launch_roots =
+        parameter_delta.cli_context.map(launch_workspace_roots_from_context).unwrap_or_default();
+    launch_roots.routine_workdir_authoritative = routine_workdir_binding_is_authoritative(
+        runtime_state,
+        run_id,
+        parameter_delta.routine.as_ref(),
+        &launch_roots,
+    )
+    .await;
+    launch_roots
+}
+
+async fn routine_workdir_binding_is_authoritative(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    routine: Option<&RunLaunchRoutineContext>,
+    launch_roots: &RunLaunchWorkspaceRoots,
+) -> bool {
+    let Some(routine) = routine else {
+        return false;
+    };
+    let Some(run) =
+        runtime_state.orchestrator_run_status_snapshot(run_id.to_owned()).await.ok().flatten()
+    else {
+        return false;
+    };
+    let Some(job) = runtime_state.cron_job(routine.job_id.clone()).await.ok().flatten() else {
+        return false;
+    };
+    routine_workdir_binding_matches(
+        run.principal.as_str(),
+        job.owner_principal.as_str(),
+        job.job_id.as_str(),
+        job.workdir.as_deref(),
+        routine,
+        launch_roots.launch_cwd.as_deref(),
+    )
+}
+
+fn routine_workdir_binding_matches(
+    run_principal: &str,
+    job_owner_principal: &str,
+    job_id: &str,
+    job_workdir: Option<&str>,
+    routine: &RunLaunchRoutineContext,
+    launch_cwd: Option<&Path>,
+) -> bool {
+    if run_principal != job_owner_principal
+        || routine.routine_id != job_id
+        || routine.job_id != job_id
+    {
+        return false;
+    }
+    let Some(job_workdir) = job_workdir.and_then(canonical_launch_workspace_root) else {
+        return false;
+    };
+    let Some(routine_workdir) =
+        routine.workdir.as_deref().and_then(canonical_launch_workspace_root)
+    else {
+        return false;
+    };
+    launch_cwd.is_some_and(|launch_cwd| {
+        same_workspace_root(job_workdir.as_path(), routine_workdir.as_path())
+            && same_workspace_root(job_workdir.as_path(), launch_cwd)
+    })
 }
 
 async fn run_launch_parameter_delta_json(
@@ -311,21 +386,30 @@ fn merge_launch_workspace_roots(
     if launch_roots.extra_roots.is_empty() && launch_roots.launch_cwd.is_none() {
         return workspace_roots.to_vec();
     }
-    let mut merged: Vec<PathBuf> = Vec::with_capacity(
-        workspace_roots.len().saturating_add(launch_roots.extra_roots.len() + 1),
-    );
+    let include_agent_roots = !launch_roots.routine_workdir_authoritative;
+    let agent_root_capacity = if include_agent_roots { workspace_roots.len() } else { 0 };
+    let mut merged: Vec<PathBuf> =
+        Vec::with_capacity(agent_root_capacity.saturating_add(launch_roots.extra_roots.len() + 1));
     if let Some(launch_cwd) = launch_roots.launch_cwd {
         push_unique_workspace_root(&mut merged, launch_cwd);
     }
     push_unique_workspace_roots(&mut merged, launch_roots.extra_roots);
-    push_unique_workspace_roots(&mut merged, workspace_roots.iter().cloned());
+    if include_agent_roots {
+        push_unique_workspace_roots(&mut merged, workspace_roots.iter().cloned());
+    }
     merged
 }
 
 fn filter_launch_workspace_roots(
-    launch_roots: RunLaunchWorkspaceRoots,
+    mut launch_roots: RunLaunchWorkspaceRoots,
     workspace_roots: &[PathBuf],
 ) -> RunLaunchWorkspaceRoots {
+    if launch_roots.routine_workdir_authoritative {
+        // The durable routine workdir is the complete workspace authority for
+        // this child run; caller-merged extra roots must not widen it.
+        launch_roots.extra_roots.clear();
+        return launch_roots;
+    }
     let canonical_workspace_roots = canonicalize_workspace_roots(workspace_roots);
     if canonical_workspace_roots.is_empty() {
         return RunLaunchWorkspaceRoots::default();
@@ -339,6 +423,7 @@ fn filter_launch_workspace_roots(
             .into_iter()
             .filter(|root| launch_path_is_within_workspace_roots(root, &canonical_workspace_roots))
             .collect(),
+        routine_workdir_authoritative: false,
     }
 }
 
@@ -650,9 +735,9 @@ mod tests {
         filter_launch_file_grants_by_workspace_roots, launch_path_env_from_context,
         launch_workspace_file_grants_from_context, launch_workspace_roots_from_context,
         merge_launch_workspace_roots, relative_path_already_targets_active_root,
-        relative_path_should_use_active_root, same_workspace_root,
+        relative_path_should_use_active_root, routine_workdir_binding_matches, same_workspace_root,
         workspace_focus_path_is_runtime_internal, workspace_root_override_targets_active_root,
-        ActiveWorkspaceRoot, RunLaunchCliContext,
+        ActiveWorkspaceRoot, RunLaunchCliContext, RunLaunchRoutineContext,
     };
     use std::{collections::BTreeMap, fs};
 
@@ -922,6 +1007,89 @@ mod tests {
         let roots = merge_launch_workspace_roots(std::slice::from_ref(&agent_root), launch_roots);
 
         assert_eq!(roots, vec![agent_root]);
+    }
+
+    #[test]
+    fn authoritative_routine_workdir_replaces_global_agent_roots() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let agent_root = tempdir.path().join("global-agent");
+        let routine_workdir = tempdir.path().join("routine-project");
+        let injected_extra_root = tempdir.path().join("injected-extra");
+        fs::create_dir_all(agent_root.as_path()).expect("agent root should exist");
+        fs::create_dir_all(routine_workdir.as_path()).expect("routine workdir should exist");
+        fs::create_dir_all(injected_extra_root.as_path())
+            .expect("injected extra root should exist");
+        let agent_root =
+            fs::canonicalize(agent_root.as_path()).expect("agent root should canonicalize");
+        let routine_workdir = fs::canonicalize(routine_workdir.as_path())
+            .expect("routine workdir should canonicalize");
+        let injected_extra_root = fs::canonicalize(injected_extra_root.as_path())
+            .expect("injected extra root should canonicalize");
+        let mut launch_roots = launch_workspace_roots_from_context(RunLaunchCliContext {
+            launch_cwd: Some(routine_workdir.to_string_lossy().into_owned()),
+            workspace_roots: Some(vec![
+                routine_workdir.to_string_lossy().into_owned(),
+                injected_extra_root.to_string_lossy().into_owned(),
+            ]),
+            workspace_file_grants: None,
+            env: None,
+        });
+        launch_roots.routine_workdir_authoritative = true;
+
+        let roots = merge_launch_workspace_roots(std::slice::from_ref(&agent_root), launch_roots);
+
+        assert_eq!(roots, vec![routine_workdir]);
+    }
+
+    #[test]
+    fn routine_workdir_authority_requires_exact_job_owner_and_canonical_binding() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let routine_workdir = tempdir.path().join("routine-project");
+        let other_workdir = tempdir.path().join("other-project");
+        fs::create_dir_all(routine_workdir.as_path()).expect("routine workdir should exist");
+        fs::create_dir_all(other_workdir.as_path()).expect("other workdir should exist");
+        let routine_workdir = fs::canonicalize(routine_workdir.as_path())
+            .expect("routine workdir should canonicalize");
+        let other_workdir =
+            fs::canonicalize(other_workdir.as_path()).expect("other workdir should canonicalize");
+        let routine = RunLaunchRoutineContext {
+            routine_id: "routine-1".to_owned(),
+            job_id: "routine-1".to_owned(),
+            workdir: Some(routine_workdir.to_string_lossy().into_owned()),
+        };
+
+        assert!(routine_workdir_binding_matches(
+            "principal:owner",
+            "principal:owner",
+            "routine-1",
+            Some(routine_workdir.to_string_lossy().as_ref()),
+            &routine,
+            Some(routine_workdir.as_path()),
+        ));
+        assert!(!routine_workdir_binding_matches(
+            "principal:attacker",
+            "principal:owner",
+            "routine-1",
+            Some(routine_workdir.to_string_lossy().as_ref()),
+            &routine,
+            Some(routine_workdir.as_path()),
+        ));
+        assert!(!routine_workdir_binding_matches(
+            "principal:owner",
+            "principal:owner",
+            "other-job",
+            Some(routine_workdir.to_string_lossy().as_ref()),
+            &routine,
+            Some(routine_workdir.as_path()),
+        ));
+        assert!(!routine_workdir_binding_matches(
+            "principal:owner",
+            "principal:owner",
+            "routine-1",
+            Some(routine_workdir.to_string_lossy().as_ref()),
+            &routine,
+            Some(other_workdir.as_path()),
+        ));
     }
 
     #[test]
