@@ -35,7 +35,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_safety::{
     redact_text_for_export, SafetyContentKind, SafetyFindingCategory, SafetySourceKind, TrustLabel,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -60,6 +60,19 @@ const MAX_OS_FILE_SEARCH_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_OS_FILE_SEARCH_ENTRIES: usize = 20_000;
 const MAX_OS_FILE_SEARCH_EXCERPT_CHARS: usize = 240;
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
+const APPROVED_OS_ROOT_HANDOFF_PREFIX: &str = "os-root://";
+
+/// Bounded model-visible reference from a workspace symlink to a target
+/// inside one currently approved OS-file root.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ApprovedOsRootHandoff {
+    pub(crate) authority: &'static str,
+    pub(crate) root_index: usize,
+    pub(crate) root_id_sha256: String,
+    pub(crate) relative_path: String,
+    pub(crate) os_file_path: String,
+    pub(crate) target_kind: &'static str,
+}
 
 /// Model-supplied tool input; one flat schema shared by all operations.
 #[derive(Debug, Deserialize)]
@@ -1094,7 +1107,7 @@ fn resolve_copy_move_target_path(
     target_path: &str,
 ) -> Result<ResolvedOsPath, String> {
     let trimmed = target_path.trim();
-    if path_env_prefix(trimmed)?.is_some() {
+    if trimmed.starts_with(APPROVED_OS_ROOT_HANDOFF_PREFIX) || path_env_prefix(trimmed)?.is_some() {
         return resolve_target_os_path(policy, trimmed);
     }
     if is_workspace_relative_target(trimmed) || !Path::new(trimmed).is_absolute() {
@@ -1212,6 +1225,9 @@ fn parse_absolute_os_path(policy: &OsFilePolicy, path: &str) -> Result<PathBuf, 
     if trimmed.chars().any(char::is_control) {
         return Err(format!("{OS_FILE_TOOL_NAME} path contains unsupported characters"));
     }
+    if let Some(parsed) = parse_approved_os_root_handoff(policy, trimmed)? {
+        return Ok(parsed);
+    }
     let parsed = expand_env_prefixed_os_path(policy, trimmed)?;
     if !parsed.is_absolute() {
         return Err(format!("{OS_FILE_TOOL_NAME} path must be an absolute OS path"));
@@ -1224,6 +1240,39 @@ fn parse_absolute_os_path(policy: &OsFilePolicy, path: &str) -> Result<PathBuf, 
         }
     }
     Ok(parsed)
+}
+
+fn parse_approved_os_root_handoff(
+    policy: &OsFilePolicy,
+    path: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(handoff) = path.strip_prefix(APPROVED_OS_ROOT_HANDOFF_PREFIX) else {
+        return Ok(None);
+    };
+    let Some((root_id, relative)) = handoff.split_once('/') else {
+        return Err(format!("{OS_FILE_TOOL_NAME} approved-root handoff is malformed"));
+    };
+    if root_id.len() != 64
+        || !root_id.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
+        return Err(format!("{OS_FILE_TOOL_NAME} approved-root handoff id is invalid"));
+    }
+    let root = policy
+        .user_os_roots
+        .iter()
+        .find(|root| approved_os_root_id(root.as_path()) == root_id)
+        .ok_or_else(|| {
+            format!("{OS_FILE_TOOL_NAME} approved-root handoff is stale or no longer authorized")
+        })?;
+    let relative = PathBuf::from(relative);
+    if relative.as_os_str().is_empty()
+        || !relative.components().all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "{OS_FILE_TOOL_NAME} approved-root handoff must contain a relative target path"
+        ));
+    }
+    Ok(Some(root.join(relative)))
 }
 
 fn expand_env_prefixed_os_path(policy: &OsFilePolicy, path: &str) -> Result<PathBuf, String> {
@@ -1581,6 +1630,82 @@ fn user_owned_os_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Resolves a workspace symlink only far enough to issue an OS-file handoff.
+///
+/// The returned token identifies the approved root by digest and the target
+/// relative to that root. `palyra.fs.os_file` re-resolves and reauthorizes the
+/// token for every operation, so the workspace link itself is never trusted as
+/// a mutable write path.
+pub(crate) fn approved_os_root_handoff_for_workspace_symlink(
+    link_path: &Path,
+) -> Option<ApprovedOsRootHandoff> {
+    let roots = user_owned_os_roots();
+    approved_os_root_handoff_for_workspace_symlink_with_roots(link_path, roots.as_slice())
+}
+
+fn approved_os_root_handoff_for_workspace_symlink_with_roots(
+    link_path: &Path,
+    approved_roots: &[PathBuf],
+) -> Option<ApprovedOsRootHandoff> {
+    if !fs::symlink_metadata(link_path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let target = fs::canonicalize(link_path).ok()?;
+    if protected_os_path(target.as_path()) {
+        return None;
+    }
+    let metadata = fs::metadata(target.as_path()).ok()?;
+    for (root_index, root) in approved_roots.iter().enumerate() {
+        let Some(relative) = approved_os_root_relative_path(target.as_path(), root.as_path())
+        else {
+            continue;
+        };
+        if relative.as_os_str().is_empty()
+            || !relative.components().all(|component| matches!(component, Component::Normal(_)))
+        {
+            continue;
+        }
+        let relative_path = relative.to_str()?.replace('\\', "/");
+        let root_id_sha256 = approved_os_root_id(root.as_path());
+        return Some(ApprovedOsRootHandoff {
+            authority: "approved_os_root",
+            root_index,
+            os_file_path: format!(
+                "{APPROVED_OS_ROOT_HANDOFF_PREFIX}{root_id_sha256}/{relative_path}"
+            ),
+            root_id_sha256,
+            relative_path,
+            target_kind: metadata_kind(&metadata),
+        });
+    }
+    None
+}
+
+fn approved_os_root_relative_path(target: &Path, root: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = target.strip_prefix(root) {
+        return Some(relative.to_path_buf());
+    }
+    #[cfg(windows)]
+    {
+        let target = windows_os_file_path_key(target);
+        let root = windows_os_file_path_key(root);
+        let suffix = target.strip_prefix(root.as_str())?.strip_prefix('/')?;
+        Some(PathBuf::from(suffix))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn approved_os_root_id(root: &Path) -> String {
+    #[cfg(windows)]
+    let identity = windows_os_file_path_key(root);
+    #[cfg(not(windows))]
+    let identity = display_path(root);
+    hex::encode(Sha256::digest(identity.as_bytes()))
+}
+
 fn configured_user_os_roots() -> Option<Vec<PathBuf>> {
     let value = std::env::var_os(PALYRA_OS_FILE_ROOTS_ENV)?;
     let roots = std::env::split_paths(&value)
@@ -1811,6 +1936,16 @@ mod tests {
         std::os::windows::fs::symlink_dir(target, link)
     }
 
+    #[cfg(unix)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
     fn test_policy(root: &Path) -> OsFilePolicy {
         OsFilePolicy {
             workspace_roots: vec![fs::canonicalize(root).expect("root should canonicalize")],
@@ -1832,6 +1967,97 @@ mod tests {
             .expect_err("opened handle outside policy must be rejected");
 
         assert!(error.contains("outside agent workspace roots"), "{error}");
+    }
+
+    #[test]
+    fn approved_root_handoff_survives_link_swap_without_following_new_target() {
+        let tempdir = os_file_tempdir();
+        let workspace = tempdir.path().join("workspace");
+        let approved = tempdir.path().join("approved");
+        let adjacent = tempdir.path().join("adjacent");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        fs::create_dir_all(approved.as_path()).expect("approved root should exist");
+        fs::create_dir_all(adjacent.as_path()).expect("adjacent root should exist");
+        let approved_target = approved.join("report.txt");
+        let adjacent_target = adjacent.join("decoy.txt");
+        fs::write(approved_target.as_path(), "approved\n").expect("approved target should exist");
+        fs::write(adjacent_target.as_path(), "adjacent\n").expect("adjacent target should exist");
+        let link = workspace.join("report-link.txt");
+        if let Err(error) = create_file_symlink(approved_target.as_path(), link.as_path()) {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("file symlink should be created: {error}");
+        }
+
+        let canonical_workspace =
+            fs::canonicalize(workspace.as_path()).expect("workspace should canonicalize");
+        let canonical_approved =
+            fs::canonicalize(approved.as_path()).expect("approved root should canonicalize");
+        let canonical_target =
+            fs::canonicalize(approved_target.as_path()).expect("target should canonicalize");
+        let handoff = approved_os_root_handoff_for_workspace_symlink_with_roots(
+            link.as_path(),
+            std::slice::from_ref(&canonical_approved),
+        )
+        .expect("approved target should produce a handoff");
+        assert_eq!(handoff.authority, "approved_os_root");
+        assert_eq!(handoff.root_index, 0);
+        assert_eq!(handoff.relative_path, "report.txt");
+        assert_eq!(handoff.target_kind, "file");
+        assert!(handoff.os_file_path.starts_with(APPROVED_OS_ROOT_HANDOFF_PREFIX));
+        assert!(!handoff.os_file_path.contains(canonical_approved.to_string_lossy().as_ref()));
+
+        let policy = OsFilePolicy {
+            workspace_roots: vec![canonical_workspace],
+            user_os_roots: vec![canonical_approved.clone()],
+            path_env: BTreeMap::new(),
+        };
+        assert_eq!(
+            parse_absolute_os_path(&policy, handoff.os_file_path.as_str())
+                .expect("current handoff should resolve"),
+            canonical_target
+        );
+        assert!(
+            resolve_copy_move_target_path(&policy, handoff.os_file_path.as_str())
+                .expect("handoff should be valid as a copy or move target")
+                .existed
+        );
+
+        fs::remove_file(link.as_path()).expect("original link should be removed");
+        create_file_symlink(adjacent_target.as_path(), link.as_path())
+            .expect("replacement link should be created");
+        assert_eq!(
+            parse_absolute_os_path(&policy, handoff.os_file_path.as_str())
+                .expect("issued handoff should remain bound to its approved target"),
+            canonical_target
+        );
+        assert!(
+            approved_os_root_handoff_for_workspace_symlink_with_roots(
+                link.as_path(),
+                std::slice::from_ref(&canonical_approved),
+            )
+            .is_none(),
+            "replacement link outside the approved root must not receive a handoff"
+        );
+
+        let stale_policy = OsFilePolicy {
+            workspace_roots: policy.workspace_roots.clone(),
+            user_os_roots: Vec::new(),
+            path_env: BTreeMap::new(),
+        };
+        let stale_error = parse_absolute_os_path(&stale_policy, handoff.os_file_path.as_str())
+            .expect_err("removed root should invalidate its handoff");
+        assert!(stale_error.contains("stale or no longer authorized"));
+
+        let traversal = format!(
+            "{APPROVED_OS_ROOT_HANDOFF_PREFIX}{}/../adjacent/decoy.txt",
+            handoff.root_id_sha256
+        );
+        let traversal_error = parse_absolute_os_path(&policy, traversal.as_str())
+            .expect_err("handoff traversal should be rejected");
+        assert!(traversal_error.contains("relative target path"));
     }
 
     #[cfg(unix)]

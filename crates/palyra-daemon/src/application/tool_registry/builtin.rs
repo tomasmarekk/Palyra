@@ -954,7 +954,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.fs.list_dir",
-            "List entries in a directory inside the current agent workspace root. Use this for discovery instead of process.run find, grep, cat, or shell commands.",
+            "List entries in a directory inside the current agent workspace root. Use this for discovery instead of process.run find, grep, cat, or shell commands. A workspace symlink whose target is inside a currently approved user-owned OS root includes an os_file_handoff; pass its os_file_path unchanged to palyra.fs.os_file instead of guessing or exposing an absolute host path.",
             object_schema(
                 &[],
                 vec![
@@ -1143,11 +1143,11 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "path",
-                        json!({"type":"string","description":"Absolute OS path to inspect or modify. A leading launch-context path prefix such as $PALYRA_E2E_OS_ROOT, ${PALYRA_E2E_OS_ROOT}, or %PALYRA_E2E_OS_ROOT% is accepted only when that alias was explicitly provided by the CLI/tool context for this run. Do not invent env aliases or use credential-bearing process env names; protected system paths are denied."}),
+                        json!({"type":"string","description":"Absolute OS path to inspect or modify. A leading launch-context path prefix such as $PALYRA_E2E_OS_ROOT, ${PALYRA_E2E_OS_ROOT}, or %PALYRA_E2E_OS_ROOT% is accepted only when that alias was explicitly provided by the CLI/tool context for this run. An os-root:// approved-root handoff is accepted only when copied unchanged from palyra.fs.list_dir os_file_handoff.os_file_path. Do not invent env aliases or handoff tokens or use credential-bearing process env names; protected system paths are denied."}),
                     ),
                     (
                         "target_path",
-                        json!({"type":"string","description":"Destination path for copy or move operations. Use an absolute OS path, optionally with a launch-context path prefix such as %PALYRA_E2E_OS_ROOT% only when that alias was explicitly provided for this run, for OS-to-OS moves. Use a workspace-relative path such as data/imported/file.csv or /workspace/data/imported/file.csv to import an allowed OS file into the active workspace without guessing the workspace's absolute root."}),
+                        json!({"type":"string","description":"Destination path for copy or move operations. Use an absolute OS path, optionally with a launch-context path prefix such as %PALYRA_E2E_OS_ROOT% only when that alias was explicitly provided for this run, for OS-to-OS moves. An os-root:// approved-root handoff is accepted only when copied unchanged from palyra.fs.list_dir. Use a workspace-relative path such as data/imported/file.csv or /workspace/data/imported/file.csv to import an allowed OS file into the active workspace without guessing the workspace's absolute root."}),
                     ),
                     (
                         "content_text",
@@ -3012,6 +3012,10 @@ mod tests {
 
     #[test]
     fn os_file_registry_exposes_cache_discovery_operations() {
+        let list_entry = registry_entry("palyra.fs.list_dir").expect("list_dir entry exists");
+        assert!(list_entry.description.contains("os_file_handoff"));
+        assert!(list_entry.description.contains("os_file_path"));
+
         let entry = registry_entry("palyra.fs.os_file").expect("os_file entry exists");
         let operation_values = entry
             .input_schema
@@ -3036,6 +3040,8 @@ mod tests {
             .expect("os_file path description should be visible to models");
         assert!(path_description.contains("$PALYRA_E2E_OS_ROOT"));
         assert!(path_description.contains("%PALYRA_E2E_OS_ROOT%"));
+        assert!(path_description.contains("os-root://"));
+        assert!(path_description.contains("palyra.fs.list_dir"));
 
         let target_description = entry
             .input_schema
@@ -3044,6 +3050,7 @@ mod tests {
             .expect("os_file target_path description should be visible to models");
         assert!(target_description.contains("workspace-relative"));
         assert!(target_description.contains("%PALYRA_E2E_OS_ROOT%"));
+        assert!(target_description.contains("os-root://"));
         assert!(target_description.contains("/workspace/data/imported/file.csv"));
 
         let query_description = entry

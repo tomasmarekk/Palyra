@@ -37,10 +37,13 @@ use crate::{
     agents::AgentResolveRequest,
     application::{
         file_view_registry::build_workspace_file_view_record,
-        tool_runtime::workspace_scope::{
-            relative_path_should_use_active_root, run_launch_context_read_file_grants,
-            session_active_workspace_root, workspace_root_override_targets_active_root,
-            workspace_roots_with_run_launch_context_for_agent_source,
+        tool_runtime::{
+            os_file::{approved_os_root_handoff_for_workspace_symlink, ApprovedOsRootHandoff},
+            workspace_scope::{
+                relative_path_should_use_active_root, run_launch_context_read_file_grants,
+                session_active_workspace_root, workspace_root_override_targets_active_root,
+                workspace_roots_with_run_launch_context_for_agent_source,
+            },
         },
     },
     gateway::{
@@ -192,6 +195,8 @@ struct WorkspaceListDirEntry {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os_file_handoff: Option<ApprovedOsRootHandoff>,
 }
 
 struct WorkspaceReadWindow {
@@ -1492,10 +1497,21 @@ fn list_workspace_directory(
         } else {
             "other"
         };
+        let os_file_handoff = if file_type.is_symlink() {
+            approved_os_root_handoff_for_workspace_symlink(raw_entry_path.as_path())
+        } else {
+            None
+        };
         total_entries = total_entries.saturating_add(1);
         retain_smallest_list_dir_entries(
             &mut entries,
-            WorkspaceListDirEntry { name, path, kind: kind.to_owned(), size_bytes },
+            WorkspaceListDirEntry {
+                name,
+                path,
+                kind: kind.to_owned(),
+                size_bytes,
+                os_file_handoff,
+            },
             max_entries.saturating_add(1),
         );
     }
@@ -2750,6 +2766,38 @@ fn workspace_search_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(previous) => std::env::set_var(self.key, previous),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
 
     #[cfg(windows)]
     #[test]
@@ -4441,6 +4489,57 @@ mod tests {
             .expect_err("host directory listings outside workspace roots should be rejected");
 
         assert!(error.contains("escapes agent workspace roots"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn list_workspace_dir_exposes_approved_os_root_symlink_handoff() {
+        let _env_lock = crate::test_env::lock();
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let approved = tempdir.path().join("approved");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        fs::create_dir_all(approved.as_path()).expect("approved root should exist");
+        let target = approved.join("report.txt");
+        fs::write(target.as_path(), "approved\n").expect("approved target should exist");
+        let link = workspace.join("report-link.txt");
+        if let Err(error) = create_file_symlink(target.as_path(), link.as_path()) {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("file symlink should be created: {error}");
+        }
+        let _approved_roots = ScopedEnvVar::set("PALYRA_OS_FILE_ROOTS", approved.as_path());
+
+        let canonical_workspace =
+            fs::canonicalize(workspace.as_path()).expect("workspace should canonicalize");
+        let input =
+            WorkspaceListDirInput { path: ".".to_owned(), workspace_root: None, max_entries: None };
+        let output = list_workspace_directory(
+            0,
+            canonical_workspace.as_path(),
+            canonical_workspace.clone(),
+            ".".to_owned(),
+            &input,
+        )
+        .expect("workspace directory should list");
+
+        let entry = output
+            .entries
+            .iter()
+            .find(|entry| entry.name == "report-link.txt")
+            .expect("symlink entry should be returned");
+        assert_eq!(entry.kind, "symlink");
+        let handoff = entry
+            .os_file_handoff
+            .as_ref()
+            .expect("approved symlink should include an OS-file handoff");
+        assert_eq!(handoff.authority, "approved_os_root");
+        assert_eq!(handoff.root_index, 0);
+        assert_eq!(handoff.relative_path, "report.txt");
+        assert_eq!(handoff.target_kind, "file");
+        assert!(handoff.os_file_path.starts_with("os-root://"));
+        assert!(!handoff.os_file_path.contains(approved.to_string_lossy().as_ref()));
     }
 
     #[test]
