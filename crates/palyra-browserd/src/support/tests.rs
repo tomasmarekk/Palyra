@@ -2288,6 +2288,132 @@ function markFiltered(){document.getElementById('filter-status').textContent='fi
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_chromium_executes_relative_scripts_for_local_file_page() {
+    let Some(chromium_path) = resolve_chromium_path_for_tests() else {
+        return;
+    };
+    let _guard = chromium_integration_test_guard().await;
+    let fixture = tempfile::tempdir().expect("local file fixture directory should be created");
+    let index_path = fixture.path().join("index.html");
+    std::fs::write(
+        index_path.as_path(),
+        r#"<!doctype html><html><body>
+<button id="load-data">Load data</button><p id="status">Not loaded</p>
+<script src="mock-data.js"></script><script src="app.js"></script>
+</body></html>"#,
+    )
+    .expect("local index fixture should be written");
+    std::fs::write(
+        fixture.path().join("mock-data.js"),
+        "globalThis.MOCK_DATA = ['Ada Lovelace', 'Grace Hopper'];",
+    )
+    .expect("local data script should be written");
+    std::fs::write(
+        fixture.path().join("app.js"),
+        "document.querySelector('#load-data').addEventListener('click', () => { document.querySelector('#status').textContent = `Loaded ${globalThis.MOCK_DATA.length} customers`; });",
+    )
+    .expect("local application script should be written");
+    let file_url =
+        Url::from_file_path(index_path.as_path()).expect("fixture path should convert to file URL");
+
+    let runtime = Arc::new(
+        browser_runtime_state_for_tests(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: None,
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 256 * 1024,
+            max_response_bytes: 256 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Chromium,
+            chromium_path: Some(chromium_path),
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("chromium runtime should initialize"),
+    );
+    let service = BrowserServiceImpl { runtime };
+    let created = create_session_with_retry_for_chromium_test(
+        &service,
+        browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        },
+        3,
+    )
+    .await
+    .expect("create_session should execute");
+    let session_id = created.session_id.expect("session id should be present");
+    let navigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url: file_url.to_string(),
+            timeout_ms: 5_000,
+            allow_redirects: false,
+            max_redirects: 0,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("local file navigation should execute")
+        .into_inner();
+    assert!(navigate.success, "local file navigation should succeed: {}", navigate.error);
+
+    let click = service
+        .click(Request::new(browser_v1::ClickRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            selector: "#load-data".to_owned(),
+            max_retries: 1,
+            timeout_ms: 3_000,
+            capture_failure_screenshot: false,
+            max_failure_screenshot_bytes: 0,
+        }))
+        .await
+        .expect("local file click should execute")
+        .into_inner();
+    assert!(click.success, "local file click should succeed: {}", click.error);
+
+    let observed = service
+        .observe(Request::new(browser_v1::ObserveRequest {
+            v: 1,
+            session_id: Some(session_id),
+            include_dom_snapshot: false,
+            include_accessibility_tree: false,
+            include_visible_text: true,
+            max_dom_snapshot_bytes: 0,
+            max_accessibility_tree_bytes: 0,
+            max_visible_text_bytes: 8 * 1024,
+            capture_selectors: Vec::new(),
+            computed_style_properties: Vec::new(),
+            max_capture_text_bytes: 0,
+        }))
+        .await
+        .expect("local file observe should execute")
+        .into_inner();
+    assert!(observed.success, "local file observe should succeed: {}", observed.error);
+    assert!(
+        observed.visible_text.contains("Loaded 2 customers"),
+        "relative scripts should execute for a local page: {}",
+        observed.visible_text
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_chromium_handles_native_dialogs_with_generation_fence() {
     let Some(chromium_path) = resolve_chromium_path_for_tests() else {
         return;
