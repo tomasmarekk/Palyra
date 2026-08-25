@@ -6823,6 +6823,10 @@ fn argument_is_non_path_option_assignment(arg: &str) -> bool {
     option_assignment_value(arg)
         .and_then(|_| arg.trim().split_once('=').map(|(name, _)| name))
         .is_some_and(option_consumes_non_path_value)
+        || arg
+            .trim()
+            .split_once('=')
+            .is_some_and(|(option, value)| network_listener_value_is_non_path(option, value))
 }
 
 fn option_consumes_non_path_value(arg: &str) -> bool {
@@ -6876,6 +6880,27 @@ fn command_arg_is_non_path_value(command: &str, args: &[String], index: usize) -
     command_positional_arg_is_non_path_value(command, arg.as_str())
         || python_module_invocation_arg_is_non_path_value(command, args, index)
         || git_invocation_arg_is_non_path_value(command, args, index)
+        || npm_invocation_arg_is_non_path_value(command, args, index)
+        || network_listener_arg_is_non_path_value(args, index)
+}
+
+fn network_listener_arg_is_non_path_value(args: &[String], index: usize) -> bool {
+    let Some(value) = args.get(index) else {
+        return false;
+    };
+    args.get(index.saturating_sub(1))
+        .is_some_and(|option| network_listener_value_is_non_path(option, value))
+}
+
+fn network_listener_value_is_non_path(option: &str, value: &str) -> bool {
+    let option = option.trim().to_ascii_lowercase();
+    if option == "--port" {
+        return value.trim().parse::<u16>().is_ok();
+    }
+    matches!(
+        option.as_str(),
+        "--host" | "--hostname" | "--bind" | "--listen" | "--address" | "--addr"
+    ) && maybe_extract_bare_host(value, true).is_some()
 }
 
 fn git_invocation_arg_is_non_path_value(command: &str, args: &[String], index: usize) -> bool {
@@ -6893,6 +6918,27 @@ fn git_invocation_arg_is_non_path_value(command: &str, args: &[String], index: u
     }
     args.get(subcommand_index)
         .is_some_and(|subcommand| subcommand.trim().eq_ignore_ascii_case("show"))
+}
+
+fn npm_invocation_arg_is_non_path_value(command: &str, args: &[String], index: usize) -> bool {
+    if normalize_process_executable_token(command) != "npm" {
+        return false;
+    }
+    let Some(arg) = args.get(index).map(|arg| arg.trim()) else {
+        return false;
+    };
+    if index == 0 {
+        return matches!(
+            arg.to_ascii_lowercase().as_str(),
+            "run" | "run-script" | "test" | "start" | "stop" | "restart" | "exec"
+        );
+    }
+    index == 1
+        && args.first().is_some_and(|subcommand| {
+            matches!(subcommand.trim().to_ascii_lowercase().as_str(), "run" | "run-script")
+        })
+        && !arg.is_empty()
+        && arg.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':'))
 }
 
 fn python_module_invocation_arg_is_non_path_value(
@@ -7892,8 +7938,10 @@ fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, SandboxProcessRunEr
 
 // Best-effort preflight extraction of every host the invocation appears to target: explicit
 // requested_egress_hosts, URL arguments, --host=value style assignments, values following
-// host-hint flags, and URL/host-shaped env values. This is a heuristic deny gate, not runtime
-// isolation; strict mode layers backend-enforced network isolation on top.
+// host-hint flags, and URL/host-shaped env values. Loopback values used by listen/bind flags are
+// removed because they describe a local socket target rather than outbound traffic. This is a
+// heuristic deny gate, not runtime isolation; strict mode layers backend-enforced network
+// isolation on top.
 fn collect_requested_egress_hosts(
     input: &ProcessRunnerInput,
 ) -> Result<Vec<String>, SandboxProcessRunError> {
@@ -7916,7 +7964,50 @@ fn collect_requested_egress_hosts(
     for (key, value) in &input.env {
         collect_hosts_from_token(&mut hosts, value, is_env_host_hint_key(key))?;
     }
+    let loopback_listen_hosts = collect_loopback_listen_hosts(input);
+    hosts.retain(|host| !loopback_listen_hosts.iter().any(|listen_host| listen_host == host));
     Ok(hosts)
+}
+
+fn collect_loopback_listen_hosts(input: &ProcessRunnerInput) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for (index, arg) in input.args.iter().enumerate() {
+        if let Some((key, value)) = arg.split_once('=') {
+            if is_listen_host_hint_key(key) {
+                push_loopback_listen_host(&mut hosts, value);
+            }
+            continue;
+        }
+        if is_listen_host_hint_key(arg.as_str()) {
+            if let Some(value) = input.args.get(index.saturating_add(1)) {
+                push_loopback_listen_host(&mut hosts, value);
+            }
+        }
+    }
+    hosts
+}
+
+fn is_listen_host_hint_key(raw: &str) -> bool {
+    matches!(
+        raw.trim().trim_start_matches('-').to_ascii_lowercase().as_str(),
+        "host" | "hostname" | "bind" | "listen" | "address" | "addr"
+    )
+}
+
+fn push_loopback_listen_host(hosts: &mut Vec<String>, raw: &str) {
+    let candidate = raw.trim().trim_matches(['"', '\'']).trim_end_matches('.');
+    let candidate = split_host_and_port(candidate)
+        .filter(|(_, port)| port.chars().all(|ch| ch.is_ascii_digit()))
+        .map_or(candidate, |(host, _)| host);
+    let normalized = candidate.to_ascii_lowercase();
+    let is_loopback = normalized == "localhost"
+        || normalized
+            .parse::<std::net::Ipv4Addr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false);
+    if is_loopback && !hosts.iter().any(|host| host == &normalized) {
+        hosts.push(normalized);
+    }
 }
 
 fn validate_requested_egress_hosts_require_enforcement(
@@ -14334,6 +14425,52 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_arguments_to_scoped_paths_preserves_npm_script_and_network_values() {
+        let workspace = unique_temp_dir("workspace-npm-network-values");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = ["run", "dev", "--", "--host", "127.0.0.1", "--port", "5173"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        let rewritten = rewrite_arguments_to_scoped_paths(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "npm",
+            args.as_slice(),
+        )
+        .expect("npm lifecycle and syntactic network values should remain non-path arguments");
+
+        assert_eq!(rewritten, args);
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn rewrite_arguments_to_scoped_paths_rejects_path_shaped_network_values() {
+        let workspace = unique_temp_dir("workspace-network-path-value");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = ["run", "dev", "--", "--host", "../outside"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        let error = rewrite_arguments_to_scoped_paths(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "npm",
+            args.as_slice(),
+        )
+        .expect_err("path-shaped network values must still pass workspace scoping");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
     fn build_process_command_uses_rewritten_sandbox_args() {
         let workspace = unique_temp_dir("workspace-build-command-virtual-arg");
         let nested = workspace.join("e2e-file-workflow");
@@ -19431,6 +19568,40 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn run_constrained_process_allows_npm_loopback_dev_server_arguments() {
+        if Command::new("npm").arg("--version").output().is_err() {
+            return;
+        }
+        let workspace = unique_temp_dir("workspace-npm-loopback-server");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::write(
+            workspace.join("package.json"),
+            br#"{"private":true,"scripts":{"dev":"node smoke.js"}}"#,
+        )
+        .expect("package fixture should be written");
+        fs::write(workspace.join("smoke.js"), b"console.log(process.argv.slice(2).join('|'));\n")
+            .expect("Node fixture should be written");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec!["npm".to_owned()]);
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        let input = br#"{
+            "command":"npm",
+            "args":["run","dev","--","--host","127.0.0.1","--port","5173"],
+            "requested_egress_hosts":["127.0.0.1"]
+        }"#;
+
+        let result = run_constrained_process(&policy, input, Duration::from_millis(20_000))
+            .expect("loopback listen arguments should not require outbound egress authority");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("process output should parse");
+        let stdout = output.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default();
+        assert!(stdout.contains("--host|127.0.0.1|--port|5173"), "{stdout}");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn run_constrained_process_supports_workspace_local_git_workflow_when_available() {
         if Command::new("git").arg("--version").output().is_err() {
             return;
@@ -19932,6 +20103,43 @@ mod tests {
             !hosts.iter().any(|host| host == "readme.md"),
             "file-like args should not be treated as host candidates by default"
         );
+    }
+
+    #[test]
+    fn collect_requested_egress_hosts_excludes_loopback_listen_targets() {
+        let mut input = process_runner_input(
+            "npm",
+            &[
+                "run",
+                "dev",
+                "--",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173",
+                "--endpoint",
+                "api.example.com",
+            ],
+            None,
+        );
+        input.requested_egress_hosts = vec!["127.0.0.1".to_owned()];
+
+        let hosts = collect_requested_egress_hosts(&input)
+            .expect("loopback listen host extraction should succeed");
+
+        assert_eq!(hosts, vec!["api.example.com".to_owned()]);
+    }
+
+    #[test]
+    fn collect_requested_egress_hosts_keeps_remote_host_hints() {
+        let mut input =
+            process_runner_input("vite", &["--host=preview.example.com", "--port", "5173"], None);
+        input.requested_egress_hosts = vec!["localhost".to_owned()];
+
+        let hosts =
+            collect_requested_egress_hosts(&input).expect("remote host extraction should succeed");
+
+        assert_eq!(hosts, vec!["localhost".to_owned(), "preview.example.com".to_owned()]);
     }
 
     #[test]
