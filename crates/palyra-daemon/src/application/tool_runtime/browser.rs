@@ -373,11 +373,15 @@ fn browser_tool_requires_open_session(tool_name: &str) -> bool {
 
 /// Resolves the browserd private-target flag after URL-specific validation.
 ///
-/// Network targets always stay under browserd's default private-address block.
 /// A `file://` target reaches this helper only after the caller has confined
-/// the canonical file to an active workspace root.
-fn browser_private_target_flag_for_validated_url(url: &str) -> bool {
-    browser_url_uses_file_scheme(url)
+/// the canonical file to an active workspace root. Network targets require the
+/// explicit model-visible opt-in carried by an approval-gated browser call.
+fn browser_private_target_flag_for_validated_url(url: &str, explicitly_allowed: bool) -> bool {
+    browser_url_uses_file_scheme(url) || explicitly_allowed
+}
+
+fn browser_private_targets_requested(payload: &serde_json::Map<String, Value>) -> bool {
+    payload.get("allow_private_targets").and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn browser_url_uses_file_scheme(raw_url: &str) -> bool {
@@ -1588,7 +1592,7 @@ pub(crate) async fn execute_browser_tool(
                 principal: principal.to_owned(),
                 idle_ttl_ms,
                 budget,
-                allow_private_targets: false,
+                allow_private_targets: browser_private_targets_requested(&payload),
                 allow_downloads: payload
                     .get("allow_downloads")
                     .and_then(Value::as_bool)
@@ -1784,7 +1788,10 @@ pub(crate) async fn execute_browser_tool(
                     error,
                 );
             }
-            let allow_private_targets = browser_private_target_flag_for_validated_url(url);
+            let allow_private_targets = browser_private_target_flag_for_validated_url(
+                url,
+                browser_private_targets_requested(&payload),
+            );
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
@@ -1983,7 +1990,7 @@ pub(crate) async fn execute_browser_tool(
                 );
             }
             let allow_private_targets =
-                browser_private_target_flag_for_validated_url(current_url.as_str());
+                browser_private_target_flag_for_validated_url(current_url.as_str(), false);
             let requested_url = redact_url(current_url.as_str());
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
@@ -4118,7 +4125,10 @@ pub(crate) async fn execute_browser_tool(
                     error,
                 );
             }
-            let allow_private_targets = browser_private_target_flag_for_validated_url(url);
+            let allow_private_targets = browser_private_target_flag_for_validated_url(
+                url,
+                browser_private_targets_requested(&payload),
+            );
             let mut request = Request::new(browser_v1::OpenTabRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
@@ -5945,21 +5955,22 @@ mod tests {
         browser_file_url_to_path, browser_image_tags_from_dom_snapshot,
         browser_max_redirects_from_payload, browser_network_log_entry_to_json,
         browser_observe_include_visible_text, browser_output_with_runtime_capabilities,
-        browser_private_target_flag_for_validated_url, browser_reload_expected_url_from_payload,
-        browser_rescue_rollout_disabled_output, browser_rescue_trace_payload,
-        browser_resilience_rollout_mismatch, browser_screenshot_image_observation_hint,
-        browser_session_closed_error_message, browser_session_persistence_from_payload,
-        browser_session_profile_id_from_payload, browser_storage_origin_to_json,
-        browser_tool_execution_outcome, browser_tool_requires_open_session,
-        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
-        canonical_file_path_is_inside_workspace_roots, default_browser_session_persistence_id,
-        evaluate_browser_rescue_trigger, filter_browser_network_log_entries_since,
-        normalize_browser_press_key_input, parse_browser_download_artifact_id,
-        parse_browser_observe_string_array, resolve_browser_output_path,
-        resolve_browser_upload_path, validate_browser_file_url_path_scope,
-        validate_browser_workspace_relative_path, write_browser_output_file,
-        BrowserRescueTriggerKind, BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER,
-        BROWSER_COOKIE_VALUE_WITHHELD, BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
+        browser_private_target_flag_for_validated_url, browser_private_targets_requested,
+        browser_reload_expected_url_from_payload, browser_rescue_rollout_disabled_output,
+        browser_rescue_trace_payload, browser_resilience_rollout_mismatch,
+        browser_screenshot_image_observation_hint, browser_session_closed_error_message,
+        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
+        browser_storage_origin_to_json, browser_tool_execution_outcome,
+        browser_tool_requires_open_session, browser_user_owned_os_roots,
+        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
+        default_browser_session_persistence_id, evaluate_browser_rescue_trigger,
+        filter_browser_network_log_entries_since, normalize_browser_press_key_input,
+        parse_browser_download_artifact_id, parse_browser_observe_string_array,
+        resolve_browser_output_path, resolve_browser_upload_path,
+        validate_browser_file_url_path_scope, validate_browser_workspace_relative_path,
+        write_browser_output_file, BrowserRescueTriggerKind, BrowserRuntimeCapabilities,
+        BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
+        BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -7274,13 +7285,30 @@ mod tests {
     }
 
     #[test]
-    fn browser_private_target_flag_never_implicitly_allows_loopback() {
-        assert!(!browser_private_target_flag_for_validated_url("http://localhost:8899/"));
-        assert!(!browser_private_target_flag_for_validated_url("http://127.0.0.1:8899/"));
-        assert!(!browser_private_target_flag_for_validated_url("http://[::1]:8899/"));
-        assert!(!browser_private_target_flag_for_validated_url("http://192.168.1.10/"));
-        assert!(!browser_private_target_flag_for_validated_url("https://example.com/"));
-        assert!(browser_private_target_flag_for_validated_url("file:///workspace/index.html"));
+    fn browser_private_target_flag_requires_explicit_network_opt_in() {
+        for url in [
+            "http://localhost:8899/",
+            "http://127.0.0.1:8899/",
+            "http://[::1]:8899/",
+            "http://192.168.1.10/",
+        ] {
+            assert!(!browser_private_target_flag_for_validated_url(url, false));
+            assert!(browser_private_target_flag_for_validated_url(url, true));
+        }
+        assert!(!browser_private_target_flag_for_validated_url("https://example.com/", false));
+        assert!(browser_private_target_flag_for_validated_url("https://example.com/", true));
+        assert!(browser_private_target_flag_for_validated_url(
+            "file:///workspace/index.html",
+            false
+        ));
+        let opted_in = json!({"allow_private_targets": true});
+        assert!(browser_private_targets_requested(
+            opted_in.as_object().expect("fixture should be an object")
+        ));
+        let defaulted = json!({});
+        assert!(!browser_private_targets_requested(
+            defaulted.as_object().expect("fixture should be an object")
+        ));
     }
 
     #[test]

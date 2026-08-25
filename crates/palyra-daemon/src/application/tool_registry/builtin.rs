@@ -2391,6 +2391,13 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                     "description":"Target URL. file:// URLs are supported only for regular files inside active agent workspace roots or run-launch workspace roots; after opening one, use palyra.browser.observe for DOM/text evidence instead of treating a filesystem read as browser validation."
                 }),
             ));
+            properties.push((
+                "allow_private_targets",
+                json!({
+                    "type":"boolean",
+                    "description":"Set true only when the user explicitly authorizes this approval-gated navigation to localhost, loopback, or another private-network target. Omit or leave false for public targets. Browserd still validates the destination and redirects."
+                }),
+            ));
             required.push("url");
         }
         "palyra.browser.tabs.switch" => {
@@ -2538,6 +2545,13 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 json!({"type":"boolean","description":"Defaults to true for ordinary sessions so close/recreate recovery preserves browser state within the current agent session. Set false only for explicit ephemeral sessions."}),
             ));
             properties.push(("allow_downloads", json!({"type":"boolean"})));
+            properties.push((
+                "allow_private_targets",
+                json!({
+                    "type":"boolean",
+                    "description":"Set true only when the user explicitly authorizes this approval-gated session to reach localhost, loopback, or another private-network target. Omit or leave false for ordinary public browsing. Browserd still validates each destination and redirect."
+                }),
+            ));
             properties.push((
                 "budget",
                 json!({"type":"object","properties":{},"additionalProperties":true}),
@@ -3261,13 +3275,16 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("browser url description should be visible to models");
         assert!(!url_description.contains("allow_private_targets=true"));
-        assert!(!url_description.contains("localhost"));
         assert!(url_description.contains("file:// URLs"));
         assert!(url_description.contains("active agent workspace roots"));
-        assert!(
-            navigate.input_schema.pointer("/properties/allow_private_targets").is_none(),
-            "model-facing navigation schema must not expose private-target policy controls"
-        );
+        let private_target_description = navigate
+            .input_schema
+            .pointer("/properties/allow_private_targets/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("navigation should expose an explicit private-target capability");
+        assert!(private_target_description.contains("explicitly authorizes"));
+        assert!(private_target_description.contains("approval-gated"));
+        assert!(private_target_description.contains("localhost"));
 
         let reload = registry_entry("palyra.browser.reload").expect("reload entry exists");
         assert_eq!(
@@ -3280,9 +3297,9 @@ mod tests {
         assert!(reload.input_schema.pointer("/properties/max_redirects").is_some());
         let session_create =
             registry_entry("palyra.browser.session.create").expect("session create entry exists");
-        assert!(session_create.input_schema.pointer("/properties/allow_private_targets").is_none());
+        assert!(session_create.input_schema.pointer("/properties/allow_private_targets").is_some());
         let tabs_open = registry_entry("palyra.browser.tabs.open").expect("tabs open entry exists");
-        assert!(tabs_open.input_schema.pointer("/properties/allow_private_targets").is_none());
+        assert!(tabs_open.input_schema.pointer("/properties/allow_private_targets").is_some());
 
         let screenshot =
             registry_entry("palyra.browser.screenshot").expect("screenshot entry exists");
