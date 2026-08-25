@@ -4357,6 +4357,30 @@ fn select_chromium_viewport_metric_pair(
         .or(layout)
 }
 
+fn chromium_mobile_viewport_reload_url(
+    mobile: bool,
+    requested_width: u32,
+    requested_height: u32,
+    actual_width: u32,
+    actual_height: u32,
+    current_url: &str,
+) -> Option<String> {
+    let current_url = current_url.trim();
+    if !mobile
+        || !chromium_viewport_metrics_mismatch(
+            requested_width,
+            requested_height,
+            actual_width,
+            actual_height,
+        )
+        || current_url.is_empty()
+        || current_url.eq_ignore_ascii_case("about:blank")
+    {
+        return None;
+    }
+    Some(current_url.to_owned())
+}
+
 fn chromium_u32_metric_option(value: &serde_json::Value, field: &str) -> Option<u32> {
     value
         .get(field)
@@ -6013,8 +6037,9 @@ pub(crate) async fn set_viewport_with_chromium(
         })
         .map_err(|error| format!("failed to set Chromium touch emulation: {error}"))?;
         let _ = tab.call_method(Emulation::SetVisibleSize { width, height });
-        let value = tab
-            .evaluate(
+        let read_viewport_metrics = || {
+            let value = tab
+                .evaluate(
                 r#"JSON.stringify({
                     visual_width: Math.trunc((window.visualViewport && window.visualViewport.width) || 0),
                     visual_height: Math.trunc((window.visualViewport && window.visualViewport.height) || 0),
@@ -6024,15 +6049,37 @@ pub(crate) async fn set_viewport_with_chromium(
                 })"#,
                 false,
             )
-            .map_err(|error| format!("failed to verify Chromium viewport metrics: {error}"))?
-            .value
-            .unwrap_or(serde_json::Value::Null);
-        Ok(parse_chromium_viewport_metrics(
-            decode_chromium_json_script_value(value),
+                .map_err(|error| format!("failed to verify Chromium viewport metrics: {error}"))?
+                .value
+                .unwrap_or(serde_json::Value::Null);
+            Ok::<_, String>(parse_chromium_viewport_metrics(
+                decode_chromium_json_script_value(value),
+                width,
+                height,
+                device_scale_factor,
+            ))
+        };
+        let mut metrics = read_viewport_metrics()?;
+        if let Some(reload_url) = chromium_mobile_viewport_reload_url(
+            mobile,
             width,
             height,
-            device_scale_factor,
-        ))
+            metrics.0,
+            metrics.1,
+            tab.get_url().as_str(),
+        ) {
+            // Chromium applies the mobile layout viewport meta policy during
+            // navigation. Reload only when the first post-override measurement
+            // proves that the live document retained its desktop viewport.
+            tab.navigate_to(reload_url.as_str()).map_err(|error| {
+                format!("failed to reload Chromium page for mobile viewport: {error}")
+            })?;
+            tab.wait_until_navigated().map_err(|error| {
+                format!("Chromium mobile viewport reload timed out: {error}")
+            })?;
+            metrics = read_viewport_metrics()?;
+        }
+        Ok(metrics)
     })
     .await;
 
@@ -6114,7 +6161,8 @@ mod tests {
     use super::{
         chromium_cookie_delete_requests, chromium_element_capture_script,
         chromium_element_may_open_window, chromium_layout_metrics_from_cdp,
-        chromium_network_log_headers, chromium_observe_state_script, chromium_permission_origin,
+        chromium_mobile_viewport_reload_url, chromium_network_log_headers,
+        chromium_observe_state_script, chromium_permission_origin,
         chromium_permission_origins_for_urls, chromium_permission_reset_request,
         chromium_permission_set_requests, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
@@ -7060,6 +7108,43 @@ mod tests {
     #[test]
     fn chromium_viewport_mismatch_flags_actual_css_viewport() {
         assert!(chromium_viewport_metrics_mismatch(375, 812, 1040, 2252));
+    }
+
+    #[test]
+    fn chromium_mobile_viewport_reload_requires_live_mobile_mismatch() {
+        assert_eq!(
+            chromium_mobile_viewport_reload_url(
+                true,
+                375,
+                812,
+                980,
+                2122,
+                "http://127.0.0.1:8765/"
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:8765/")
+        );
+        assert!(
+            chromium_mobile_viewport_reload_url(
+                false,
+                375,
+                812,
+                980,
+                2122,
+                "http://127.0.0.1:8765/"
+            )
+            .is_none(),
+            "narrow desktop mode must not trigger a document reload"
+        );
+        assert!(
+            chromium_mobile_viewport_reload_url(true, 375, 812, 375, 797, "http://127.0.0.1:8765/")
+                .is_none(),
+            "usable mobile metrics must not reload"
+        );
+        assert!(
+            chromium_mobile_viewport_reload_url(true, 375, 812, 980, 2122, "about:blank").is_none(),
+            "blank tabs have no document worth reloading"
+        );
     }
 
     #[test]
