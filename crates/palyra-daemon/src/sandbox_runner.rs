@@ -6837,6 +6837,7 @@ fn command_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
     option_consumes_non_path_value(arg)
         || python_module_option_consumes_non_path_value(command, arg)
         || windows_acl_option_consumes_non_path_value(command, arg)
+        || git_option_consumes_non_path_value(command, arg)
 }
 
 fn python_module_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
@@ -6856,6 +6857,14 @@ fn windows_acl_option_consumes_non_path_value(command: &str, arg: &str) -> bool 
         )
 }
 
+fn git_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
+    normalize_process_executable_token(command) == "git"
+        && matches!(
+            arg.trim().to_ascii_lowercase().as_str(),
+            "-b" | "--orphan" | "-m" | "--message"
+        )
+}
+
 fn command_positional_arg_is_non_path_value(command: &str, arg: &str) -> bool {
     let command = normalize_process_executable_token(command);
     matches!(command.as_str(), "sleep") && is_sleep_duration_literal(arg)
@@ -6867,6 +6876,24 @@ fn command_arg_is_non_path_value(command: &str, args: &[String], index: usize) -
     };
     command_positional_arg_is_non_path_value(command, arg.as_str())
         || python_module_invocation_arg_is_non_path_value(command, args, index)
+        || git_invocation_arg_is_non_path_value(command, args, index)
+}
+
+fn git_invocation_arg_is_non_path_value(command: &str, args: &[String], index: usize) -> bool {
+    if normalize_process_executable_token(command) != "git" {
+        return false;
+    }
+    let Some(subcommand_index) = args.iter().position(|arg| !arg.trim().starts_with('-')) else {
+        return false;
+    };
+    if index == subcommand_index {
+        return true;
+    }
+    if args[..index].iter().any(|arg| arg.trim() == "--") {
+        return false;
+    }
+    args.get(subcommand_index)
+        .is_some_and(|subcommand| subcommand.trim().eq_ignore_ascii_case("show"))
 }
 
 fn python_module_invocation_arg_is_non_path_value(
@@ -19333,6 +19360,77 @@ mod tests {
             output.get("stdout").and_then(serde_json::Value::as_str),
             Some("PALYRA_NODE_SCRIPT_OK\n")
         );
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_constrained_process_supports_workspace_local_git_workflow_when_available() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let workspace = unique_temp_dir("workspace-git-workflow");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.name", "Palyra Test"],
+            vec!["config", "user.email", "palyra-test@example.invalid"],
+        ] {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(workspace.as_path())
+                .status()
+                .expect("Git fixture setup should start");
+            assert!(status.success(), "Git fixture setup should succeed");
+        }
+        fs::write(workspace.join("README.md"), b"initial\n")
+            .expect("initial Git fixture should be written");
+
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec!["git".to_owned()]);
+        policy.egress_enforcement_mode = EgressEnforcementMode::None;
+        let run_git = |args: &[&str]| {
+            let input = serde_json::to_vec(&serde_json::json!({
+                "command": "git",
+                "args": args
+            }))
+            .expect("Git process input should serialize");
+            let result =
+                run_constrained_process(&policy, input.as_slice(), Duration::from_millis(20_000))
+                    .expect("allowlisted Git workspace operation should succeed");
+            serde_json::from_slice::<serde_json::Value>(&result.output_json)
+                .expect("Git process output should parse")
+        };
+
+        let status = run_git(&["status", "--short"]);
+        assert_eq!(status.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
+        assert_eq!(
+            status.get("stdout").and_then(serde_json::Value::as_str),
+            Some("?? README.md\n")
+        );
+
+        let checkout = run_git(&["checkout", "-b", "e2e-local-commit-smoke"]);
+        assert_eq!(checkout.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
+        fs::write(workspace.join("README.md"), b"initial\nupdated\n")
+            .expect("updated Git fixture should be written");
+        assert_eq!(
+            run_git(&["add", "README.md"]).get("exit_code").and_then(serde_json::Value::as_i64),
+            Some(0)
+        );
+        assert_eq!(
+            run_git(&["commit", "-m", "local harness commit"])
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64),
+            Some(0)
+        );
+        let show = run_git(&["show", "--stat", "--oneline", "HEAD"]);
+        let stdout = show
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .expect("Git show output should include stdout");
+        assert!(stdout.contains("local harness commit"), "{stdout}");
+        assert!(stdout.contains("README.md"), "{stdout}");
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
