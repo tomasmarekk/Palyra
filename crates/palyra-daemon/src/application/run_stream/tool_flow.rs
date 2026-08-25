@@ -2829,7 +2829,7 @@ async fn execute_allowed_prepared_tool_runtime(
         prepared,
         remaining_tool_budget,
         flow_control,
-        mut cancellation,
+        cancellation: _,
     } = execution;
     if runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await? {
         request_persisted_run_interrupt(runtime_state, run_id, &flow_control).await?;
@@ -2855,15 +2855,6 @@ async fn execute_allowed_prepared_tool_runtime(
         execution_surface = "run_stream",
         status = tracing::field::Empty,
     );
-    let process_cancellation = if prepared.tool_name == PROCESS_RUNNER_TOOL_NAME {
-        Some(flow_control.child_from(
-            cancellation.context(),
-            CancellationScopeKind::Process,
-            tool_execution_timeout(runtime_state, prepared.tool_name.as_str()),
-        )?)
-    } else {
-        None
-    };
     let (process_progress_sink, mut process_progress_rx) =
         process_progress_channel_for_tool(prepared.tool_name.as_str(), progress_sender.is_some());
     apply_tool_fault(runtime_state, "tool.before_effect", prepared.proposal_id.as_str())?;
@@ -2920,6 +2911,37 @@ async fn execute_allowed_prepared_tool_runtime(
         }
         return Err(error);
     }
+    // Durable host preflight can include journal and side-effect-fence IO. Start
+    // the operator-configured execution budget only once the tool is ready to
+    // dispatch, while the run root continues to bound the whole operation.
+    let mut cancellation = flow_control.live_child(
+        CancellationScopeKind::ToolExecution,
+        tool_execution_timeout(runtime_state, prepared.tool_name.as_str()),
+    )?;
+    if !cancellation.permits_new_work(crate::gateway::current_unix_ms()) {
+        record_run_interrupt_observation(runtime_state, &flow_control);
+        if let Err(settlement_error) =
+            mark_tool_side_effect_unknown(runtime_state, active_side_effect_fence.as_ref()).await
+        {
+            warn!(
+                run_id = %run_id,
+                proposal_id = %prepared.proposal_id,
+                tool_name = %prepared.tool_name,
+                error = %settlement_error,
+                "failed to mark tool effect unknown after cancellation at the dispatch boundary"
+            );
+        }
+        return Ok(None);
+    }
+    let process_cancellation = if prepared.tool_name == PROCESS_RUNNER_TOOL_NAME {
+        Some(flow_control.child_from(
+            cancellation.context(),
+            CancellationScopeKind::Process,
+            tool_execution_timeout(runtime_state, prepared.tool_name.as_str()),
+        )?)
+    } else {
+        None
+    };
     let execution_deadline = RunStreamFlowControl::remaining_for_new_work(
         process_cancellation.as_ref().unwrap_or(cancellation.context()),
     )?;
