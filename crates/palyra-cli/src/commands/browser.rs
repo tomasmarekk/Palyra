@@ -193,6 +193,8 @@ struct BrowserStatusPayload {
     health_response: Option<Value>,
     grpc_ok: bool,
     grpc_error: Option<String>,
+    engine_ready: bool,
+    engine_error: Option<String>,
     lifecycle_running: bool,
     lifecycle_state: &'static str,
     lifecycle_owner: &'static str,
@@ -717,10 +719,19 @@ async fn run_browser_status(
         fetch_browser_health(resolved.connection.health_base_url.as_str()).await.ok();
     let grpc_error =
         probe_browser_grpc(&resolved.connection).await.err().map(|error| error.to_string());
+    let engine_error = if grpc_error.is_none() {
+        probe_browser_engine_readiness(&resolved.connection)
+            .await
+            .err()
+            .map(|error| format!("{error:#}"))
+    } else {
+        None
+    };
     let port_diagnostics = browser_connection_port_diagnostics(&resolved.connection);
     let control_plane = browser_status_control_plane_policy_snapshot();
     let browserd_reachable = health_response.is_some() || grpc_error.is_none();
-    let browserd_healthy = health_response.is_some() && grpc_error.is_none();
+    let engine_ready = grpc_error.is_none() && engine_error.is_none();
+    let browserd_healthy = health_response.is_some() && engine_ready;
     if browserd_healthy
         && probe_browser_profile_readiness(&resolved.connection).await.unwrap_or(false)
     {
@@ -749,6 +760,9 @@ async fn run_browser_status(
         health_response.is_some(),
         grpc_error.is_none(),
     ));
+    if let Some(error) = engine_error.as_deref() {
+        warnings.push(browser_engine_readiness_warning(error));
+    }
     let payload = BrowserStatusPayload {
         service: "palyra-browserd",
         grpc_url: resolved.connection.grpc_url,
@@ -758,6 +772,8 @@ async fn run_browser_status(
         health_response,
         grpc_ok: grpc_error.is_none(),
         grpc_error,
+        engine_ready,
+        engine_error,
         lifecycle_running,
         lifecycle_state,
         lifecycle_owner: browser_lifecycle_owner(lifecycle_state),
@@ -1044,6 +1060,23 @@ async fn run_browser_start(
             lifecycle_warnings.push(browser_stale_lifecycle_metadata_warning());
         }
         let lifecycle_state = browser_lifecycle_state(metadata.as_ref(), metadata_running, true);
+        let engine_verified = metadata.as_ref().is_some_and(|value| {
+            metadata_running
+                && value.grpc_url == resolved.connection.grpc_url
+                && value.health_base_url == resolved.connection.health_base_url
+        });
+        if engine_verified {
+            probe_browser_engine_readiness(&resolved.connection)
+                .await
+                .with_context(|| {
+                    "browser service transport is reachable, but Chromium session launch failed; run `palyra browser stop`, inspect the browserd logs reported by `palyra browser status --json`, and rerun `palyra browser start --setup`"
+                })?;
+        } else {
+            lifecycle_warnings.push(
+                "Chromium engine readiness was not probed because the reachable endpoint is not bound to matching live CLI lifecycle metadata; use `palyra browser status --json` for an explicit authenticated engine probe."
+                    .to_owned(),
+            );
+        }
         let payload = BrowserLifecyclePayload {
             action: "start".to_owned(),
             running: true,
@@ -1054,7 +1087,12 @@ async fn run_browser_start(
             health_base_url: resolved.connection.health_base_url,
             stdout_log_path: metadata.as_ref().map(|value| value.stdout_log_path.clone()),
             stderr_log_path: metadata.as_ref().map(|value| value.stderr_log_path.clone()),
-            detail: "browser service health and gRPC endpoints are already reachable".to_owned(),
+            detail: if engine_verified {
+                "browser service health, gRPC, and Chromium session launch are ready".to_owned()
+            } else {
+                "browser service transport is reachable; Chromium engine readiness is unverified"
+                    .to_owned()
+            },
             cleanup_hint: browser_lifecycle_cleanup_hint(lifecycle_state),
             warnings: lifecycle_warnings,
         };
@@ -1150,34 +1188,41 @@ async fn run_browser_start(
     let started = SystemTime::now();
     let mut last_health_error: Option<String> = None;
     let mut last_grpc_error: Option<String> = None;
+    let mut last_engine_error: Option<String> = None;
     loop {
         match fetch_browser_health(resolved.connection.health_base_url.as_str()).await {
             Ok(_) => match probe_browser_start_grpc_reachability(&resolved.connection).await {
-                Ok(()) => {
-                    let payload = BrowserLifecyclePayload {
-                        action: "start".to_owned(),
-                        running: true,
-                        pid: Some(metadata.pid),
-                        lifecycle_state: BROWSER_LIFECYCLE_MANAGED_RUNNING,
-                        lifecycle_owner: "cli",
-                        grpc_url: resolved.connection.grpc_url,
-                        health_base_url: resolved.connection.health_base_url,
-                        stdout_log_path: Some(metadata.stdout_log_path),
-                        stderr_log_path: Some(metadata.stderr_log_path),
-                        detail: "browser service started and passed non-secret readiness checks"
-                            .to_owned(),
-                        cleanup_hint: None,
-                        warnings: lifecycle_warnings,
-                    };
-                    let value = serde_json::to_value(&payload)
-                        .context("failed to encode browser lifecycle payload")?;
-                    return emit_browser_value_with_json(
-                        &value,
-                        format_browser_lifecycle_text(&payload),
-                        "failed to encode browser lifecycle output",
-                        json,
-                    );
-                }
+                Ok(()) => match probe_browser_engine_readiness(&resolved.connection).await {
+                    Ok(()) => {
+                        let payload = BrowserLifecyclePayload {
+                            action: "start".to_owned(),
+                            running: true,
+                            pid: Some(metadata.pid),
+                            lifecycle_state: BROWSER_LIFECYCLE_MANAGED_RUNNING,
+                            lifecycle_owner: "cli",
+                            grpc_url: resolved.connection.grpc_url,
+                            health_base_url: resolved.connection.health_base_url,
+                            stdout_log_path: Some(metadata.stdout_log_path),
+                            stderr_log_path: Some(metadata.stderr_log_path),
+                            detail:
+                                "browser service started and passed transport plus Chromium session-launch readiness"
+                                    .to_owned(),
+                            cleanup_hint: None,
+                            warnings: lifecycle_warnings,
+                        };
+                        let value = serde_json::to_value(&payload)
+                            .context("failed to encode browser lifecycle payload")?;
+                        return emit_browser_value_with_json(
+                            &value,
+                            format_browser_lifecycle_text(&payload),
+                            "failed to encode browser lifecycle output",
+                            json,
+                        );
+                    }
+                    Err(error) => {
+                        last_engine_error = Some(format!("{error:#}"));
+                    }
+                },
                 Err(error) => {
                     last_grpc_error = Some(error.to_string());
                 }
@@ -1190,9 +1235,10 @@ async fn run_browser_start(
             let readiness_detail = browser_start_readiness_timeout_detail(
                 last_health_error.as_deref(),
                 last_grpc_error.as_deref(),
+                last_engine_error.as_deref(),
             );
             anyhow::bail!(
-                "browser service did not become ready within {} ms ({readiness_detail}); inspect {} and {}",
+                "browser service did not become ready within {} ms ({readiness_detail}); inspect {} and {}, then run `palyra browser stop` before retrying `palyra browser start --setup`",
                 wait_ms.max(BROWSER_SERVICE_START_POLL_MS),
                 stdout_log_path.display(),
                 stderr_log_path.display()
@@ -1205,13 +1251,17 @@ async fn run_browser_start(
 fn browser_start_readiness_timeout_detail(
     last_health_error: Option<&str>,
     last_grpc_error: Option<&str>,
+    last_engine_error: Option<&str>,
 ) -> String {
-    match (last_health_error, last_grpc_error) {
-        (_, Some(grpc_error)) => {
+    match (last_health_error, last_grpc_error, last_engine_error) {
+        (_, _, Some(engine_error)) => {
+            format!("Chromium session-launch readiness failed: {engine_error}")
+        }
+        (_, Some(grpc_error), None) => {
             format!("gRPC readiness failed: {grpc_error}")
         }
-        (Some(health_error), None) => format!("health check failed: {health_error}"),
-        (None, None) => "no readiness response was observed".to_owned(),
+        (Some(health_error), None, None) => format!("health check failed: {health_error}"),
+        (None, None, None) => "no readiness response was observed".to_owned(),
     }
 }
 
@@ -3306,6 +3356,54 @@ async fn probe_browser_grpc(connection: &BrowserServiceConnection) -> Result<()>
     Ok(())
 }
 
+async fn probe_browser_engine_readiness(connection: &BrowserServiceConnection) -> Result<()> {
+    let mut client = connect_browser_service(connection).await?;
+    let created = client
+        .create_session(browser_request(
+            browser_v1::CreateSessionRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                principal: BROWSER_PROBE_PRINCIPAL.to_owned(),
+                idle_ttl_ms: 5_000,
+                budget: None,
+                allow_private_targets: false,
+                allow_downloads: false,
+                action_allowed_domains: Vec::new(),
+                persistence_enabled: false,
+                persistence_id: String::new(),
+                profile_id: None,
+                private_profile: true,
+                channel: "readiness_probe".to_owned(),
+            },
+            connection.auth_token.as_deref(),
+            BROWSER_PROBE_PRINCIPAL,
+        )?)
+        .await
+        .context("failed to launch a Chromium readiness session")?
+        .into_inner();
+    let session_id =
+        created.session_id.context("Chromium readiness session returned no session id")?;
+    let closed = client
+        .close_session(browser_request(
+            browser_v1::CloseSessionRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(session_id),
+            },
+            connection.auth_token.as_deref(),
+            BROWSER_PROBE_PRINCIPAL,
+        )?)
+        .await
+        .context("failed to close the Chromium readiness session")?
+        .into_inner();
+    if !closed.closed {
+        anyhow::bail!(
+            "Chromium readiness session was not closed: {}",
+            normalize_optional_text(closed.reason.as_str())
+                .unwrap_or("browserd returned no reason")
+        );
+    }
+    Ok(())
+}
+
 fn browser_start_grpc_readiness_request() -> Result<Request<browser_v1::ListSessionsRequest>> {
     browser_request(
         browser_v1::ListSessionsRequest {
@@ -3747,6 +3845,12 @@ fn browser_status_warnings(
         ));
     }
     warnings
+}
+
+fn browser_engine_readiness_warning(error: &str) -> String {
+    format!(
+        "browserd health and gRPC transport may be reachable, but Chromium session launch is not ready: {error}. Run `palyra browser stop`, inspect the browserd logs in this status payload, then rerun `palyra browser start --setup`."
+    )
 }
 
 fn browser_port_diagnostic_warnings(
@@ -4585,10 +4689,11 @@ fn browser_snapshot_emits_json_to_stdout(mode: BrowserOutputMode, output_written
 
 fn format_browser_status_text(payload: &BrowserStatusPayload) -> String {
     let mut lines = vec![format!(
-        "browser.status service={} health_ok={} grpc_ok={} lifecycle_running={} lifecycle_state={} lifecycle_owner={} grpc_url={} health_url={}",
+        "browser.status service={} health_ok={} grpc_ok={} engine_ready={} lifecycle_running={} lifecycle_state={} lifecycle_owner={} grpc_url={} health_url={}",
         payload.service,
         payload.health_ok,
         payload.grpc_ok,
+        payload.engine_ready,
         payload.lifecycle_running,
         payload.lifecycle_state,
         payload.lifecycle_owner,
@@ -5250,19 +5355,20 @@ fn proto_console_severity_text(value: i32) -> &'static str {
 mod tests {
     use super::{
         browser_command_payload_should_emit, browser_command_policy_action,
-        browser_control_plane_request_timeout, browser_failure_detail,
-        browser_identifier_json_value, browser_lifecycle_cleanup_hint, browser_lifecycle_owner,
-        browser_lifecycle_state, browser_open_cleanup_status_text, browser_open_output_value,
-        browser_service_auth_token_command, browser_service_enable_command,
-        browser_service_stop_complete, browser_service_stop_pending_reasons,
-        browser_session_handle_text, browser_setup_gateway_reload_warning,
-        browser_snapshot_emits_json_to_stdout, browser_start_auth_token_warnings,
-        browser_start_grpc_readiness_request, browser_start_grpc_readiness_result,
-        browser_start_readiness_timeout_detail, browser_status_control_plane_policy_snapshot,
-        browser_status_warnings, browser_stop_without_metadata_payload,
-        effective_browser_lifecycle_running, ensure_browser_command_success,
-        ensure_browser_gateway_auth_token_alignment, ensure_browser_service_enabled,
-        ensure_browser_start_preflight, ensure_browser_value_success, format_browser_console_text,
+        browser_control_plane_request_timeout, browser_engine_readiness_warning,
+        browser_failure_detail, browser_identifier_json_value, browser_lifecycle_cleanup_hint,
+        browser_lifecycle_owner, browser_lifecycle_state, browser_open_cleanup_status_text,
+        browser_open_output_value, browser_service_auth_token_command,
+        browser_service_enable_command, browser_service_stop_complete,
+        browser_service_stop_pending_reasons, browser_session_handle_text,
+        browser_setup_gateway_reload_warning, browser_snapshot_emits_json_to_stdout,
+        browser_start_auth_token_warnings, browser_start_grpc_readiness_request,
+        browser_start_grpc_readiness_result, browser_start_readiness_timeout_detail,
+        browser_status_control_plane_policy_snapshot, browser_status_warnings,
+        browser_stop_without_metadata_payload, effective_browser_lifecycle_running,
+        ensure_browser_command_success, ensure_browser_gateway_auth_token_alignment,
+        ensure_browser_service_enabled, ensure_browser_start_preflight,
+        ensure_browser_value_success, format_browser_console_text,
         format_browser_session_summary_text, normalize_session_scoped_output,
         redact_browser_output_value, session_summary_value, should_write_browser_setup_auth_token,
         should_write_browser_setup_state_key, BrowserControlPlaneSnapshot, BrowserOutputMode,
@@ -6321,6 +6427,7 @@ mod tests {
         let detail = browser_start_readiness_timeout_detail(
             Some("health endpoint refused connection"),
             Some("failed to call browser ListSessions: unauthenticated"),
+            None,
         );
 
         assert!(detail.contains("gRPC readiness failed"));
@@ -6333,9 +6440,31 @@ mod tests {
         let detail = browser_start_readiness_timeout_detail(
             Some("failed to reach browser health endpoint"),
             None,
+            None,
         );
 
         assert_eq!(detail, "health check failed: failed to reach browser health endpoint");
+    }
+
+    #[test]
+    fn browser_start_timeout_detail_prefers_engine_failure() {
+        let detail = browser_start_readiness_timeout_detail(
+            None,
+            None,
+            Some("failed to launch a Chromium readiness session"),
+        );
+
+        assert!(detail.contains("Chromium session-launch readiness failed"));
+        assert!(detail.contains("failed to launch"));
+    }
+
+    #[test]
+    fn browser_engine_readiness_warning_exposes_restart_recovery() {
+        let warning = browser_engine_readiness_warning("os error 232");
+
+        assert!(warning.contains("Chromium session launch is not ready"));
+        assert!(warning.contains("palyra browser stop"));
+        assert!(warning.contains("palyra browser start --setup"));
     }
 
     #[test]
