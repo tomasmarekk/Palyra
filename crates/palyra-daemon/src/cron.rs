@@ -2768,6 +2768,7 @@ async fn ensure_scheduled_routine_approval_requested(
 async fn enforce_scheduled_routine_approval(
     state: Arc<GatewayRuntimeState>,
     job: &CronJobRecord,
+    wake_signal: &Arc<Notify>,
 ) -> Result<Option<DispatchOutcome>, Status> {
     // Routines runtime is optional; without it the job runs as plain cron.
     let Ok(runtime) = state.routines_runtime_config() else {
@@ -2798,15 +2799,61 @@ async fn enforce_scheduled_routine_approval(
         return Ok(None);
     }
     ensure_scheduled_routine_approval_requested(&state, job, &routine, mode).await?;
-    register_terminal_and_disable_cron_if_max_runs_exhausted(
+    pause_cron_while_routine_approval_pending(Arc::clone(&state), job).await?;
+    let outcome = register_terminal_and_disable_cron_if_max_runs_exhausted(
         Arc::clone(&state),
         job,
         CronRunStatus::Denied,
         ROUTINE_APPROVAL_REQUIRED_ERROR_KIND,
-        "routine approval is required before the first scheduled run",
+        "routine approval is required before the first scheduled run; automatic scheduling is paused until an operator approves it",
     )
-    .await
-    .map(Some)
+    .await?;
+    // An operator can resolve the approval between prompt creation and the
+    // pause write. Recheck the bound decision so that race cannot strand an
+    // already-approved routine without a next tick.
+    if scheduled_routine_approval_granted(
+        &state,
+        subject_id.as_str(),
+        job.owner_principal.as_str(),
+        expected_policy_hash.as_str(),
+    )
+    .await?
+    {
+        state
+            .update_cron_job(
+                job.job_id.clone(),
+                routine_approval_granted_rearm_patch(now_unix_ms()?),
+            )
+            .await?;
+        wake_signal.notify_one();
+    }
+    Ok(Some(outcome))
+}
+
+async fn pause_cron_while_routine_approval_pending(
+    state: Arc<GatewayRuntimeState>,
+    job: &CronJobRecord,
+) -> Result<(), Status> {
+    state.update_cron_job(job.job_id.clone(), routine_approval_pending_pause_patch()).await?;
+    Ok(())
+}
+
+fn routine_approval_pending_pause_patch() -> CronJobUpdatePatch {
+    // Keep the job enabled: the approval-decision handler recognizes this
+    // paused state and schedules the first run immediately after approval.
+    CronJobUpdatePatch {
+        next_run_at_unix_ms: Some(None),
+        queued_run: Some(false),
+        ..CronJobUpdatePatch::default()
+    }
+}
+
+fn routine_approval_granted_rearm_patch(now_unix_ms: i64) -> CronJobUpdatePatch {
+    CronJobUpdatePatch {
+        next_run_at_unix_ms: Some(Some(now_unix_ms)),
+        queued_run: Some(false),
+        ..CronJobUpdatePatch::default()
+    }
 }
 
 /// Evaluates a file-watch routine before dispatch.
@@ -3143,7 +3190,9 @@ async fn dispatch_job(
     }
 
     if !manual_trigger {
-        if let Some(outcome) = enforce_scheduled_routine_approval(Arc::clone(&state), &job).await? {
+        if let Some(outcome) =
+            enforce_scheduled_routine_approval(Arc::clone(&state), &job, &wake_signal).await?
+        {
             return Ok(outcome);
         }
     }
@@ -4913,6 +4962,7 @@ mod tests {
         max_runs_for_job, merged_parameter_delta_json, next_run_at_for_enabled_state,
         normalize_schedule, now_unix_ms_or_fallback, panicked_cron_run_finalize_request,
         parse_skill_reaudit_interval, periodic_reaudit_targets, reserved_cron_run_slot_count,
+        routine_approval_granted_rearm_patch, routine_approval_pending_pause_patch,
         routine_approval_subject_id, routine_gate_error_kind, routine_parameter_delta_json,
         routines_automation_enabled, scheduled_routine_approval_matches,
         scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
@@ -5496,6 +5546,24 @@ mod tests {
         routine.trigger_kind = RoutineTriggerKind::Schedule;
         routine.approval_policy = RoutineApprovalPolicy { mode: RoutineApprovalMode::None };
         assert!(!scheduled_routine_requires_first_run_approval(&routine));
+    }
+
+    #[test]
+    fn pending_first_run_approval_pauses_ticks_without_disabling_the_routine() {
+        let patch = routine_approval_pending_pause_patch();
+
+        assert_eq!(patch.enabled, None);
+        assert_eq!(patch.next_run_at_unix_ms, Some(None));
+        assert_eq!(patch.queued_run, Some(false));
+    }
+
+    #[test]
+    fn approval_granted_during_pause_rearms_an_immediate_tick() {
+        let patch = routine_approval_granted_rearm_patch(12_345);
+
+        assert_eq!(patch.enabled, None);
+        assert_eq!(patch.next_run_at_unix_ms, Some(Some(12_345)));
+        assert_eq!(patch.queued_run, Some(false));
     }
 
     #[test]
