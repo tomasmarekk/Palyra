@@ -1590,6 +1590,33 @@ fn background_budget_guard_rejects_over_budget_input() {
 }
 
 #[test]
+fn background_budget_guard_counts_model_visible_tool_schemas() {
+    let mut request = ProviderRequest::from_input_text(
+        "short background task".to_owned(),
+        false,
+        Vec::new(),
+        None,
+    );
+    request.tool_catalog_snapshot = Some(serde_json::json!({
+        "tools": [{
+            "name": "palyra.example",
+            "description": vec!["schema"; 1_100].join(" "),
+            "input_schema": {
+                "type": "object",
+                "properties": {}
+            }
+        }]
+    }));
+
+    let message = apply_background_budget_guard(&mut request, 1_000, 0)
+        .expect_err("tool schema overhead must be included before provider execution");
+
+    assert!(message.contains("background task token budget exhausted before provider turn"));
+    assert!(message.contains("estimated_input_tokens="));
+    assert_eq!(request.max_output_tokens, None);
+}
+
+#[test]
 fn background_budget_overrun_detects_provider_usage_after_turn() {
     assert!(background_budget_overrun_message(1_000, 1_001)
         .expect("usage above budget must be rejected")

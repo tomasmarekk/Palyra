@@ -8,9 +8,14 @@ pub(super) fn runtime_kernel_provider_request_input_tokens(request: &ProviderReq
         .iter()
         .map(estimate_provider_message_input_tokens)
         .fold(0_u64, u64::saturating_add);
+    let tool_catalog_tokens = request
+        .tool_catalog_snapshot
+        .as_ref()
+        .map(|catalog| estimate_background_budget_text_tokens(catalog.to_string().as_str()))
+        .unwrap_or_default();
     let vision_tokens =
         u64::try_from(request.vision_inputs.len()).unwrap_or(u64::MAX).saturating_mul(256);
-    message_tokens.saturating_add(vision_tokens)
+    message_tokens.saturating_add(tool_catalog_tokens).saturating_add(vision_tokens)
 }
 
 fn estimate_provider_message_input_tokens(message: &ProviderMessage) -> u64 {

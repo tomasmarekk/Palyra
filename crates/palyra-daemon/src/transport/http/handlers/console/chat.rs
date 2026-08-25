@@ -47,7 +47,10 @@ use serde::Serialize;
 // artifact store so cross-device surfaces never receive attachment content.
 const ATTACHMENT_DERIVED_INDEX_OMITTED_MESSAGE: &str =
     "attachment-derived content omitted; use device-scoped derived artifact endpoints";
-const DEFAULT_CONSOLE_BACKGROUND_TASK_BUDGET_TOKENS: u64 = 4_096;
+// Background budgets meter the compiled instructions and tool schemas on every
+// provider turn, not only the operator's task text. Reserve enough for several
+// ordinary tool-loop turns while keeping explicit operator budgets authoritative.
+const DEFAULT_CONSOLE_BACKGROUND_TASK_BUDGET_TOKENS: u64 = 65_536;
 
 /// Transcript provenance for a canvas: the latest tape event that referenced
 /// the canvas frame URL, if any.
@@ -7054,7 +7057,7 @@ fn approval_scope_to_proto(scope: Option<ApprovalDecisionScope>) -> i32 {
 }
 
 /// Effective token budget for a console background task: the requested value
-/// verbatim, or the default floor raised to at least the prompt's own
+/// verbatim, or the default multi-turn floor raised to at least the task text's
 /// estimated size.
 fn console_background_task_budget_tokens(requested: Option<u64>, text: &str) -> u64 {
     requested.unwrap_or_else(|| {
@@ -7437,7 +7440,12 @@ mod tests {
             super::DEFAULT_CONSOLE_BACKGROUND_TASK_BUDGET_TOKENS
         );
         let long_task = vec!["word"; 4_200].join(" ");
-        assert_eq!(console_background_task_budget_tokens(None, long_task.as_str()), 4_200);
+        assert_eq!(
+            console_background_task_budget_tokens(None, long_task.as_str()),
+            super::DEFAULT_CONSOLE_BACKGROUND_TASK_BUDGET_TOKENS
+        );
+        let oversized_task = vec!["word"; 70_000].join(" ");
+        assert_eq!(console_background_task_budget_tokens(None, oversized_task.as_str()), 70_000);
     }
 
     #[test]
