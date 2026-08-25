@@ -22,7 +22,9 @@ use crate::{
         TerminalOutcomeClass, TerminalOutcomeClassification,
     },
 };
-use palyra_common::process_runner_input::parse_process_runner_tool_input;
+use palyra_common::{
+    process_runner_input::parse_process_runner_tool_input, runtime_contracts::ToolTurnBudget,
+};
 
 /// Default wall-clock budget per run (15 minutes) covering long browser workflows.
 pub(crate) const DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS: u64 = 900_000;
@@ -1736,17 +1738,27 @@ fn build_run_progress_checkpoint(
         let output = model_visible_tool_result_payload(&raw_output);
 
         if model_visible_tool_result_succeeded(&raw_output) {
-            collect_produced_files(
-                tool_call.tool_name.as_str(),
-                output,
-                &mut produced_files_by_path,
-            );
-            collect_satisfied_file_evidence(
-                tool_call.tool_name.as_str(),
-                output,
-                &mut satisfied_file_paths,
-            );
-            collect_process_progress(tool_call.tool_name.as_str(), output, &mut process_by_pid);
+            let projected_summary = projected_tool_result_summary(output);
+            let evidence_outputs = std::iter::once(output)
+                .chain(projected_summary.as_ref())
+                .chain(output.get("progress_evidence"));
+            for evidence_output in evidence_outputs {
+                collect_produced_files(
+                    tool_call.tool_name.as_str(),
+                    evidence_output,
+                    &mut produced_files_by_path,
+                );
+                collect_satisfied_file_evidence(
+                    tool_call.tool_name.as_str(),
+                    evidence_output,
+                    &mut satisfied_file_paths,
+                );
+                collect_process_progress(
+                    tool_call.tool_name.as_str(),
+                    evidence_output,
+                    &mut process_by_pid,
+                );
+            }
             last_successful_tool = Some(tool_success_summary(tool_call.tool_name.as_str(), output));
         } else if known_failed_attempts.len() < RUN_PROGRESS_MAX_FAILED_ATTEMPTS {
             known_failed_attempts
@@ -1785,8 +1797,26 @@ struct ProviderMessageToolCallRef {
 fn model_visible_tool_result_payload(output: &Value) -> &Value {
     output
         .get("output")
-        .filter(|_| output.get("tool_name").and_then(Value::as_str).is_some())
+        .filter(|_| {
+            output.get("tool_name").and_then(Value::as_str).is_some()
+                || (output.get("success").and_then(Value::as_bool).is_some()
+                    && output.get("error").and_then(Value::as_str).is_some())
+        })
         .unwrap_or(output)
+}
+
+fn projected_tool_result_summary(output: &Value) -> Option<Value> {
+    if output.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || output.get("projection_policy").and_then(Value::as_str).is_none()
+    {
+        return None;
+    }
+    let summary = output.get("summary").and_then(Value::as_str)?;
+    if summary.len() > ToolTurnBudget::default().max_model_summary_bytes {
+        return None;
+    }
+    let summary = serde_json::from_str::<Value>(summary).ok()?;
+    summary.is_object().then_some(summary)
 }
 
 fn model_visible_tool_result_succeeded(output: &Value) -> bool {
@@ -1827,11 +1857,16 @@ fn collect_workspace_patch_files(
         if matches!(operation.as_str(), "delete" | "no_op") {
             continue;
         }
+        let root_label = file
+            .get("workspace_root_index")
+            .and_then(Value::as_u64)
+            .map_or_else(|| "app".to_owned(), |index| format!("workspace_root:{index}"));
+        let key = format!("{root_label}:{path}");
         produced_files_by_path.insert(
-            path.clone(),
+            key,
             RunProgressFileSummary {
                 path,
-                root_label: "app".to_owned(),
+                root_label,
                 status: "exists".to_owned(),
                 operation,
                 sha256: file.get("after_sha256").and_then(Value::as_str).map(checkpoint_sha),
@@ -2742,6 +2777,65 @@ mod tests {
         )]);
     }
 
+    fn append_projected_workspace_patch(
+        state: &mut AgentRunLoopState,
+        proposal_id: &str,
+        path: &str,
+        operation: &str,
+    ) {
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: proposal_id.to_owned(),
+                tool_name: WORKSPACE_PATCH_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({ "patch": format!("patch for {path}") }),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        let patch_output = serde_json::json!({
+            "patch_sha256": "abc",
+            "dry_run": false,
+            "files_touched": [{
+                "path": path,
+                "workspace_root_index": 0,
+                "operation": operation,
+                "after_sha256": "sha",
+                "after_size_bytes": 84
+            }],
+            "rollback_performed": false,
+            "redacted_preview": ""
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            proposal_id,
+            serde_json::json!({
+                "success": true,
+                "error": "",
+                "output": {
+                    "schema_version": 1,
+                    "visibility": "redacted_preview",
+                    "projection_policy": "redacted_preview_and_artifact",
+                    "summary": patch_output.to_string(),
+                    "progress_evidence": {
+                        "schema_version": 1,
+                        "kind": "workspace_patch",
+                        "dry_run": false,
+                        "rollback_performed": false,
+                        "files_touched": patch_output["files_touched"],
+                        "files_touched_truncated": false
+                    },
+                    "artifact": {
+                        "artifact_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                        "tool_name": WORKSPACE_PATCH_TOOL_NAME
+                    }
+                }
+            })
+            .to_string(),
+        )]);
+    }
+
     fn append_workspace_patch_with_stale_verification(
         state: &mut AgentRunLoopState,
         proposal_id: &str,
@@ -3181,6 +3275,72 @@ mod tests {
             .any(|value| value == "file:extract.js"));
         assert_eq!(envelope.final_answer_contract.decision, FinalAnswerDecision::Accepted);
         assert_eq!(envelope.evidence_summary.coverage, FinalAnswerEvidenceCoverage::Satisfied);
+    }
+
+    #[test]
+    fn projected_patch_create_and_update_satisfy_final_artifact_evidence() {
+        let path = "reports/event-order.md";
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text(format!(
+                "Create {path}, run the requested command, and update {path} with its output."
+            ))],
+            2,
+            4,
+            10_000,
+        );
+        append_projected_workspace_patch(&mut state, "call-create", path, "create");
+        append_projected_workspace_patch(&mut state, "call-update", path, "update");
+
+        let checkpoint =
+            state.progress_checkpoint("run-01", AgentLoopTerminationReason::FinalAnswer);
+        assert_eq!(checkpoint.produced_files.len(), 1);
+        assert_eq!(checkpoint.produced_files[0].path, path);
+        assert_eq!(checkpoint.produced_files[0].root_label, "workspace_root:0");
+        assert_eq!(checkpoint.produced_files[0].operation, "update");
+        assert!(checkpoint.missing_artifacts.is_empty());
+
+        let final_answer = format!("Created and updated {path}.");
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::FinalAnswer,
+            final_answer.as_str(),
+            None,
+        );
+        let parsed: Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+        let evidence = &parsed["finalization"]["evidence_summary"];
+        assert_eq!(evidence["coverage"], "satisfied");
+        assert_eq!(evidence["produced_files_count"], 1);
+        assert_eq!(evidence["missing_artifacts_count"], 0);
+        assert!(evidence["evidence_refs"]
+            .as_array()
+            .expect("evidence refs should be an array")
+            .iter()
+            .any(|value| value == "file:reports/event-order.md"));
+    }
+
+    #[test]
+    fn projected_summary_fallback_recovers_legacy_patch_metadata() {
+        let summary = serde_json::json!({
+            "dry_run": false,
+            "files_touched": [{
+                "path": "reports/event-order.md",
+                "workspace_root_index": 0,
+                "operation": "create"
+            }]
+        });
+        let projection = serde_json::json!({
+            "schema_version": 1,
+            "projection_policy": "redacted_preview_and_artifact",
+            "summary": summary.to_string()
+        });
+
+        let recovered =
+            projected_tool_result_summary(&projection).expect("legacy summary should parse");
+        assert_eq!(
+            recovered.pointer("/files_touched/0/path").and_then(Value::as_str),
+            Some("reports/event-order.md")
+        );
     }
 
     #[test]

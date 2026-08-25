@@ -136,6 +136,7 @@ use super::{
 const MAX_PARALLEL_TOOL_CALLS_PER_GROUP: usize = 4;
 const TOOL_PARALLELISM_ENABLED_ENV: &str = "PALYRA_TOOL_PARALLELISM_ENABLED";
 const TOOL_RESULT_PROJECTION_POLICY_EVENT: &str = "tool.result.projection_policy";
+const TOOL_RESULT_PROGRESS_EVIDENCE_MAX_FILES: usize = 128;
 const TOOL_RESULT_REPLAY_SAFETY_EVENT: &str = "tool.result.replay_safety";
 const TOOL_BEFORE_DECISION_EVENT: &str = "tool.before_decision";
 const TOOL_RESULT_MIDDLEWARE_EVENT: &str = "tool.result.middleware";
@@ -4443,6 +4444,8 @@ async fn project_tool_result_for_model(
         outcome.output_json.as_slice(),
         budget.max_model_summary_bytes,
     );
+    let progress_evidence =
+        tool_result_progress_evidence(tool_name, outcome.output_json.as_slice());
     let visibility = if default_sensitive {
         ToolResultVisibility::RedactedPreview
     } else {
@@ -4457,7 +4460,7 @@ async fn project_tool_result_for_model(
     .await;
     let saved_model_visible_bytes =
         outcome.output_json.len().saturating_sub(summary.len()).try_into().unwrap_or(u64::MAX);
-    let projected = json!({
+    let mut projected = json!({
         "schema_version": 1,
         "visibility": visibility.as_str(),
         "projection_policy": projection_policy.as_str(),
@@ -4479,6 +4482,9 @@ async fn project_tool_result_for_model(
             "saved_model_visible_bytes": saved_model_visible_bytes,
         }
     });
+    if let Some(progress_evidence) = progress_evidence {
+        projected["progress_evidence"] = progress_evidence;
+    }
     let mut projected_outcome = outcome;
     projected_outcome.output_json = serde_json::to_vec(&projected).map_err(|error| {
         Status::internal(format!("failed to serialize projected tool result: {error}"))
@@ -4516,6 +4522,44 @@ async fn project_tool_result_for_model(
         audit: Some(audit),
         middleware_report,
     })
+}
+
+fn tool_result_progress_evidence(tool_name: &str, output_json: &[u8]) -> Option<Value> {
+    if tool_name != crate::gateway::WORKSPACE_PATCH_TOOL_NAME {
+        return None;
+    }
+    let output = serde_json::from_slice::<Value>(output_json).ok()?;
+    let files = output.get("files_touched").and_then(Value::as_array)?;
+    let files_touched = files
+        .iter()
+        .take(TOOL_RESULT_PROGRESS_EVIDENCE_MAX_FILES)
+        .filter_map(|file| {
+            let path = file.get("path").and_then(Value::as_str)?;
+            let workspace_root_index = file.get("workspace_root_index").and_then(Value::as_u64)?;
+            let operation = file.get("operation").and_then(Value::as_str)?;
+            Some(json!({
+                "path": path,
+                "workspace_root_index": workspace_root_index,
+                "operation": operation,
+                "after_sha256": file.get("after_sha256").cloned().unwrap_or(Value::Null),
+                "after_size_bytes": file
+                    .get("after_size_bytes")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }))
+        })
+        .collect::<Vec<_>>();
+    Some(json!({
+        "schema_version": 1,
+        "kind": "workspace_patch",
+        "dry_run": output.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
+        "rollback_performed": output
+            .get("rollback_performed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "files_touched": files_touched,
+        "files_touched_truncated": files.len() > TOOL_RESULT_PROGRESS_EVIDENCE_MAX_FILES,
+    }))
 }
 
 async fn workspace_spill_projection_for_artifact(
@@ -6550,6 +6594,47 @@ mod tests {
                 &ToolTurnBudget::default()
             ),
             "small OS list_dir metadata must use RedactedPreviewAndArtifact projection"
+        );
+    }
+
+    #[test]
+    fn workspace_patch_progress_evidence_is_root_indexed_and_bounded() {
+        let files_touched = (0..130)
+            .map(|index| {
+                json!({
+                    "path": format!("reports/output-{index}.md"),
+                    "workspace_root_index": index % 2,
+                    "operation": if index == 0 { "create" } else { "update" },
+                    "after_sha256": format!("{index:064x}"),
+                    "after_size_bytes": index + 1,
+                    "redacted_preview": "must not enter progress evidence"
+                })
+            })
+            .collect::<Vec<_>>();
+        let output = serde_json::to_vec(&json!({
+            "dry_run": false,
+            "rollback_performed": false,
+            "files_touched": files_touched
+        }))
+        .expect("patch output should serialize");
+
+        let evidence = super::tool_result_progress_evidence(
+            crate::gateway::WORKSPACE_PATCH_TOOL_NAME,
+            &output,
+        )
+        .expect("workspace patch should project progress evidence");
+
+        assert_eq!(evidence["kind"], "workspace_patch");
+        assert_eq!(
+            evidence["files_touched"].as_array().map(Vec::len),
+            Some(super::TOOL_RESULT_PROGRESS_EVIDENCE_MAX_FILES)
+        );
+        assert_eq!(evidence["files_touched_truncated"], true);
+        assert_eq!(evidence["files_touched"][0]["workspace_root_index"], 0);
+        assert_eq!(evidence["files_touched"][0]["path"], "reports/output-0.md");
+        assert!(
+            evidence["files_touched"][0].get("redacted_preview").is_none(),
+            "progress evidence must include only whitelisted metadata"
         );
     }
 
