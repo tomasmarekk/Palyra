@@ -1027,6 +1027,65 @@ fn persisted_state_store_enforces_owner_only_permissions() {
     assert_eq!(registry_mode, 0o600, "registry file should be owner-only on unix");
 }
 
+#[test]
+fn persisted_state_store_quarantines_snapshot_after_key_change_and_recovers() {
+    let temp = tempfile::tempdir().expect("tempdir should be available");
+    let root = temp.path().join("state");
+    let state_id = "agent-session-sha256-test";
+    let snapshot = PersistedSessionSnapshot {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        principal: "user:ops".to_owned(),
+        channel: None,
+        tabs: Vec::new(),
+        tab_order: Vec::new(),
+        active_tab_id: String::new(),
+        permissions: SessionPermissionsInternal::default(),
+        cookie_jar: HashMap::new(),
+        storage_entries: HashMap::new(),
+        state_revision: 1,
+        saved_at_unix_ms: 1_737_000_000_000,
+    };
+    let original_store = PersistedStateStore::new(root.clone(), [7_u8; STATE_KEY_LEN])
+        .expect("initial state store should initialize");
+    original_store
+        .save_snapshot(state_id, None, &snapshot)
+        .expect("initial snapshot should persist");
+    let original_path = original_store.snapshot_path(state_id);
+    assert!(original_path.is_file());
+
+    let replacement_store = PersistedStateStore::new(root.clone(), [9_u8; STATE_KEY_LEN])
+        .expect("replacement state store should initialize");
+    let restored = replacement_store
+        .load_snapshot(state_id, None)
+        .expect("authentication failure should recover through quarantine");
+    assert!(restored.is_none(), "unreadable state must not be restored");
+    assert!(!original_path.exists(), "unreadable source blob should leave the active path");
+    let quarantine_entries = std::fs::read_dir(root.as_path())
+        .expect("state directory should remain readable")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with(state_id)
+                && entry.path().extension().and_then(|value| value.to_str()) == Some("invalid")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(quarantine_entries.len(), 1, "one audit quarantine blob should remain");
+    assert!(
+        quarantine_entries[0].file_name().to_string_lossy().contains("decrypt_failed"),
+        "quarantine name should carry the bounded failure class"
+    );
+
+    replacement_store
+        .save_snapshot(state_id, None, &snapshot)
+        .expect("fresh state should persist with the current key");
+    assert!(
+        replacement_store
+            .load_snapshot(state_id, None)
+            .expect("fresh state should decrypt")
+            .is_some(),
+        "fresh state should restore after quarantine recovery"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn persisted_state_store_rejects_symlink_profile_registry_file() {

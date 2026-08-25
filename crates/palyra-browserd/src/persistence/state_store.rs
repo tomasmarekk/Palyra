@@ -69,6 +69,21 @@ pub(crate) struct LoadedPersistedSessionSnapshot {
     pub(crate) raw_hash_sha256: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SnapshotDecodeFailure {
+    Decrypt,
+    Deserialize,
+}
+
+impl SnapshotDecodeFailure {
+    const fn audit_label(self) -> &'static str {
+        match self {
+            Self::Decrypt => "decrypt_failed",
+            Self::Deserialize => "deserialize_failed",
+        }
+    }
+}
+
 /// Canonical (sorted-map) snapshot form so hashes are stable across `HashMap` iteration orders.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PersistedSessionSnapshotForHash {
@@ -404,9 +419,13 @@ impl PersistedStateStore {
     ///
     /// `profile_id` selects the per-profile derived key and must match the one used to save.
     ///
+    /// Authentication or format failures quarantine the unreadable blob and
+    /// return `Ok(None)`, allowing a fresh session to recover. Filesystem,
+    /// permission, or quarantine failures remain hard errors.
+    ///
     /// # Errors
-    /// Fails when the file cannot be read, decryption fails (wrong key or tampering), or the
-    /// plaintext does not deserialize.
+    /// Fails when the file cannot be read securely or an unreadable blob cannot
+    /// be moved into the audit quarantine.
     pub(crate) fn load_snapshot(
         &self,
         state_id: &str,
@@ -418,17 +437,65 @@ impl PersistedStateStore {
         }
         let bytes = read_hardened_file(path.as_path(), "persisted browser state")?;
         let key = derive_state_encryption_key(&self.key, profile_id);
-        let decrypted = decrypt_state_blob(&key, bytes.as_slice()).with_context(|| {
-            format!("failed to decrypt persisted browser state '{}'", path.display())
-        })?;
-        let snapshot: PersistedSessionSnapshot = serde_json::from_slice(decrypted.as_slice())
-            .with_context(|| {
-                format!("failed to deserialize persisted browser state '{}'", path.display())
-            })?;
+        let decrypted = match decrypt_state_blob(&key, bytes.as_slice()) {
+            Ok(value) => value,
+            Err(error) => {
+                self.quarantine_unreadable_snapshot(
+                    state_id,
+                    path.as_path(),
+                    SnapshotDecodeFailure::Decrypt,
+                    &error,
+                )?;
+                return Ok(None);
+            }
+        };
+        let snapshot: PersistedSessionSnapshot = match serde_json::from_slice(decrypted.as_slice())
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.quarantine_unreadable_snapshot(
+                    state_id,
+                    path.as_path(),
+                    SnapshotDecodeFailure::Deserialize,
+                    &error,
+                )?;
+                return Ok(None);
+            }
+        };
         Ok(Some(LoadedPersistedSessionSnapshot {
             snapshot,
             raw_hash_sha256: sha256_hex(decrypted.as_slice()),
         }))
+    }
+
+    fn quarantine_unreadable_snapshot(
+        &self,
+        state_id: &str,
+        source_path: &Path,
+        failure: SnapshotDecodeFailure,
+        decode_error: &dyn std::fmt::Display,
+    ) -> Result<()> {
+        ensure_path_is_not_symlink(source_path, "persisted browser state")?;
+        let quarantine_name =
+            format!("{state_id}.{}.{}.invalid", Ulid::generate(), failure.audit_label());
+        let quarantine_path = self.root_dir.join(quarantine_name.as_str());
+        fs::rename(source_path, quarantine_path.as_path()).with_context(|| {
+            format!(
+                "failed to quarantine unreadable persisted browser state '{}' as '{}'",
+                source_path.display(),
+                quarantine_path.display()
+            )
+        })?;
+        ensure_owner_only_file(quarantine_path.as_path())?;
+        sync_directory(self.root_dir.as_path())?;
+        warn!(
+            state_id,
+            failure = failure.audit_label(),
+            quarantine_file = quarantine_name,
+            error = %decode_error,
+            "quarantined unreadable persisted browser state and will start with clean state"
+        );
+        Ok(())
     }
 
     /// Encrypts and atomically writes a session snapshot under `state_id`.
