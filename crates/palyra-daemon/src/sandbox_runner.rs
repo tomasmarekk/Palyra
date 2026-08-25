@@ -437,7 +437,7 @@ impl ProcessFailureClass {
                 "inspect cancellation/signal cause and rerun only if the process tree can complete within the run lifecycle"
             }
             Self::NonzeroExit => {
-                "fix the command or inputs, then rerun with diagnostics written to an approved workspace artifact if output inspection is required"
+                "inspect the bounded redacted stdout_preview and stderr_preview, fix the command or inputs, then rerun"
             }
             Self::OutputLimit => {
                 "rerun with narrower output, redirect verbose logs to a file, or raise max_output_bytes by policy"
@@ -3299,8 +3299,10 @@ fn process_failure_message(
     let diagnostic_hint = process_failure_diagnostic_hint(stdout, stderr)
         .map(|hint| format!(", hint={hint:?}"))
         .unwrap_or_default();
+    let stdout_preview = redacted_process_failure_preview(stdout.bytes.as_slice());
+    let stderr_preview = redacted_process_failure_preview(stderr.bytes.as_slice());
     format!(
-        "sandbox process exited unsuccessfully (failure_class={}, code={exit_code}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}{}); child output omitted from error",
+        "sandbox process exited unsuccessfully (failure_class={}, code={exit_code}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}{}); stdout_preview={stdout_preview:?}; stderr_preview={stderr_preview:?}",
         failure_class.as_str(),
         stdout.bytes.len(),
         stdout.truncated,
@@ -3308,6 +3310,78 @@ fn process_failure_message(
         stderr.truncated,
         diagnostic_hint,
     )
+}
+
+// Failure diagnostics scan the complete bounded capture before truncation. This
+// prevents a credential marker near the head from exposing a value suffix near
+// the tail while still giving the model an actionable single-line preview.
+fn redacted_process_failure_preview(output: &[u8]) -> Option<String> {
+    if output.is_empty() {
+        return None;
+    }
+    let redacted = redact_labelled_process_failure_secrets(redacted_process_output(output).text);
+    let normalized = redacted
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .collect::<String>();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let mut boundary = collapsed.len().min(PROCESS_OUTPUT_PREVIEW_BYTES);
+    while !collapsed.is_char_boundary(boundary) {
+        boundary = boundary.saturating_sub(1);
+    }
+    Some(collapsed[..boundary].to_owned())
+}
+
+// Plain-text tools sometimes emit credential labels with spaces (for example
+// `api key: value`), which the structured assignment scanner intentionally
+// does not treat as source-code syntax. Failure previews add this conservative
+// line-oriented layer before becoming model-visible.
+fn redact_labelled_process_failure_secrets(value: String) -> String {
+    let mut output = String::with_capacity(value.len());
+    for line in value.split_inclusive('\n') {
+        let (body, line_ending) = line
+            .strip_suffix("\r\n")
+            .map(|body| (body, "\r\n"))
+            .or_else(|| line.strip_suffix('\n').map(|body| (body, "\n")))
+            .unwrap_or((line, ""));
+        let Some((separator_index, _)) =
+            body.char_indices().find(|(_, character)| matches!(character, ':' | '='))
+        else {
+            output.push_str(line);
+            continue;
+        };
+        let label = body[..separator_index]
+            .trim()
+            .chars()
+            .filter(|character| !matches!(character, ' ' | '_' | '-'))
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let value_start = separator_index.saturating_add(1);
+        let secret_value = body[value_start..].trim();
+        if !matches!(
+            label.as_str(),
+            "apikey"
+                | "accesstoken"
+                | "authtoken"
+                | "password"
+                | "secret"
+                | "clientsecret"
+                | "credential"
+        ) || secret_value.is_empty()
+            || secret_value == "[REDACTED_SECRET]"
+            || secret_value == "<redacted>"
+        {
+            output.push_str(line);
+            continue;
+        }
+        output.push_str(&body[..value_start]);
+        output.push_str(" [REDACTED_SECRET]");
+        output.push_str(line_ending);
+    }
+    output
 }
 
 fn process_failure_diagnostic_hint(
@@ -3329,8 +3403,7 @@ fn process_failure_diagnostic_hint(
 }
 
 // Structured success output previews flatten control characters and collapse whitespace before
-// redaction. Failure errors never embed this content because heuristic redaction cannot prove that
-// arbitrary child output is safe for model-visible error channels.
+// redaction.
 fn redacted_process_output_preview(output: &[u8]) -> Option<String> {
     if output.is_empty() {
         return None;
@@ -6637,6 +6710,7 @@ fn rewrite_arguments_to_scoped_paths(
         }
         if let Some(file_url_path) = parse_file_url_path(arg.as_str())? {
             let scoped = resolve_scoped_path(workspace_root, cwd, file_url_path.as_str(), false)?;
+            let scoped = child_process_path(scoped.as_path());
             rewritten.push(scoped_file_url_argument(scoped.as_path())?);
             index = index.saturating_add(1);
             continue;
@@ -6646,6 +6720,7 @@ fn rewrite_arguments_to_scoped_paths(
             if let Some(file_url_path) = parse_file_url_path(value)? {
                 let scoped =
                     resolve_scoped_path(workspace_root, cwd, file_url_path.as_str(), false)?;
+                let scoped = child_process_path(scoped.as_path());
                 let scoped = scoped_file_url_argument(scoped.as_path())?;
                 rewritten.push(replace_option_assignment_value(arg.as_str(), scoped.as_str()));
                 index = index.saturating_add(1);
@@ -6659,7 +6734,7 @@ fn rewrite_arguments_to_scoped_paths(
             let scoped = resolve_scoped_path(workspace_root, cwd, value, false)?;
             rewritten.push(replace_option_assignment_value(
                 arg.as_str(),
-                scoped.to_string_lossy().as_ref(),
+                child_process_path(scoped.as_path()).to_string_lossy().as_ref(),
             ));
             index = index.saturating_add(1);
             continue;
@@ -6668,6 +6743,7 @@ fn rewrite_arguments_to_scoped_paths(
             if let Some(file_url_path) = parse_file_url_path(value)? {
                 let scoped =
                     resolve_scoped_path(workspace_root, cwd, file_url_path.as_str(), false)?;
+                let scoped = child_process_path(scoped.as_path());
                 let scoped = scoped_file_url_argument(scoped.as_path())?;
                 rewritten.push(replace_option_compact_value(arg.as_str(), scoped.as_str()));
                 index = index.saturating_add(1);
@@ -6681,7 +6757,7 @@ fn rewrite_arguments_to_scoped_paths(
             let scoped = resolve_scoped_path(workspace_root, cwd, value, false)?;
             rewritten.push(replace_option_compact_value(
                 arg.as_str(),
-                scoped.to_string_lossy().as_ref(),
+                child_process_path(scoped.as_path()).to_string_lossy().as_ref(),
             ));
             index = index.saturating_add(1);
             continue;
@@ -6692,7 +6768,7 @@ fn rewrite_arguments_to_scoped_paths(
             continue;
         }
         let scoped = resolve_scoped_path(workspace_root, cwd, arg.as_str(), false)?;
-        rewritten.push(scoped.to_string_lossy().to_string());
+        rewritten.push(child_process_path(scoped.as_path()).to_string_lossy().to_string());
         index = index.saturating_add(1);
     }
     Ok(rewritten)
@@ -9631,10 +9707,12 @@ fn background_process_startup_failure(
     stderr: &StreamCapture,
 ) -> SandboxProcessRunError {
     let failure_class = process_exit_failure_class(status);
+    let stdout_preview = redacted_process_failure_preview(stdout.bytes.as_slice());
+    let stderr_preview = redacted_process_failure_preview(stderr.bytes.as_slice());
     SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: format!(
-            "sandbox background process exited before startup check (failure_class={}, code={}) for command '{}', stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}; child output omitted from error; use the cwd field instead of command-line cwd flags, verify the server command, and probe the expected port before browser navigation",
+            "sandbox background process exited before startup check (failure_class={}, code={}) for command '{}', stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}; stdout_preview={stdout_preview:?}; stderr_preview={stderr_preview:?}; use the cwd field instead of command-line cwd flags, verify the server command, and probe the expected port before browser navigation",
             failure_class.as_str(),
             status.code().unwrap_or(-1),
             input.command,
@@ -14058,13 +14136,15 @@ mod tests {
             .expect("workspace fixture should be written");
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
             .expect("workspace root should canonicalize");
-        let expected_script = canonical_workspace
-            .join("e2e-file-workflow")
-            .join("test.js")
-            .to_string_lossy()
-            .to_string();
+        let expected_script = super::child_process_path(
+            canonical_workspace.join("e2e-file-workflow").join("test.js").as_path(),
+        )
+        .to_string_lossy()
+        .to_string();
         let expected_directory =
-            canonical_workspace.join("e2e-file-workflow").to_string_lossy().to_string();
+            super::child_process_path(canonical_workspace.join("e2e-file-workflow").as_path())
+                .to_string_lossy()
+                .to_string();
         let args = vec![
             "/workspace/e2e-file-workflow/test.js".to_owned(),
             "--config=\\workspace\\e2e-file-workflow\\test.js".to_owned(),
@@ -18905,9 +18985,9 @@ mod tests {
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::RuntimeFailure);
         assert!(error.message.contains("exited before startup check"), "{}", error.message);
-        assert!(error.message.contains("child output omitted from error"), "{}", error.message);
         assert!(
-            !error.message.contains("arbitrary-private-background-output"),
+            error.message.contains("stdout_preview=Some(")
+                && error.message.contains("arbitrary-private-background-output"),
             "{}",
             error.message
         );
@@ -19223,6 +19303,36 @@ mod tests {
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
         assert!(error.message.contains("shell-eval flags"), "{}", error.message);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_constrained_process_executes_explicit_workspace_node_script_when_available() {
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let workspace = unique_temp_dir("workspace-node-script");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::write(workspace.join("smoke.js"), b"console.log('PALYRA_NODE_SCRIPT_OK');\n")
+            .expect("Node smoke script should be written");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec!["node".to_owned()]);
+        policy.allow_interpreters = true;
+        policy.egress_enforcement_mode = EgressEnforcementMode::None;
+        let input = br#"{"command":"node","args":["smoke.js"]}"#;
+
+        let result = run_constrained_process(&policy, input, Duration::from_millis(20_000))
+            .expect("allowlisted Node must execute an explicit workspace script");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("process output should parse");
+
+        assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
+        assert_eq!(
+            output.get("stdout").and_then(serde_json::Value::as_str),
+            Some("PALYRA_NODE_SCRIPT_OK\n")
+        );
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
@@ -19756,7 +19866,7 @@ mod tests {
 
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn run_constrained_process_runtime_failure_redacts_child_stderr_payload() {
+    fn run_constrained_process_runtime_failure_exposes_redacted_child_stderr_preview() {
         if Command::new("wc").arg("--version").output().is_err() {
             return;
         }
@@ -19779,15 +19889,19 @@ mod tests {
             error.message.contains("code=")
                 && error.message.contains("stderr_bytes=")
                 && error.message.contains("stderr_truncated="),
-            "runtime failure should remain diagnosable without stderr content: {}",
+            "runtime failure should remain diagnosable with redacted stderr content: {}",
             error.message
         );
         assert!(
             !error.message.contains(secret_marker),
             "runtime failure message must not leak raw stderr payload"
         );
-        assert!(!error.message.contains("stderr_preview="), "{}", error.message);
-        assert!(error.message.contains("child output omitted from error"), "{}", error.message);
+        assert!(error.message.contains("stderr_preview=Some("), "{}", error.message);
+        assert!(
+            error.message.contains("<redacted>") || error.message.contains("[REDACTED_SECRET]"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
@@ -20105,7 +20219,7 @@ mod tests {
     }
 
     #[test]
-    fn process_failure_message_omits_stdout_and_stderr_content() {
+    fn process_failure_message_exposes_bounded_redacted_stdout_and_stderr() {
         let stdout = StreamCapture {
             bytes: b"arbitrary-private-stdout\naccess_token=stdout-secret".to_vec(),
             truncated: false,
@@ -20123,13 +20237,16 @@ mod tests {
         assert!(message.contains("failure_class=nonzero_exit"), "{message}");
         assert!(message.contains("stdout_bytes="), "{message}");
         assert!(message.contains("stderr_bytes="), "{message}");
-        assert!(message.contains("child output omitted from error"), "{message}");
-        assert!(!message.contains("stdout_preview="), "{message}");
-        assert!(!message.contains("stderr_preview="), "{message}");
-        assert!(!message.contains("arbitrary-private-stdout"), "{message}");
-        assert!(!message.contains("arbitrary-private-stderr"), "{message}");
+        assert!(message.contains("stdout_preview=Some("), "{message}");
+        assert!(message.contains("stderr_preview=Some("), "{message}");
+        assert!(message.contains("arbitrary-private-stdout"), "{message}");
+        assert!(message.contains("arbitrary-private-stderr"), "{message}");
         assert!(!message.contains("stdout-secret"), "{message}");
         assert!(!message.contains("stderr-secret"), "{message}");
+        assert!(
+            message.contains("<redacted>") || message.contains("[REDACTED_SECRET]"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -20161,7 +20278,11 @@ api key: qwerty
         for secret in ["hunter2", "qwerty", "abc123"] {
             assert!(!payload.contains(secret), "failure payload leaked {secret}: {payload}");
         }
-        assert!(payload.contains("child output omitted from error"), "{payload}");
+        assert!(payload.contains("stderr_preview"), "{payload}");
+        assert!(
+            payload.contains("<redacted>") || payload.contains("[REDACTED_SECRET]"),
+            "{payload}"
+        );
     }
 
     #[test]
@@ -20176,11 +20297,13 @@ api key: qwerty
             process_failure_message(super::ProcessFailureClass::NonzeroExit, 101, &stdout, &stderr);
 
         assert!(message.contains("stderr_bytes="), "{message}");
-        assert!(message.contains("child output omitted from error"), "{message}");
-        assert!(!message.contains("stderr_preview="), "{message}");
+        assert!(message.contains("stderr_preview=Some("), "{message}");
         assert!(!message.contains("stderr_tail="), "{message}");
-        assert!(!message.contains("access_token"), "{message}");
         assert!(!message.contains("unique-secret-suffix"), "{message}");
+        assert!(
+            message.contains("<redacted>") || message.contains("[REDACTED_SECRET]"),
+            "{message}"
+        );
     }
 
     #[test]
