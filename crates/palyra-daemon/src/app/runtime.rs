@@ -77,9 +77,6 @@ pub(crate) fn build_app_state(
         objectives: context.objectives,
         vault: context.vault,
         tool_allowed_tools: loaded.tool_call.allowed_tools.clone(),
-        browser_service_config: build_browser_service_runtime_config(
-            &loaded.tool_call.browser_service,
-        ),
         auth_runtime: context.auth_runtime,
         auth: context.auth,
         admin_rate_limit: Arc::new(Mutex::new(HashMap::<IpAddr, AdminRateLimitEntry>::new())),

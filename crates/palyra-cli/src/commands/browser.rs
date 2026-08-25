@@ -162,6 +162,10 @@ struct BrowserLifecyclePayload {
     stderr_log_path: Option<String>,
     detail: String,
     cleanup_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_restart_required: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_reload: Option<crate::commands::runtime_reload::RuntimeConfigReloadOutcome>,
     warnings: Vec<String>,
 }
 
@@ -1094,6 +1098,8 @@ async fn run_browser_start(
                     .to_owned()
             },
             cleanup_hint: browser_lifecycle_cleanup_hint(lifecycle_state),
+            gateway_restart_required: None,
+            gateway_reload: None,
             warnings: lifecycle_warnings,
         };
         let value =
@@ -1107,6 +1113,8 @@ async fn run_browser_start(
     }
 
     let binary = resolve_browser_bin_path(bin_path)?;
+    let mut fallback_selected = false;
+    let mut fallback_config_updated = false;
     let port_diagnostics = browser_connection_port_diagnostics(&resolved.connection);
     let unavailable =
         port_diagnostics.iter().filter(|diagnostic| !diagnostic.bind_available).collect::<Vec<_>>();
@@ -1125,6 +1133,8 @@ async fn run_browser_start(
         })?;
         let config_updated =
             persist_browser_service_connection_urls(resolved.config_path.as_deref(), &fallback)?;
+        fallback_selected = true;
+        fallback_config_updated = config_updated;
         lifecycle_warnings.push(browser_port_fallback_warning(
             &resolved.connection,
             &fallback,
@@ -1194,6 +1204,26 @@ async fn run_browser_start(
             Ok(_) => match probe_browser_start_grpc_reachability(&resolved.connection).await {
                 Ok(()) => match probe_browser_engine_readiness(&resolved.connection).await {
                     Ok(()) => {
+                        let gateway_reload = if fallback_config_updated {
+                            Some(
+                                crate::commands::runtime_reload::try_apply_active_config_reload(
+                                    resolved.config_path.clone(),
+                                )
+                                .await,
+                            )
+                        } else {
+                            None
+                        };
+                        let gateway_handoff_confirmed =
+                            gateway_reload.as_ref().is_some_and(browser_gateway_handoff_confirmed);
+                        let gateway_restart_required =
+                            fallback_selected.then_some(!gateway_handoff_confirmed);
+                        if fallback_selected && !gateway_handoff_confirmed {
+                            lifecycle_warnings.push(browser_gateway_handoff_pending_warning(
+                                gateway_reload.as_ref(),
+                                fallback_config_updated,
+                            ));
+                        }
                         let payload = BrowserLifecyclePayload {
                             action: "start".to_owned(),
                             running: true,
@@ -1204,10 +1234,16 @@ async fn run_browser_start(
                             health_base_url: resolved.connection.health_base_url,
                             stdout_log_path: Some(metadata.stdout_log_path),
                             stderr_log_path: Some(metadata.stderr_log_path),
-                            detail:
+                            detail: if fallback_selected && gateway_handoff_confirmed {
+                                "browser service started, passed transport plus Chromium session-launch readiness, and the running gateway acknowledged the fallback endpoint"
+                                    .to_owned()
+                            } else {
                                 "browser service started and passed transport plus Chromium session-launch readiness"
-                                    .to_owned(),
+                                    .to_owned()
+                            },
                             cleanup_hint: None,
+                            gateway_restart_required,
+                            gateway_reload,
                             warnings: lifecycle_warnings,
                         };
                         let value = serde_json::to_value(&payload)
@@ -1308,6 +1344,8 @@ async fn run_browser_stop(json: bool) -> Result<()> {
         stderr_log_path: Some(metadata.stderr_log_path),
         detail: "browser service stopped and lifecycle metadata removed".to_owned(),
         cleanup_hint: None,
+        gateway_restart_required: None,
+        gateway_reload: None,
         warnings: Vec::new(),
     };
     let value =
@@ -1440,6 +1478,8 @@ fn browser_stop_without_metadata_payload(
                 .to_owned()
         },
         cleanup_hint: browserd_reachable.then(browser_unmanaged_lifecycle_cleanup_hint),
+        gateway_restart_required: None,
+        gateway_reload: None,
         warnings: browserd_reachable
             .then(|| browser_unmanaged_lifecycle_warning(health_reachable && grpc_reachable))
             .into_iter()
@@ -4424,7 +4464,7 @@ fn browser_port_fallback_warning(
     config_updated: bool,
 ) -> String {
     let persistence = if config_updated {
-        "updated the active config so gateway hot reload can use the same endpoint"
+        "updated the active config and will require a gateway reload acknowledgement before reporting endpoint handoff"
     } else {
         "could not update an active config path; pass --setup with PALYRA_CONFIG set so gateway-mediated browser tools use the same endpoint"
     };
@@ -4434,6 +4474,44 @@ fn browser_port_fallback_warning(
         previous.grpc_url,
         fallback.health_base_url,
         fallback.grpc_url
+    )
+}
+
+fn browser_gateway_handoff_confirmed(
+    outcome: &crate::commands::runtime_reload::RuntimeConfigReloadOutcome,
+) -> bool {
+    matches!(outcome.reload_state.as_str(), "applied" | "applied_partial" | "rejected")
+        && outcome.requires_restart == Some(false)
+        && outcome.skipped_steps == 0
+}
+
+fn browser_gateway_handoff_pending_warning(
+    outcome: Option<&crate::commands::runtime_reload::RuntimeConfigReloadOutcome>,
+    config_updated: bool,
+) -> String {
+    let detail = outcome
+        .map(|value| {
+            format!(
+                "reload_state={} requires_restart={} applied_steps={} skipped_steps={} message={}",
+                value.reload_state,
+                value
+                    .requires_restart
+                    .map(|flag| flag.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                value.applied_steps,
+                value.skipped_steps,
+                value.message
+            )
+        })
+        .unwrap_or_else(|| {
+            if config_updated {
+                "runtime reload outcome was unavailable".to_owned()
+            } else {
+                "the active config path was not updated".to_owned()
+            }
+        });
+    format!(
+        "gateway_endpoint_handoff_pending: gateway_restart_required=true; {detail}. Restart the running gateway service, then verify the endpoint with `palyra browser status --json` before using gateway-mediated browser tools."
     )
 }
 
@@ -4805,6 +4883,19 @@ fn format_browser_lifecycle_text(payload: &BrowserLifecyclePayload) -> String {
     if let Some(cleanup_hint) = payload.cleanup_hint.as_deref() {
         text.push('\n');
         text.push_str(format!("browser.cleanup_hint {cleanup_hint}").as_str());
+    }
+    if let Some(restart_required) = payload.gateway_restart_required {
+        text.push('\n');
+        text.push_str(
+            format!("browser.gateway_handoff gateway_restart_required={restart_required}").as_str(),
+        );
+    }
+    if let Some(outcome) = payload.gateway_reload.as_ref() {
+        text.push('\n');
+        text.push_str(
+            crate::commands::runtime_reload::reload_text_line("browser.gateway_handoff", outcome)
+                .as_str(),
+        );
     }
     for warning in &payload.warnings {
         text.push('\n');
@@ -5356,19 +5447,20 @@ mod tests {
     use super::{
         browser_command_payload_should_emit, browser_command_policy_action,
         browser_control_plane_request_timeout, browser_engine_readiness_warning,
-        browser_failure_detail, browser_identifier_json_value, browser_lifecycle_cleanup_hint,
-        browser_lifecycle_owner, browser_lifecycle_state, browser_open_cleanup_status_text,
-        browser_open_output_value, browser_service_auth_token_command,
-        browser_service_enable_command, browser_service_stop_complete,
-        browser_service_stop_pending_reasons, browser_session_handle_text,
-        browser_setup_gateway_reload_warning, browser_snapshot_emits_json_to_stdout,
-        browser_start_auth_token_warnings, browser_start_grpc_readiness_request,
-        browser_start_grpc_readiness_result, browser_start_readiness_timeout_detail,
-        browser_status_control_plane_policy_snapshot, browser_status_warnings,
-        browser_stop_without_metadata_payload, effective_browser_lifecycle_running,
-        ensure_browser_command_success, ensure_browser_gateway_auth_token_alignment,
-        ensure_browser_service_enabled, ensure_browser_start_preflight,
-        ensure_browser_value_success, format_browser_console_text,
+        browser_failure_detail, browser_gateway_handoff_confirmed,
+        browser_gateway_handoff_pending_warning, browser_identifier_json_value,
+        browser_lifecycle_cleanup_hint, browser_lifecycle_owner, browser_lifecycle_state,
+        browser_open_cleanup_status_text, browser_open_output_value,
+        browser_service_auth_token_command, browser_service_enable_command,
+        browser_service_stop_complete, browser_service_stop_pending_reasons,
+        browser_session_handle_text, browser_setup_gateway_reload_warning,
+        browser_snapshot_emits_json_to_stdout, browser_start_auth_token_warnings,
+        browser_start_grpc_readiness_request, browser_start_grpc_readiness_result,
+        browser_start_readiness_timeout_detail, browser_status_control_plane_policy_snapshot,
+        browser_status_warnings, browser_stop_without_metadata_payload,
+        effective_browser_lifecycle_running, ensure_browser_command_success,
+        ensure_browser_gateway_auth_token_alignment, ensure_browser_service_enabled,
+        ensure_browser_start_preflight, ensure_browser_value_success, format_browser_console_text,
         format_browser_session_summary_text, normalize_session_scoped_output,
         redact_browser_output_value, session_summary_value, should_write_browser_setup_auth_token,
         should_write_browser_setup_state_key, BrowserControlPlaneSnapshot, BrowserOutputMode,
@@ -6465,6 +6557,29 @@ mod tests {
         assert!(warning.contains("Chromium session launch is not ready"));
         assert!(warning.contains("palyra browser stop"));
         assert!(warning.contains("palyra browser start --setup"));
+    }
+
+    #[test]
+    fn browser_gateway_handoff_requires_unskipped_reload_acknowledgement() {
+        let acknowledged = crate::commands::runtime_reload::RuntimeConfigReloadOutcome {
+            reload_state: "applied".to_owned(),
+            message: "all hot-safe reload steps were applied successfully".to_owned(),
+            active_runs: Some(1),
+            applied_steps: 1,
+            skipped_steps: 0,
+            requires_restart: Some(false),
+        };
+        assert!(browser_gateway_handoff_confirmed(&acknowledged));
+
+        let mut partial = acknowledged.clone();
+        partial.reload_state = "applied_partial".to_owned();
+        partial.skipped_steps = 1;
+        assert!(!browser_gateway_handoff_confirmed(&partial));
+
+        let warning = browser_gateway_handoff_pending_warning(Some(&partial), true);
+        assert!(warning.contains("gateway_endpoint_handoff_pending"));
+        assert!(warning.contains("gateway_restart_required=true"));
+        assert!(warning.contains("skipped_steps=1"));
     }
 
     #[test]

@@ -3119,6 +3119,7 @@ pub struct GatewayRuntimeState {
     pub(crate) started_at: Instant,
     pub(crate) build: BuildSnapshot,
     pub(crate) config: GatewayRuntimeConfigSnapshot,
+    browser_service_config: RwLock<BrowserServiceRuntimeConfig>,
     pub(crate) journal_config: GatewayJournalConfigSnapshot,
     pub(crate) counters: RuntimeCounters,
     feature_usage: FeatureUsageRegistry,
@@ -4904,6 +4905,7 @@ impl GatewayRuntimeState {
             current_unix_ms(),
         )?;
         let daemon_lifecycle_startup = journal_store.begin_daemon_lifecycle_startup()?;
+        let browser_service_config = config.browser_service.clone();
         let state = Arc::new(Self {
             started_at: Instant::now(),
             build: BuildSnapshot {
@@ -4912,6 +4914,7 @@ impl GatewayRuntimeState {
                 build_profile: build.build_profile.to_owned(),
             },
             config,
+            browser_service_config: RwLock::new(browser_service_config),
             journal_config,
             counters: RuntimeCounters {
                 run_stream_requests: AtomicU64::new(0),
@@ -17924,8 +17927,44 @@ impl GatewayRuntimeState {
         )
     }
 
-    // Live runtime configuration (memory/retrieval/learning/routines) and
-    // channel router delegates.
+    // Live runtime configuration (browser/memory/retrieval/learning/routines)
+    // and channel router delegates.
+
+    /// Replaces browser connection settings without changing whether browser
+    /// tools exist in the startup-owned catalog.
+    ///
+    /// # Errors
+    /// Returns an error when the candidate changes browser-service enablement;
+    /// that boundary requires a daemon restart.
+    pub(crate) fn configure_browser_service(
+        &self,
+        config: BrowserServiceRuntimeConfig,
+    ) -> Result<(), &'static str> {
+        let mut guard = match self.browser_service_config.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("browser service config lock poisoned while applying runtime config");
+                poisoned.into_inner()
+            }
+        };
+        if guard.enabled != config.enabled {
+            return Err("browser service enablement changes require daemon restart");
+        }
+        *guard = config;
+        Ok(())
+    }
+
+    /// Current browser service connection settings.
+    #[must_use]
+    pub(crate) fn browser_service_config_snapshot(&self) -> BrowserServiceRuntimeConfig {
+        match self.browser_service_config.read() {
+            Ok(config) => config.clone(),
+            Err(poisoned) => {
+                warn!("browser service config lock poisoned while reading runtime config");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
 
     /// Replaces the memory config and invalidates the memory search cache
     /// (cached scores depend on the old limits).

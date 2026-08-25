@@ -2205,15 +2205,17 @@ fn optional_console_browser_canonical_id(
 }
 
 fn clamp_console_browser_max_title_bytes(state: &AppState, value: Option<u64>) -> u64 {
+    let browser_service_config = state.runtime.browser_service_config_snapshot();
     value
-        .unwrap_or(state.browser_service_config.max_title_bytes as u64)
-        .clamp(1, state.browser_service_config.max_title_bytes as u64)
+        .unwrap_or(browser_service_config.max_title_bytes as u64)
+        .clamp(1, browser_service_config.max_title_bytes as u64)
 }
 
 fn clamp_console_browser_max_screenshot_bytes(state: &AppState, value: Option<u64>) -> u64 {
+    let browser_service_config = state.runtime.browser_service_config_snapshot();
     value
-        .unwrap_or(state.browser_service_config.max_screenshot_bytes as u64)
-        .clamp(1, state.browser_service_config.max_screenshot_bytes as u64)
+        .unwrap_or(browser_service_config.max_screenshot_bytes as u64)
+        .clamp(1, browser_service_config.max_screenshot_bytes as u64)
 }
 
 fn console_browser_session_budget_to_proto(
@@ -2890,29 +2892,27 @@ pub(crate) async fn build_console_browser_client(
     browser_v1::browser_service_client::BrowserServiceClient<tonic::transport::Channel>,
     Response,
 > {
-    if !state.browser_service_config.enabled {
+    let browser_service_config = state.runtime.browser_service_config_snapshot();
+    if !browser_service_config.enabled {
         return Err(runtime_status_response(tonic::Status::failed_precondition(
             "browser service is disabled (tool_call.browser_service.enabled=false)",
         )));
     }
-    let endpoint =
-        tonic::transport::Endpoint::from_shared(state.browser_service_config.endpoint.clone())
-            .map_err(|error| {
-                runtime_status_response(tonic::Status::invalid_argument(format!(
-                    "invalid browser service endpoint '{}': {error}",
-                    state.browser_service_config.endpoint
-                )))
-            })?
-            .connect_timeout(std::time::Duration::from_millis(
-                state.browser_service_config.connect_timeout_ms,
-            ))
-            .timeout(std::time::Duration::from_millis(
-                state.browser_service_config.request_timeout_ms,
-            ));
+    let endpoint = tonic::transport::Endpoint::from_shared(browser_service_config.endpoint.clone())
+        .map_err(|error| {
+            runtime_status_response(tonic::Status::invalid_argument(format!(
+                "invalid browser service endpoint '{}': {error}",
+                browser_service_config.endpoint
+            )))
+        })?
+        .connect_timeout(std::time::Duration::from_millis(
+            browser_service_config.connect_timeout_ms,
+        ))
+        .timeout(std::time::Duration::from_millis(browser_service_config.request_timeout_ms));
     let channel = endpoint.connect().await.map_err(|error| {
         runtime_status_response(tonic::Status::unavailable(format!(
             "failed to connect to browser service '{}': {error}",
-            state.browser_service_config.endpoint
+            browser_service_config.endpoint
         )))
     })?;
     Ok(browser_v1::browser_service_client::BrowserServiceClient::new(channel))
@@ -2929,7 +2929,8 @@ pub(crate) fn apply_browser_service_auth(
     state: &AppState,
     metadata: &mut tonic::metadata::MetadataMap,
 ) -> Result<(), Response> {
-    if let Some(token) = state.browser_service_config.auth_token.as_deref() {
+    let browser_service_config = state.runtime.browser_service_config_snapshot();
+    if let Some(token) = browser_service_config.auth_token.as_deref() {
         let bearer = MetadataValue::try_from(format!("Bearer {token}").as_str()).map_err(|_| {
             runtime_status_response(tonic::Status::internal(
                 "failed to encode browser service authorization metadata",

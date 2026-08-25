@@ -1324,7 +1324,7 @@ async fn evaluate_browser_runtime(state: &AppState) -> Result<(), String> {
     {
         return Ok(());
     }
-    if !state.browser_service_config.enabled {
+    if !state.runtime.browser_service_config_snapshot().enabled {
         state.runtime.resolve_self_healing_incident(
             IncidentDomain::Browser,
             "browser_service_health",

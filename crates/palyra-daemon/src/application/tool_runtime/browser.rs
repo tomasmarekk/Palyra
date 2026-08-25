@@ -1381,6 +1381,7 @@ pub(crate) async fn execute_browser_tool(
 ) -> ToolExecutionOutcome {
     let principal = context.principal;
     let channel = context.channel;
+    let browser_service_config = runtime_state.browser_service_config_snapshot();
     if input_json.len() > MAX_BROWSER_TOOL_INPUT_BYTES {
         return browser_tool_execution_outcome(
             proposal_id,
@@ -1390,7 +1391,7 @@ pub(crate) async fn execute_browser_tool(
             format!("palyra.browser.* input exceeds {MAX_BROWSER_TOOL_INPUT_BYTES} bytes"),
         );
     }
-    if !runtime_state.config.browser_service.enabled {
+    if !browser_service_config.enabled {
         return browser_tool_execution_outcome(
             proposal_id,
             input_json,
@@ -1470,7 +1471,7 @@ pub(crate) async fn execute_browser_tool(
     }
 
     let browser_service_channel =
-        match connect_browser_service_channel(runtime_state.config.browser_service.clone()).await {
+        match connect_browser_service_channel(browser_service_config.clone()).await {
             Ok(value) => value,
             Err(error) => {
                 return browser_tool_execution_outcome(
@@ -1490,7 +1491,7 @@ pub(crate) async fn execute_browser_tool(
     // engine mode between calls).
     let browser_runtime_capabilities = fetch_browser_runtime_capabilities(
         &mut capability_client,
-        runtime_state.config.browser_service.auth_token.as_deref(),
+        browser_service_config.auth_token.as_deref(),
     )
     .await;
     if browser_resilience_rollout_mismatch(
@@ -1657,7 +1658,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -1740,7 +1741,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -1842,7 +1843,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -1911,7 +1912,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut get_request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2042,7 +2043,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2124,11 +2125,11 @@ pub(crate) async fn execute_browser_tool(
                 max_failure_screenshot_bytes: payload
                     .get("max_failure_screenshot_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                    .unwrap_or(browser_service_config.max_screenshot_bytes as u64),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2216,11 +2217,11 @@ pub(crate) async fn execute_browser_tool(
                 max_failure_screenshot_bytes: payload
                     .get("max_failure_screenshot_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                    .unwrap_or(browser_service_config.max_screenshot_bytes as u64),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2337,11 +2338,11 @@ pub(crate) async fn execute_browser_tool(
                 max_failure_screenshot_bytes: payload
                     .get("max_failure_screenshot_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                    .unwrap_or(browser_service_config.max_screenshot_bytes as u64),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2427,11 +2428,11 @@ pub(crate) async fn execute_browser_tool(
                 max_failure_screenshot_bytes: payload
                     .get("max_failure_screenshot_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                    .unwrap_or(browser_service_config.max_screenshot_bytes as u64),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2532,11 +2533,11 @@ pub(crate) async fn execute_browser_tool(
                 max_failure_screenshot_bytes: payload
                     .get("max_failure_screenshot_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                    .unwrap_or(browser_service_config.max_screenshot_bytes as u64),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2627,7 +2628,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2734,11 +2735,11 @@ pub(crate) async fn execute_browser_tool(
                 max_failure_screenshot_bytes: payload
                     .get("max_failure_screenshot_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                    .unwrap_or(browser_service_config.max_screenshot_bytes as u64),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2801,11 +2802,11 @@ pub(crate) async fn execute_browser_tool(
                 max_failure_screenshot_bytes: payload
                     .get("max_failure_screenshot_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                    .unwrap_or(browser_service_config.max_screenshot_bytes as u64),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2878,11 +2879,11 @@ pub(crate) async fn execute_browser_tool(
                 max_failure_screenshot_bytes: payload
                     .get("max_failure_screenshot_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                    .unwrap_or(browser_service_config.max_screenshot_bytes as u64),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -2941,11 +2942,11 @@ pub(crate) async fn execute_browser_tool(
                 max_title_bytes: payload
                     .get("max_title_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_title_bytes as u64),
+                    .unwrap_or(browser_service_config.max_title_bytes as u64),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -3000,12 +3001,12 @@ pub(crate) async fn execute_browser_tool(
                 max_bytes: payload
                     .get("max_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                    .unwrap_or(browser_service_config.max_screenshot_bytes as u64),
                 format: payload.get("format").and_then(Value::as_str).unwrap_or("png").to_owned(),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -3097,7 +3098,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -3243,7 +3244,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -3358,12 +3359,12 @@ pub(crate) async fn execute_browser_tool(
                 max_bytes: payload
                     .get("max_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                    .unwrap_or(browser_service_config.max_screenshot_bytes as u64),
                 format: "png".to_owned(),
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -3450,7 +3451,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -3560,7 +3561,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -3723,7 +3724,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -3830,7 +3831,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -3935,7 +3936,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -4039,7 +4040,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -4104,7 +4105,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -4180,7 +4181,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -4245,7 +4246,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -4330,7 +4331,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -4385,7 +4386,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -4481,7 +4482,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -4539,7 +4540,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -4619,7 +4620,7 @@ pub(crate) async fn execute_browser_tool(
                     });
                     if let Err(error) = attach_browser_auth_metadata(
                         &mut list_request,
-                        runtime_state.config.browser_service.auth_token.as_deref(),
+                        browser_service_config.auth_token.as_deref(),
                     ) {
                         return browser_tool_execution_outcome(
                             proposal_id,
@@ -4696,7 +4697,7 @@ pub(crate) async fn execute_browser_tool(
             });
             if let Err(error) = attach_browser_auth_metadata(
                 &mut request,
-                runtime_state.config.browser_service.auth_token.as_deref(),
+                browser_service_config.auth_token.as_deref(),
             ) {
                 return browser_tool_execution_outcome(
                     proposal_id,
@@ -4824,7 +4825,8 @@ pub(crate) async fn close_browser_session_for_run_cleanup(
     runtime_state: &Arc<GatewayRuntimeState>,
     session_id: &str,
 ) -> Result<bool, String> {
-    if !runtime_state.config.browser_service.enabled {
+    let browser_service_config = runtime_state.browser_service_config_snapshot();
+    if !browser_service_config.enabled {
         return Err(
             "palyra.browser.session cleanup skipped because browser service is disabled".to_owned()
         );
@@ -4837,17 +4839,13 @@ pub(crate) async fn close_browser_session_for_run_cleanup(
         format!("palyra.browser.session cleanup session_id is invalid: {error}")
     })?;
 
-    let channel =
-        connect_browser_service_channel(runtime_state.config.browser_service.clone()).await?;
+    let channel = connect_browser_service_channel(browser_service_config.clone()).await?;
     let mut client = browser_v1::browser_service_client::BrowserServiceClient::new(channel);
     let mut request = Request::new(browser_v1::CloseSessionRequest {
         v: CANONICAL_PROTOCOL_MAJOR,
         session_id: Some(common_v1::CanonicalId { ulid: session_id.to_owned() }),
     });
-    attach_browser_auth_metadata(
-        &mut request,
-        runtime_state.config.browser_service.auth_token.as_deref(),
-    )?;
+    attach_browser_auth_metadata(&mut request, browser_service_config.auth_token.as_deref())?;
 
     client.close_session(request).await.map(|response| response.into_inner().closed).map_err(
         |error| {

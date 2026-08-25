@@ -2087,6 +2087,7 @@ async fn collect_console_turn_control_diagnostics(
 /// relay failure metrics into a redacted browser diagnostics block; probe
 /// failures become counted samples instead of errors.
 pub(crate) async fn collect_console_browser_diagnostics(state: &AppState) -> Value {
+    let browser_service_config = state.runtime.browser_service_config_snapshot();
     let mut failure_messages = Vec::<String>::new();
     let (relay_failures, relay_failure_messages) =
         collect_console_browser_relay_failure_metrics(state).await;
@@ -2094,7 +2095,7 @@ pub(crate) async fn collect_console_browser_diagnostics(state: &AppState) -> Val
 
     let mut recent_health_failures = 0_u64;
     let mut health_payload = Value::Null;
-    if state.browser_service_config.enabled {
+    if browser_service_config.enabled {
         match build_console_browser_client(state).await {
             Ok(mut client) => {
                 let mut request = TonicRequest::new(browser_v1::BrowserHealthRequest {
@@ -2138,16 +2139,16 @@ pub(crate) async fn collect_console_browser_diagnostics(state: &AppState) -> Val
     failure_messages.truncate(5);
 
     let mut payload = json!({
-        "enabled": state.browser_service_config.enabled,
-        "endpoint": state.browser_service_config.endpoint,
+        "enabled": browser_service_config.enabled,
+        "endpoint": browser_service_config.endpoint,
         "sessions": {
             "active": health_payload.get("active_sessions").and_then(Value::as_u64).unwrap_or(0),
         },
         "budgets": {
-            "connect_timeout_ms": state.browser_service_config.connect_timeout_ms,
-            "request_timeout_ms": state.browser_service_config.request_timeout_ms,
-            "max_screenshot_bytes": state.browser_service_config.max_screenshot_bytes,
-            "max_title_bytes": state.browser_service_config.max_title_bytes,
+            "connect_timeout_ms": browser_service_config.connect_timeout_ms,
+            "request_timeout_ms": browser_service_config.request_timeout_ms,
+            "max_screenshot_bytes": browser_service_config.max_screenshot_bytes,
+            "max_title_bytes": browser_service_config.max_title_bytes,
         },
         "health": health_payload,
         "failures": {

@@ -336,6 +336,9 @@ pub(crate) async fn apply_config_reload_for_context(
             && reload_plan_step_is_hot_safe(&plan, "model_provider");
         let apply_memory =
             current.memory != candidate.memory && reload_plan_step_is_hot_safe(&plan, "memory");
+        let apply_browser_service = current.tool_call.browser_service
+            != candidate.tool_call.browser_service
+            && reload_plan_step_is_hot_safe(&plan, "tool_call.browser_service");
         if apply_model_provider {
             next_loaded.model_provider = candidate.model_provider.clone();
             let resolver = SecretResolver::with_working_dir(
@@ -377,6 +380,14 @@ pub(crate) async fn apply_config_reload_for_context(
                 applied_steps.push(step.clone());
             }
         }
+        if apply_browser_service {
+            next_loaded.tool_call.browser_service = candidate.tool_call.browser_service.clone();
+            if let Some(step) =
+                plan.steps.iter().find(|step| step.config_path == "tool_call.browser_service")
+            {
+                applied_steps.push(step.clone());
+            }
+        }
         let next_generation = state
             .configured_secrets
             .lock()
@@ -409,6 +420,18 @@ pub(crate) async fn apply_config_reload_for_context(
         }
         if apply_memory {
             state.runtime.configure_memory(memory_runtime_config_from_loaded(&next_loaded));
+        }
+        if apply_browser_service {
+            state
+                .runtime
+                .configure_browser_service(
+                    crate::app::runtime::build_browser_service_runtime_config(
+                        &next_loaded.tool_call.browser_service,
+                    ),
+                )
+                .map_err(|error| {
+                    runtime_status_response(tonic::Status::failed_precondition(error))
+                })?;
         }
         {
             let mut loaded_guard =
@@ -634,16 +657,31 @@ fn build_reload_plan(
         ));
     }
     if current.tool_call.browser_service != candidate.tool_call.browser_service {
+        let restart_required = browser_service_reload_requires_restart(
+            &current.tool_call.browser_service,
+            &candidate.tool_call.browser_service,
+        );
+        let category = if restart_required { "restart_required" } else { "hot_safe" };
+        let reason = if restart_required {
+            "browser service enablement, authentication, or persistent-state ownership changed across a startup-owned boundary"
+        } else {
+            "browser service connection settings are resolved from a synchronized snapshot for every new request"
+        };
+        let impact = if restart_required {
+            "requires daemon/browser supervisor restart before changing browser tool availability, service credentials, or persistent-state ownership"
+        } else {
+            "new browser requests use the refreshed endpoint, timeouts, and output-size limits"
+        };
         steps.push(reload_plan_step(
             "browser_service",
             "tool_call.browser_service",
-            "restart_required",
-            "browser service endpoint/auth changes are consumed by long-lived runtime clients",
+            category,
+            reason,
             "browser service disabled with bounded timeouts by default",
             "browser service endpoint, auth token, timeout, and output-size validation",
             "secret_refs_redacted",
-            "restart_required",
-            "changes long-lived browser service client connectivity",
+            category,
+            impact,
             "browser service config changed; auth token values are redacted",
         ));
     }
@@ -769,6 +807,18 @@ fn normalized_reload_config(config: &crate::config::LoadedConfig) -> crate::conf
     normalized
 }
 
+fn browser_service_reload_requires_restart(
+    current: &crate::config::BrowserServiceConfig,
+    candidate: &crate::config::BrowserServiceConfig,
+) -> bool {
+    current.enabled != candidate.enabled
+        || current.auth_token != candidate.auth_token
+        || current.auth_token_secret_ref != candidate.auth_token_secret_ref
+        || current.state_dir != candidate.state_dir
+        || current.state_key_secret_ref != candidate.state_key_secret_ref
+        || current.state_key_vault_ref != candidate.state_key_vault_ref
+}
+
 fn estimate_active_runs(state: &AppState) -> u64 {
     state.runtime.counters.snapshot().active_orchestrator_runs()
 }
@@ -889,6 +939,52 @@ mod tests {
             .expect("model-provider reload step should be present");
         assert_eq!(step.category, "hot_safe");
         assert_eq!(step.reloadability, "hot_safe");
+    }
+
+    #[test]
+    fn browser_endpoint_reload_is_hot_safe_without_security_boundary_changes() {
+        let current = loaded_with_model_provider(ModelProviderConfig::default());
+        let mut candidate = current.clone();
+        candidate.tool_call.browser_service.endpoint = "http://127.0.0.1:7544".to_owned();
+
+        let plan = build_reload_plan(&current, &candidate, "test-palyra.toml".to_owned(), 2);
+
+        assert!(!plan.requires_restart);
+        assert!(plan.hot_safe_applicable);
+        let step = plan
+            .steps
+            .iter()
+            .find(|step| step.config_path == "tool_call.browser_service")
+            .expect("browser-service reload step should be present");
+        assert_eq!(step.category, "hot_safe");
+        assert!(step.reason.contains("synchronized snapshot"));
+    }
+
+    #[test]
+    fn browser_startup_owned_settings_reload_requires_restart() {
+        let current = loaded_with_model_provider(ModelProviderConfig::default());
+        let mut enabled_candidate = current.clone();
+        enabled_candidate.tool_call.browser_service.enabled =
+            !enabled_candidate.tool_call.browser_service.enabled;
+        let enabled_plan =
+            build_reload_plan(&current, &enabled_candidate, "test-palyra.toml".to_owned(), 0);
+        assert!(enabled_plan.requires_restart);
+        assert!(!enabled_plan.hot_safe_applicable);
+
+        let mut auth_candidate = current.clone();
+        auth_candidate.tool_call.browser_service.auth_token = Some("replacement-token".to_owned());
+        let auth_plan =
+            build_reload_plan(&current, &auth_candidate, "test-palyra.toml".to_owned(), 0);
+        assert!(auth_plan.requires_restart);
+        assert!(!auth_plan.hot_safe_applicable);
+
+        let mut state_candidate = current.clone();
+        state_candidate.tool_call.browser_service.state_dir =
+            Some(std::path::PathBuf::from("replacement-browser-state"));
+        let state_plan =
+            build_reload_plan(&current, &state_candidate, "test-palyra.toml".to_owned(), 0);
+        assert!(state_plan.requires_restart);
+        assert!(!state_plan.hot_safe_applicable);
     }
 
     #[test]

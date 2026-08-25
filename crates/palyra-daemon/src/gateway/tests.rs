@@ -6403,6 +6403,32 @@ fn memory_config_snapshot_recovers_from_poisoned_lock_without_default_fallback()
 }
 
 #[test]
+fn browser_service_runtime_reload_updates_connection_but_not_enablement() {
+    let state = build_test_runtime_state(false);
+    let initial = state.browser_service_config_snapshot();
+    let mut replacement = initial.clone();
+    replacement.endpoint = "http://127.0.0.1:7544".to_owned();
+    replacement.connect_timeout_ms = replacement.connect_timeout_ms.saturating_add(1);
+
+    state
+        .configure_browser_service(replacement.clone())
+        .expect("connection-only browser config should reload");
+    assert_eq!(state.browser_service_config_snapshot(), replacement);
+
+    let mut enablement_change = replacement.clone();
+    enablement_change.enabled = !enablement_change.enabled;
+    let error = state
+        .configure_browser_service(enablement_change)
+        .expect_err("browser enablement must remain startup-owned");
+    assert!(error.contains("require daemon restart"));
+    assert_eq!(
+        state.browser_service_config_snapshot(),
+        replacement,
+        "rejected enablement changes must not mutate live connectivity"
+    );
+}
+
+#[test]
 fn clear_memory_search_cache_recovers_from_poisoned_lock() {
     let state = build_test_runtime_state(false);
     {

@@ -54,7 +54,6 @@ pub(crate) struct AppState {
     pub(crate) objectives: Arc<objectives::ObjectiveRegistry>,
     pub(crate) vault: Arc<Vault>,
     pub(crate) tool_allowed_tools: Vec<String>,
-    pub(crate) browser_service_config: gateway::BrowserServiceRuntimeConfig,
     pub(crate) auth_runtime: Arc<gateway::AuthRuntimeState>,
     pub(crate) auth: GatewayAuthConfig,
     pub(crate) admin_rate_limit: Arc<Mutex<HashMap<IpAddr, AdminRateLimitEntry>>>,
