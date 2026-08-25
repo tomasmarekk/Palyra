@@ -3,14 +3,14 @@ use super::{
     agent_loop_terminal_status_message, apply_background_budget_guard,
     background_budget_overrun_message, background_run_budget_tokens,
     bounded_provider_retry_evidence, bounded_provider_route_change_evidence,
-    browser_followup_timeout_partial_summary, configured_run_stream_agent_harness_plugin_id,
-    configured_run_stream_codex_harness_id, contains_raw_provider_tool_call_markup,
-    delegated_run_admission, drain_active_run_steering_before_provider_call,
-    effective_provider_request_deadline, embedded_run_stream_runtime_selection_payload,
-    execute_run_stream_provider_request, final_answer_recovery_fallback_summary,
-    final_answer_recovery_prompt, followup_timeout_recovery_prompt,
-    incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
-    incomplete_terminal_outcome_message, is_browser_tool_name,
+    browser_followup_timeout_context, browser_followup_timeout_partial_summary,
+    configured_run_stream_agent_harness_plugin_id, configured_run_stream_codex_harness_id,
+    contains_raw_provider_tool_call_markup, delegated_run_admission,
+    drain_active_run_steering_before_provider_call, effective_provider_request_deadline,
+    embedded_run_stream_runtime_selection_payload, execute_run_stream_provider_request,
+    final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
+    followup_timeout_recovery_prompt, incomplete_final_answer_without_tools,
+    incomplete_terminal_final_answer, incomplete_terminal_outcome_message, is_browser_tool_name,
     is_run_stream_response_channel_closed, length_recovery_prompt,
     narrow_routine_tool_catalog_policy, normalized_provider_stream_from_output_v2,
     normalized_tool_output_evidence, phase_heartbeat_interval, provider_error_partial_summary,
@@ -31,16 +31,15 @@ use super::{
     selected_v2_shadow_route_semantics, shadow_catalog_matches_selected_v2_route,
     should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
     tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
-    tool_followup_timeout_partial_summary, tool_result_to_provider_message,
-    truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+    tool_followup_timeout_context, tool_followup_timeout_partial_summary,
+    tool_result_to_provider_message, truncated_final_answer_without_tools,
     ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
     RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
     RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
     RunStreamProviderRequestOutcome, RunStreamToolResultForModel, ToolCatalogPolicySnapshot,
-    BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, CODEX_MANAGED_RUNTIME_ID, HARNESS_SELECTION_EVENT,
-    MAX_LENGTH_RECOVERY_ATTEMPTS, RUNTIME_SELECTED_METADATA_EVENT,
-    RUN_STREAM_HARNESS_RUNTIME_POLICY, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
-    TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
+    CODEX_MANAGED_RUNTIME_ID, HARNESS_SELECTION_EVENT, MAX_LENGTH_RECOVERY_ATTEMPTS,
+    RUNTIME_SELECTED_METADATA_EVENT, RUN_STREAM_HARNESS_RUNTIME_POLICY,
+    TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
 };
 use super::{
     compare_shadow_comparison_plans_for_test, RuntimeDifferentialClassification,
@@ -366,7 +365,7 @@ async fn provider_request_supersession_keeps_run_active() {
                         Duration::from_secs(30),
                     )
                     .expect("provider child scope"),
-                deadline_override: None,
+                timeout_context: None,
                 harness_lifecycle: None,
             },
             &flow_control,
@@ -1254,7 +1253,7 @@ fn provider_request_deadline_does_not_extend_for_model_override() {
 }
 
 #[test]
-fn browser_followup_deadline_caps_failover_deadline() {
+fn browser_followup_uses_full_failover_aware_provider_deadline() {
     let request = ProviderRequest::from_input_text(
         "summarize browser result".to_owned(),
         false,
@@ -1265,13 +1264,10 @@ fn browser_followup_deadline_caps_failover_deadline() {
         Duration::from_millis(180_000),
         &route_selection_with_fallback(true),
         &request,
-        Some(ProviderRequestDeadlineOverride {
-            timeout: Duration::from_millis(BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS),
-            reason: ProviderRequestTimeoutReason::BrowserFollowup,
-        }),
+        browser_followup_timeout_context(true),
     );
 
-    assert_eq!(deadline, Duration::from_millis(BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS));
+    assert_eq!(deadline, Duration::from_millis(365_000));
     assert_eq!(reason, ProviderRequestTimeoutReason::BrowserFollowup);
 }
 
@@ -1287,10 +1283,7 @@ fn browser_followup_deadline_respects_smaller_provider_timeout() {
         Duration::from_millis(5_000),
         &route_selection_with_fallback(false),
         &request,
-        Some(ProviderRequestDeadlineOverride {
-            timeout: Duration::from_millis(BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS),
-            reason: ProviderRequestTimeoutReason::BrowserFollowup,
-        }),
+        browser_followup_timeout_context(true),
     );
 
     assert_eq!(deadline, Duration::from_millis(5_000));
@@ -1298,7 +1291,7 @@ fn browser_followup_deadline_respects_smaller_provider_timeout() {
 }
 
 #[test]
-fn tool_followup_deadline_caps_failover_deadline() {
+fn tool_followup_uses_full_failover_aware_provider_deadline() {
     let request = ProviderRequest::from_input_text(
         "summarize file tool results".to_owned(),
         false,
@@ -1309,13 +1302,10 @@ fn tool_followup_deadline_caps_failover_deadline() {
         Duration::from_millis(180_000),
         &route_selection_with_fallback(true),
         &request,
-        Some(ProviderRequestDeadlineOverride {
-            timeout: Duration::from_millis(TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS),
-            reason: ProviderRequestTimeoutReason::ToolFollowup,
-        }),
+        tool_followup_timeout_context(true),
     );
 
-    assert_eq!(deadline, Duration::from_millis(TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS));
+    assert_eq!(deadline, Duration::from_millis(365_000));
     assert_eq!(reason, ProviderRequestTimeoutReason::ToolFollowup);
 }
 
@@ -1331,10 +1321,7 @@ fn tool_followup_deadline_respects_smaller_provider_timeout() {
         Duration::from_millis(5_000),
         &route_selection_with_fallback(false),
         &request,
-        Some(ProviderRequestDeadlineOverride {
-            timeout: Duration::from_millis(TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS),
-            reason: ProviderRequestTimeoutReason::ToolFollowup,
-        }),
+        tool_followup_timeout_context(true),
     );
 
     assert_eq!(deadline, Duration::from_millis(5_000));
@@ -1359,11 +1346,11 @@ fn browser_followup_timeout_status_is_actionable() {
 fn tool_followup_timeout_status_is_actionable() {
     let message = provider_request_timeout_message(
         "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        Duration::from_millis(TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS),
+        Duration::from_millis(180_000),
         ProviderRequestTimeoutReason::ToolFollowup,
     );
 
-    assert!(message.contains("tool follow-up model turn timed out after 120000ms"));
+    assert!(message.contains("tool follow-up model turn timed out after 180000ms"));
     assert!(message.contains("tool results were already recorded"));
     assert!(message.contains("next tool proposal or final answer"));
     assert!(message.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
@@ -1375,14 +1362,15 @@ fn browser_followup_waiting_status_names_followup_deadline() {
     let message = provider_waiting_status_message(
         ProviderRequestTimeoutReason::BrowserFollowup,
         20_000,
-        60_000,
         180_000,
-        Duration::from_millis(60_000),
+        180_000,
+        Duration::from_millis(180_000),
         Duration::from_millis(180_000),
     );
 
     assert!(message.contains("waiting for browser follow-up model response"));
-    assert!(message.contains("followup_deadline=true"));
+    assert!(message.contains("followup_context=true"));
+    assert!(message.contains("provider_deadline_shared=true"));
     assert!(message.contains("provider_attempt_timeout_ms=180000"));
 }
 
@@ -1391,14 +1379,15 @@ fn tool_followup_waiting_status_names_followup_deadline() {
     let message = provider_waiting_status_message(
         ProviderRequestTimeoutReason::ToolFollowup,
         20_000,
-        120_000,
         180_000,
-        Duration::from_millis(120_000),
+        180_000,
+        Duration::from_millis(180_000),
         Duration::from_millis(180_000),
     );
 
     assert!(message.contains("waiting for post-tool model response"));
-    assert!(message.contains("tool_followup_deadline=true"));
+    assert!(message.contains("tool_followup_context=true"));
+    assert!(message.contains("provider_deadline_shared=true"));
     assert!(message.contains("provider_attempt_timeout_ms=180000"));
 }
 

@@ -232,16 +232,6 @@ const MAX_PROVIDER_RETRY_EVIDENCE_EVENTS: usize = 16;
 const MAX_PROVIDER_ROUTE_CHANGE_EVIDENCE_EVENTS: usize = 16;
 const BEFORE_FINALIZE_EVENT: &str = "run.before_finalize";
 const HARNESS_TOOL_SURFACE_PROJECTION_EVENT: &str = "harness.tool_surface_projection";
-// Turns directly after browser tool results get a much shorter deadline than
-// the general provider timeout: a model that stalls on browser evidence
-// should fail fast into the follow-up recovery path instead of pinning the
-// browser session for the full provider deadline.
-const BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 60_000;
-// Non-browser tool batches still need a bounded follow-up turn. Without this
-// guard, runs that already recorded file/schema/process evidence can stay
-// `in_progress` on generic provider heartbeats until the broad provider
-// deadline, with no actionable stall diagnostic for the operator.
-const TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 120_000;
 const TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS: u64 = 30_000;
 #[cfg(test)]
 const MAX_FOLLOWUP_TIMEOUT_RECOVERY_ATTEMPTS: u8 = 1;
@@ -302,9 +292,9 @@ pub(crate) enum RunStreamProviderRequestOutcome {
 pub(crate) enum ProviderRequestTimeoutReason {
     /// The general (possibly failover-extended) provider deadline.
     Provider,
-    /// The shorter browser follow-up deadline after browser tool results.
+    /// The provider deadline expired after browser tool results.
     BrowserFollowup,
-    /// The bounded follow-up deadline after non-browser tool results.
+    /// The provider deadline expired after non-browser tool results.
     ToolFollowup,
 }
 
@@ -399,8 +389,7 @@ struct RunLoopPhaseDeadlineContext<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProviderRequestDeadlineOverride {
-    timeout: Duration,
+struct ProviderRequestTimeoutContext {
     reason: ProviderRequestTimeoutReason,
 }
 
@@ -408,7 +397,7 @@ struct RunStreamProviderRequestExecution {
     provider_request: ProviderRequest,
     lease_context: ProviderLeaseExecutionContext,
     cancellation: LiveCancellationScope,
-    deadline_override: Option<ProviderRequestDeadlineOverride>,
+    timeout_context: Option<ProviderRequestTimeoutContext>,
     harness_lifecycle: Option<RunStreamHarnessLifecycle>,
 }
 
@@ -574,38 +563,22 @@ fn effective_provider_request_deadline(
     base_timeout: Duration,
     route_selection: &ProviderRouteSelectionTrace,
     request: &ProviderRequest,
-    deadline_override: Option<ProviderRequestDeadlineOverride>,
+    timeout_context: Option<ProviderRequestTimeoutContext>,
 ) -> (Duration, ProviderRequestTimeoutReason) {
-    let default_deadline =
-        provider_request_deadline_timeout(base_timeout, route_selection, request);
-    match deadline_override {
-        // An override can only tighten the deadline, never extend it past the
-        // failover-aware default the operator configured.
-        Some(deadline_override) => {
-            (deadline_override.timeout.min(default_deadline), deadline_override.reason)
-        }
-        None => (default_deadline, ProviderRequestTimeoutReason::Provider),
-    }
+    let deadline = provider_request_deadline_timeout(base_timeout, route_selection, request);
+    let reason =
+        timeout_context.map_or(ProviderRequestTimeoutReason::Provider, |context| context.reason);
+    (deadline, reason)
 }
 
-fn browser_followup_deadline_override(
-    enabled: bool,
-    config: &GatewayRuntimeConfigSnapshot,
-) -> Option<ProviderRequestDeadlineOverride> {
-    enabled.then(|| ProviderRequestDeadlineOverride {
-        timeout: provider_request_timeout(config)
-            .min(Duration::from_millis(BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS)),
+fn browser_followup_timeout_context(enabled: bool) -> Option<ProviderRequestTimeoutContext> {
+    enabled.then_some(ProviderRequestTimeoutContext {
         reason: ProviderRequestTimeoutReason::BrowserFollowup,
     })
 }
 
-fn tool_followup_deadline_override(
-    enabled: bool,
-    config: &GatewayRuntimeConfigSnapshot,
-) -> Option<ProviderRequestDeadlineOverride> {
-    enabled.then(|| ProviderRequestDeadlineOverride {
-        timeout: provider_request_timeout(config)
-            .min(Duration::from_millis(TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS)),
+fn tool_followup_timeout_context(enabled: bool) -> Option<ProviderRequestTimeoutContext> {
+    enabled.then_some(ProviderRequestTimeoutContext {
         reason: ProviderRequestTimeoutReason::ToolFollowup,
     })
 }
@@ -765,14 +738,14 @@ fn provider_request_timeout_status(run_id: &str, timeout: Duration) -> Status {
 fn browser_followup_timeout_message(run_id: &str, timeout: Duration) -> String {
     let timeout_ms = duration_millis_u64(timeout);
     format!(
-        "browser follow-up model turn timed out after {timeout_ms}ms for run {run_id}; browser tool results were already recorded, but the model did not produce the next browser diagnostic, tool proposal, or final answer before the follow-up deadline"
+        "browser follow-up model turn timed out after {timeout_ms}ms for run {run_id}; browser tool results were already recorded, but the model did not produce the next browser diagnostic, tool proposal, or final answer before the configured provider deadline"
     )
 }
 
 fn tool_followup_timeout_message(run_id: &str, timeout: Duration) -> String {
     let timeout_ms = duration_millis_u64(timeout);
     format!(
-        "tool follow-up model turn timed out after {timeout_ms}ms for run {run_id}; tool results were already recorded, but the model did not produce the next tool proposal or final answer before the follow-up deadline"
+        "tool follow-up model turn timed out after {timeout_ms}ms for run {run_id}; tool results were already recorded, but the model did not produce the next tool proposal or final answer before the configured provider deadline"
     )
 }
 
@@ -804,10 +777,10 @@ fn provider_waiting_status_message(
 ) -> String {
     match reason {
         ProviderRequestTimeoutReason::BrowserFollowup => format!(
-            "waiting for browser follow-up model response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms}, provider_attempt_timeout_ms={provider_attempt_timeout_ms}, followup_deadline=true)"
+            "waiting for browser follow-up model response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms}, provider_attempt_timeout_ms={provider_attempt_timeout_ms}, followup_context=true, provider_deadline_shared=true)"
         ),
         ProviderRequestTimeoutReason::ToolFollowup => format!(
-            "waiting for post-tool model response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms}, provider_attempt_timeout_ms={provider_attempt_timeout_ms}, tool_followup_deadline=true)"
+            "waiting for post-tool model response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms}, provider_attempt_timeout_ms={provider_attempt_timeout_ms}, tool_followup_context=true, provider_deadline_shared=true)"
         ),
         ProviderRequestTimeoutReason::Provider if effective_timeout == provider_timeout => {
             format!(
@@ -1506,7 +1479,7 @@ async fn execute_run_stream_provider_request(
         provider_request,
         lease_context,
         mut cancellation,
-        deadline_override,
+        timeout_context,
         harness_lifecycle,
     } = execution;
     if let Some(reason) = cancellation.current_reason() {
@@ -1540,7 +1513,7 @@ async fn execute_run_stream_provider_request(
         provider_timeout,
         &provider_status.route_selection,
         &provider_request,
-        deadline_override,
+        timeout_context,
     );
     if let Some(deadline_unix_ms) = cancellation.context().deadline_unix_ms {
         let remaining_ms = deadline_unix_ms.saturating_sub(now_unix_ms);
@@ -5463,16 +5436,11 @@ async fn process_run_stream_message_inner(
             AgentHookKind::BeforeModelResolve,
         )
         .await?;
-        // Follow-up deadlines apply to exactly one turn: the turn right after
-        // a tool batch. Browser batches keep their shorter specialized guard;
-        // other tools use the generic post-tool guard.
-        let deadline_override = browser_followup_deadline_override(
-            pending_browser_followup_deadline,
-            &runtime_state.config,
-        )
-        .or_else(|| {
-            tool_followup_deadline_override(pending_tool_followup_deadline, &runtime_state.config)
-        });
+        // Follow-up classification applies to exactly one turn after a tool
+        // batch. It selects actionable recovery evidence without shortening
+        // the operator-configured, failover-aware provider deadline.
+        let timeout_context = browser_followup_timeout_context(pending_browser_followup_deadline)
+            .or_else(|| tool_followup_timeout_context(pending_tool_followup_deadline));
         append_agent_loop_tape_event(
             runtime_state,
             run_id.as_str(),
@@ -5539,7 +5507,7 @@ async fn process_run_stream_message_inner(
                     diagnostic_scope_id: Some(provider_diagnostic_scope_id),
                 },
                 cancellation: provider_cancellation,
-                deadline_override,
+                timeout_context,
                 harness_lifecycle: harness_lifecycle.clone(),
             },
             active_flow_control.as_ref().ok_or_else(|| {
