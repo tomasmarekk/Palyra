@@ -503,10 +503,12 @@ pub(crate) fn relative_path_already_targets_active_root(
 /// Heuristic deciding whether a bare relative path should be re-rooted under
 /// the active focus directory.
 ///
-/// A path qualifies when its nearest existing parent remains inside the
-/// (canonicalized) active root. Missing descendants therefore stay anchored to
-/// the active focus, while symlinked parents that escape it are rejected. Paths
-/// that already target the focus keep their original root-relative meaning.
+/// A path qualifies when its nearest existing parent is a strict descendant of
+/// the canonicalized active root. Merely having a focused directory must not
+/// re-root an unrelated missing path beneath it; at least one path component
+/// below the focus must already establish that intent. Symlinked parents that
+/// escape the focus are rejected, and paths that already target the focus keep
+/// their original root-relative meaning.
 pub(crate) fn relative_path_should_use_active_root(
     path: &str,
     active: &ActiveWorkspaceRoot,
@@ -534,8 +536,8 @@ pub(crate) fn relative_path_should_use_active_root(
         return false;
     };
     canonical_parent.is_dir()
-        && (canonical_parent == canonical_active_root
-            || canonical_parent.starts_with(canonical_active_root.as_path()))
+        && canonical_parent != canonical_active_root
+        && canonical_parent.starts_with(canonical_active_root.as_path())
 }
 
 /// Returns true when an explicit `workspace_root` override refers to the
@@ -686,11 +688,11 @@ mod tests {
             relative_path: "reports".to_owned(),
         };
 
-        assert!(relative_path_should_use_active_root("summary.md", &active));
+        assert!(!relative_path_should_use_active_root("summary.md", &active));
         assert!(relative_path_should_use_active_root("daily/report.md", &active));
         assert!(relative_path_should_use_active_root("daily/generated/report.md", &active));
-        assert!(relative_path_should_use_active_root("generated/report.md", &active));
-        assert!(relative_path_should_use_active_root("audit-fixture/alpha.txt", &active));
+        assert!(!relative_path_should_use_active_root("generated/report.md", &active));
+        assert!(!relative_path_should_use_active_root("audit-fixture/alpha.txt", &active));
         assert!(!relative_path_should_use_active_root("reports/journal-replay.md", &active));
     }
 

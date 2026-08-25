@@ -19290,6 +19290,79 @@ async fn workspace_patch_tool_preserves_subdirectory_path_under_active_scenario_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn workspace_patch_tool_does_not_re_root_missing_paths_under_file_focus() {
+    let state = build_test_runtime_state(false);
+    let tempdir = gateway_tempdir("gateway-");
+    let workspace = tempdir.path().join("workspace");
+    let data = workspace.join("data");
+    let reports = workspace.join("reports");
+    fs::create_dir_all(data.as_path()).expect("data directory should exist");
+    fs::create_dir_all(reports.as_path()).expect("reports directory should exist");
+    let workspace =
+        fs::canonicalize(workspace.as_path()).expect("workspace root should canonicalize");
+
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "patcher-file-focus".to_owned(),
+            display_name: "Patcher File Focus".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![workspace.to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created");
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+        channel: Some("cli"),
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBA",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    ensure_tool_context_session(&state, &context);
+    state
+        .upsert_session_project_context_state(SessionProjectContextStateUpsertRequest {
+            session_id: context.session_id.to_owned(),
+            focus_paths: vec!["data".to_owned()],
+            disabled_entry_ids: Vec::new(),
+            approved_entry_ids: Vec::new(),
+            last_refreshed_at_unix_ms: None,
+        })
+        .await
+        .expect("session focus should be stored");
+
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Add File: reports/jsonl-validation.md\n",
+        "+validated\n",
+        "*** End Patch\n",
+    );
+    let input_json =
+        serde_json::to_vec(&json!({ "patch": patch })).expect("patch input should serialize");
+    let outcome = execute_workspace_patch_tool(
+        &state,
+        workspace_patch_test_request("01ARZ3NDEKTSV4RRFFQ69G5FB6", input_json.as_slice()),
+    )
+    .await;
+
+    assert!(outcome.success, "patch tool should apply root-relative report: {}", outcome.error);
+    assert!(
+        reports.join("jsonl-validation.md").exists(),
+        "implicit report path should stay relative to the agent workspace root"
+    );
+    assert!(
+        !data.join("reports").join("jsonl-validation.md").exists(),
+        "file focus must not silently re-root a missing report path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn workspace_patch_tool_ignores_launch_root_outside_agent_workspace() {
     let state = build_test_runtime_state(false);
     let harness_root = gateway_tempdir("gateway-");
