@@ -611,10 +611,9 @@ pub fn process_runner_executor_name(policy: &SandboxProcessRunnerPolicy) -> Stri
 #[must_use]
 pub fn process_runner_allows_host_access(policy: &SandboxProcessRunnerPolicy) -> bool {
     matches!(policy.tier, SandboxProcessRunnerTier::B)
-        && matches!(policy.egress_enforcement_mode, EgressEnforcementMode::None)
-        && !matches!(
+        && matches!(
             process_runner_effective_path_access_mode(policy),
-            PathAccessMode::WorkspaceOnly
+            PathAccessMode::ApprovedRoots
         )
 }
 
@@ -19362,6 +19361,72 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_constrained_process_honors_approved_roots_with_preflight_egress() {
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let workspace = unique_temp_dir("workspace-approved-root-preflight");
+        let approved_root = unique_temp_dir("approved-root-preflight");
+        let adjacent_root = unique_temp_dir("adjacent-root-preflight");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(approved_root.as_path()).expect("approved root should be created");
+        fs::create_dir_all(adjacent_root.as_path()).expect("adjacent root should be created");
+        let approved_script = approved_root.join("approved.js");
+        let adjacent_script = adjacent_root.join("denied.js");
+        fs::write(&approved_script, b"console.log('PALYRA_APPROVED_ROOT_OK');\n")
+            .expect("approved Node script should be written");
+        fs::write(&adjacent_script, b"console.log('PALYRA_ADJACENT_ROOT_BAD');\n")
+            .expect("adjacent Node script should be written");
+        let configured_roots =
+            std::env::join_paths([approved_root.as_os_str()]).expect("root path should join");
+        let _configured_roots = ScopedEnvVar::set(PALYRA_OS_FILE_ROOTS_ENV, configured_roots);
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec!["node".to_owned()]);
+        policy.allow_interpreters = true;
+        policy.path_access_mode = PathAccessMode::ApprovedRoots;
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+
+        assert!(super::process_runner_allows_host_access(&policy));
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": "node",
+            "args": [approved_script.to_string_lossy()]
+        }))
+        .expect("approved-root process input should serialize");
+        let result =
+            run_constrained_process(&policy, input.as_slice(), Duration::from_millis(20_000))
+                .expect("preflight mode should preserve approved-root path authority");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("process output should parse");
+        assert_eq!(
+            output.get("stdout").and_then(serde_json::Value::as_str),
+            Some("PALYRA_APPROVED_ROOT_OK\n")
+        );
+
+        let denied_input = serde_json::to_vec(&serde_json::json!({
+            "command": "node",
+            "args": [adjacent_script.to_string_lossy()]
+        }))
+        .expect("adjacent-root process input should serialize");
+        let error = run_constrained_process(
+            &policy,
+            denied_input.as_slice(),
+            Duration::from_millis(20_000),
+        )
+        .expect_err("an adjacent unapproved root must remain denied");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("outside approved host roots"), "{}", error.message);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(approved_root.as_path());
+        let _ = fs::remove_dir_all(adjacent_root.as_path());
     }
 
     #[test]
