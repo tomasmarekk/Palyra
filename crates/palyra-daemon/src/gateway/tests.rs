@@ -47,7 +47,7 @@ use tokio::{
 };
 use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 
-use crate::agents::AgentCreateRequest;
+use crate::agents::{AgentBindingRequest, AgentCreateRequest};
 use crate::feature_usage::{
     FeatureUsageCapability, FeatureUsageCapabilitySnapshot, FeatureUsagePath, FeatureUsageReason,
 };
@@ -119,11 +119,11 @@ use super::{
     process_runner_input_should_use_active_root, process_runner_input_should_use_launch_root,
     process_runner_input_with_facade_mapping, process_runner_input_with_path_env,
     process_runner_tool_config_for_session, process_runner_workspace_root_for_input,
-    process_runner_workspace_roots_within_configured_root, resolve_cron_job_channel_for_create,
-    tool_approval_response_proposal_id, verification_status_from_tool_outcome,
-    workspace_patch_metrics_from_output, CachedMemorySearchEntry, GatewayAuthConfig,
-    GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-    MemoryRuntimeConfig, NetworkedWorkerArtifactReceipt, NetworkedWorkerDispatchSettlementIdentity,
+    resolve_cron_job_channel_for_create, tool_approval_response_proposal_id,
+    verification_status_from_tool_outcome, workspace_patch_metrics_from_output,
+    CachedMemorySearchEntry, GatewayAuthConfig, GatewayJournalConfigSnapshot,
+    GatewayRuntimeConfigSnapshot, GatewayRuntimeState, MemoryRuntimeConfig,
+    NetworkedWorkerArtifactReceipt, NetworkedWorkerDispatchSettlementIdentity,
     PendingNetworkedWorkerExpiry, ProviderRequest, RequestContext, SessionQueueAdmissionRequest,
     ToolApprovalOutcome, APPROVAL_PROMPT_TIMEOUT_SECONDS, CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT,
     HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT,
@@ -602,7 +602,7 @@ async fn process_runner_prefers_launch_workspace_over_reports_focus_for_workspac
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn process_runner_preserves_configured_root_for_sibling_agent_workspace() {
+async fn process_runner_uses_session_bound_agent_workspace_outside_configured_root() {
     let tempdir = gateway_tempdir("gateway-");
     let configured = tempdir.path().join("configured-process-root");
     let agent_workspace = tempdir.path().join("agent-workspace");
@@ -621,10 +621,10 @@ async fn process_runner_preserves_configured_root_for_sibling_agent_workspace() 
 
     state
         .create_agent(AgentCreateRequest {
-            agent_id: "process-configured-root".to_owned(),
-            display_name: "Process Configured Root".to_owned(),
+            agent_id: "process-default-root".to_owned(),
+            display_name: "Process Default Root".to_owned(),
             agent_dir: None,
-            workspace_roots: vec![agent_workspace.to_string_lossy().into_owned()],
+            workspace_roots: vec![configured.to_string_lossy().into_owned()],
             default_model_profile: None,
             execution_backend_preference: None,
             default_tool_allowlist: Vec::new(),
@@ -633,7 +633,22 @@ async fn process_runner_preserves_configured_root_for_sibling_agent_workspace() 
             allow_absolute_paths: true,
         })
         .await
-        .expect("agent should be created");
+        .expect("default agent should be created");
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "process-bound-root".to_owned(),
+            display_name: "Process Bound Root".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![agent_workspace.to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: false,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("bound agent should be created");
 
     let context = super::ToolRuntimeExecutionContext {
         principal: "user:ops",
@@ -645,15 +660,21 @@ async fn process_runner_preserves_configured_root_for_sibling_agent_workspace() 
         backend_reason_code: "backend.default.local_sandbox",
     };
     ensure_tool_context_session(&state, &context);
+    state
+        .bind_agent_for_context(AgentBindingRequest {
+            agent_id: "process-bound-root".to_owned(),
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            session_id: context.session_id.to_owned(),
+        })
+        .await
+        .expect("session should bind to the non-default agent");
 
-    let config = process_runner_tool_config_for_session(
-        &state,
-        context,
-        br#"{"command":"node","args":["calculator.test.js"]}"#,
-    )
-    .await;
+    let config =
+        process_runner_tool_config_for_session(&state, context, br#"{"command":"pwd","args":[]}"#)
+            .await;
 
-    assert_eq!(config.process_runner.workspace_root, configured);
+    assert_eq!(config.process_runner.workspace_root, agent_workspace);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -936,23 +957,6 @@ fn process_runner_workspace_root_does_not_default_to_agent_workspace() {
     );
 
     assert_eq!(selected, None);
-}
-
-#[test]
-fn process_runner_workspace_roots_stay_inside_configured_root() {
-    let tempdir = gateway_tempdir("gateway-");
-    let configured = tempdir.path().join("configured-process-root");
-    let nested = configured.join("nested-agent-workspace");
-    let sibling_agent_workspace = tempdir.path().join("agent-workspace");
-    fs::create_dir_all(nested.as_path()).expect("nested root should exist");
-    fs::create_dir_all(sibling_agent_workspace.as_path()).expect("agent root should exist");
-
-    let scoped = process_runner_workspace_roots_within_configured_root(
-        configured.as_path(),
-        &[sibling_agent_workspace, nested.clone()],
-    );
-
-    assert_eq!(scoped, vec![nested, configured]);
 }
 
 #[test]

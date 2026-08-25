@@ -3765,10 +3765,11 @@ fn browser_session_id_from_tool_input(input_json: &[u8]) -> Option<String> {
 }
 
 // Workspace-root selection precedence for a process run: CLI launch cwd is the
-// default root for generic `/workspace` commands, while active and path-derived
-// roots may only narrow execution inside the configured process root. Resolution
-// failures fall back rather than fail so a broken agent binding cannot brick
-// process execution.
+// default root for generic `/workspace` commands, followed by active and
+// path-derived roots, then the effective agent's first workspace root. The
+// static configured root is only a fallback when agent resolution fails or the
+// agent has no usable root; otherwise file and process tools in one session
+// would operate on different projects.
 async fn process_runner_tool_config_for_session(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -3816,6 +3817,8 @@ async fn process_runner_tool_config_for_session(
         process_runner_workspace_root_for_input(input_json, workspace_roots.as_slice())
     {
         config.process_runner.workspace_root = workspace_root;
+    } else if let Some(workspace_root) = workspace_roots.first() {
+        config.process_runner.workspace_root = workspace_root.clone();
     }
     config
 }
@@ -3898,46 +3901,11 @@ async fn process_runner_workspace_roots_for_session(
         outcome.source,
     )
     .await;
-    let scoped_roots = process_runner_workspace_roots_within_configured_root(
-        configured_root.as_path(),
-        workspace_roots.as_slice(),
-    );
-    if scoped_roots.is_empty() {
+    if workspace_roots.is_empty() {
         fallback
     } else {
-        scoped_roots
+        workspace_roots
     }
-}
-
-fn process_runner_workspace_roots_within_configured_root(
-    configured_root: &Path,
-    workspace_roots: &[PathBuf],
-) -> Vec<PathBuf> {
-    let Some(canonical_configured_root) =
-        fs::canonicalize(configured_root).ok().filter(|root| root.is_dir())
-    else {
-        return vec![configured_root.to_path_buf()];
-    };
-    let mut scoped_roots = Vec::new();
-    for root in workspace_roots {
-        let Some(canonical_root) = fs::canonicalize(root).ok().filter(|root| root.is_dir()) else {
-            continue;
-        };
-        if !canonical_root.starts_with(canonical_configured_root.as_path()) {
-            continue;
-        }
-        if !scoped_roots.iter().any(|existing| existing == root) {
-            scoped_roots.push(root.clone());
-        }
-    }
-    if !scoped_roots.iter().any(|root| {
-        fs::canonicalize(root)
-            .ok()
-            .is_some_and(|canonical_root| canonical_root == canonical_configured_root)
-    }) {
-        scoped_roots.push(configured_root.to_path_buf());
-    }
-    scoped_roots
 }
 
 fn process_runner_workspace_root_for_input(
