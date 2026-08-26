@@ -5,21 +5,24 @@
 //! `manifest.json`.
 
 use std::{
+    collections::HashSet,
     env, fs,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zip::{
-    read::ZipArchive,
-    result::ZipError,
     write::{SimpleFileOptions, ZipWriter},
     CompressionMethod,
 };
 
 use crate::cli::{BackupCommand, BackupComponentArg};
+use crate::commands::archive::{
+    BoundedZipArchive, MAX_ARCHIVE_MEMBER_BYTES, MAX_BACKUP_MANIFEST_BYTES,
+};
 use crate::*;
 
 const BACKUP_MANIFEST_PATH: &str = "manifest.json";
@@ -240,8 +243,8 @@ fn run_backup_create(
 
 fn run_backup_verify(archive: String, json: bool) -> Result<()> {
     let archive_path = PathBuf::from(archive);
-    let file = match fs::File::open(archive_path.as_path()) {
-        Ok(file) => file,
+    let metadata = match fs::metadata(archive_path.as_path()) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             anyhow::bail!(
                 "backup archive not found: {}; provide an existing Palyra backup archive path",
@@ -254,18 +257,30 @@ fn run_backup_verify(archive: String, json: bool) -> Result<()> {
             });
         }
     };
-    let mut archive = ZipArchive::new(file)
-        .with_context(|| format!("failed to parse {}", archive_path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("backup archive path is not a regular file: {}", archive_path.display());
+    }
+    let mut archive = BoundedZipArchive::open(archive_path.as_path())?;
     let manifest = read_backup_manifest(&mut archive)?;
+    validate_backup_membership(&manifest, archive.member_names())?;
 
     for entry in manifest.entries.as_slice() {
-        let mut file = archive
-            .by_name(entry.archive_path.as_str())
-            .with_context(|| format!("backup archive is missing {}", entry.archive_path))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .with_context(|| format!("failed to read archive entry {}", entry.archive_path))?;
-        let actual_hash = sha256_hex(bytes.as_slice());
+        if entry.size_bytes > MAX_ARCHIVE_MEMBER_BYTES {
+            anyhow::bail!(
+                "backup entry {} declares {} bytes, exceeding the {} byte verification limit",
+                entry.archive_path,
+                entry.size_bytes,
+                MAX_ARCHIVE_MEMBER_BYTES
+            );
+        }
+        let mut hasher = Sha256::new();
+        let actual_size = archive
+            .read_required_with(entry.archive_path.as_str(), MAX_ARCHIVE_MEMBER_BYTES, |chunk| {
+                hasher.update(chunk);
+                Ok(())
+            })
+            .with_context(|| format!("failed to verify archive entry {}", entry.archive_path))?;
+        let actual_hash = hex::encode(hasher.finalize());
         if actual_hash != entry.sha256 {
             anyhow::bail!(
                 "backup entry {} failed SHA256 verification (expected {}, observed {})",
@@ -274,12 +289,12 @@ fn run_backup_verify(archive: String, json: bool) -> Result<()> {
                 actual_hash
             );
         }
-        if bytes.len() as u64 != entry.size_bytes {
+        if actual_size != entry.size_bytes {
             anyhow::bail!(
                 "backup entry {} failed size verification (expected {}, observed {})",
                 entry.archive_path,
                 entry.size_bytes,
-                bytes.len()
+                actual_size
             );
         }
     }
@@ -581,17 +596,55 @@ fn add_bytes_to_zip(
     Ok(())
 }
 
-fn read_backup_manifest(archive: &mut ZipArchive<fs::File>) -> Result<BackupManifest> {
-    let mut file = archive.by_name(BACKUP_MANIFEST_PATH).map_err(|error| match error {
-        ZipError::FileNotFound => anyhow!(
+fn read_backup_manifest(archive: &mut BoundedZipArchive) -> Result<BackupManifest> {
+    let bytes = archive
+        .read_optional_bytes(BACKUP_MANIFEST_PATH, MAX_BACKUP_MANIFEST_BYTES)?
+        .ok_or_else(|| {
+            anyhow!(
             "invalid backup archive: missing manifest.json; selected ZIP is not a Palyra backup archive"
-        ),
-        other => anyhow!(other).context("failed to locate backup manifest"),
-    })?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).context("failed to read backup manifest")?;
+            )
+        })?;
     serde_json::from_slice::<BackupManifest>(bytes.as_slice())
         .context("invalid backup archive: failed to parse manifest.json")
+}
+
+fn validate_backup_membership(manifest: &BackupManifest, archive_members: &[String]) -> Result<()> {
+    let mut expected_members = HashSet::with_capacity(manifest.entries.len().saturating_add(1));
+    expected_members.insert(BACKUP_MANIFEST_PATH.to_ascii_lowercase());
+    for entry in manifest.entries.as_slice() {
+        let archive_path = entry.archive_path.trim();
+        if archive_path.is_empty() {
+            anyhow::bail!("invalid backup archive: manifest contains an empty archive path");
+        }
+        let normalized = archive_path.to_ascii_lowercase();
+        if normalized == BACKUP_MANIFEST_PATH {
+            anyhow::bail!(
+                "invalid backup archive: manifest.json cannot be listed as a payload entry"
+            );
+        }
+        if !expected_members.insert(normalized) {
+            anyhow::bail!(
+                "invalid backup archive: duplicate manifest entry {}",
+                entry.archive_path
+            );
+        }
+    }
+
+    let actual_members =
+        archive_members.iter().map(|name| name.to_ascii_lowercase()).collect::<HashSet<_>>();
+    if actual_members != expected_members {
+        let mut missing = expected_members.difference(&actual_members).cloned().collect::<Vec<_>>();
+        let mut unexpected =
+            actual_members.difference(&expected_members).cloned().collect::<Vec<_>>();
+        missing.sort();
+        unexpected.sort();
+        anyhow::bail!(
+            "invalid backup archive membership (missing: {}; unexpected: {})",
+            missing.join(", "),
+            unexpected.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn emit_backup_create_report(report: &BackupCreateReport, json: bool) -> Result<()> {
@@ -753,12 +806,45 @@ mod tests {
         writer.write_all(serde_json::to_vec(&manifest)?.as_slice())?;
         writer.finish()?;
 
-        let file = fs::File::open(archive_path.as_path())?;
-        let mut archive = ZipArchive::new(file)?;
+        let mut archive = BoundedZipArchive::open(archive_path.as_path())?;
         let loaded = read_backup_manifest(&mut archive)?;
+        validate_backup_membership(&loaded, archive.member_names())?;
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].sha256, crate::sha256_hex(b"abc"));
         Ok(())
+    }
+
+    #[test]
+    fn backup_manifest_rejects_untracked_archive_members() {
+        let manifest = BackupManifest {
+            schema_version: 1,
+            generated_at_unix_ms: 1,
+            created_by_version: "0.1.0".to_owned(),
+            created_by_git_hash: "abc".to_owned(),
+            config_path: None,
+            state_root: "state".to_owned(),
+            install_root: None,
+            included_workspace: false,
+            included_support_bundle: false,
+            entries: vec![BackupEntry {
+                archive_path: "state/file.txt".to_owned(),
+                source_path: "C:/state/file.txt".to_owned(),
+                size_bytes: 3,
+                sha256: crate::sha256_hex(b"abc"),
+            }],
+        };
+
+        let error = validate_backup_membership(
+            &manifest,
+            &[
+                BACKUP_MANIFEST_PATH.to_owned(),
+                "state/file.txt".to_owned(),
+                "state/untracked.txt".to_owned(),
+            ],
+        )
+        .expect_err("untracked archive members must fail closed");
+
+        assert!(error.to_string().contains("state/untracked.txt"));
     }
 
     #[test]

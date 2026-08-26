@@ -5,6 +5,7 @@ pub mod acp;
 pub mod agent;
 pub mod agents;
 pub mod approvals;
+pub(crate) mod archive;
 pub mod auth;
 pub mod backup;
 pub mod browser;

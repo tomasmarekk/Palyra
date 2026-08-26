@@ -4,17 +4,15 @@
 //! In-place self-update is intentionally unimplemented; applying with
 //! `--yes` fails closed so the trust chain stays a manual operator action.
 
-use std::{
-    fs,
-    io::Read,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
-use zip::read::ZipArchive;
 
 use crate::cli::UpdateCommand;
+use crate::commands::archive::{
+    BoundedZipArchive, MAX_UPDATE_MANIFEST_BYTES, MAX_UPDATE_TEXT_BYTES,
+};
 use crate::*;
 
 /// Manifest and release-note details read from a candidate update archive.
@@ -166,11 +164,11 @@ pub(crate) fn run_update(command: UpdateCommand) -> Result<()> {
 
 fn load_candidate_archive_snapshot(archive_path: String) -> Result<UpdateArchiveSnapshot> {
     let archive_path_buf = PathBuf::from(archive_path.as_str());
-    let file = fs::File::open(archive_path_buf.as_path())
-        .with_context(|| format!("failed to open update archive {}", archive_path_buf.display()))?;
-    let mut archive = ZipArchive::new(file)
-        .with_context(|| format!("failed to read update archive {}", archive_path_buf.display()))?;
-    let archive_members = zip_member_names(&mut archive)?;
+    let mut archive = BoundedZipArchive::open(archive_path_buf.as_path()).with_context(|| {
+        format!("failed to inspect update archive {}", archive_path_buf.display())
+    })?;
+    let archive_members =
+        archive.member_names().iter().map(|name| name.to_ascii_lowercase()).collect::<Vec<_>>();
     let manifest = read_optional_zip_json::<support::lifecycle::ReleaseManifest>(
         &mut archive,
         "release-manifest.json",
@@ -203,17 +201,6 @@ fn load_candidate_archive_snapshot(archive_path: String) -> Result<UpdateArchive
         rollback_hint,
         migration_notes,
     })
-}
-
-fn zip_member_names(archive: &mut ZipArchive<fs::File>) -> Result<Vec<String>> {
-    let mut names = Vec::with_capacity(archive.len());
-    for index in 0..archive.len() {
-        let file = archive
-            .by_index(index)
-            .with_context(|| format!("failed to inspect zip member at index {index}"))?;
-        names.push(file.name().to_ascii_lowercase());
-    }
-    Ok(names)
 }
 
 fn is_sbom_member(name: &str) -> bool {
@@ -540,33 +527,24 @@ fn emit_update_report(report: &UpdateReport, json: bool) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
-fn read_optional_zip_json<T>(archive: &mut ZipArchive<fs::File>, path: &str) -> Result<Option<T>>
+fn read_optional_zip_json<T>(archive: &mut BoundedZipArchive, path: &str) -> Result<Option<T>>
 where
     T: for<'de> serde::Deserialize<'de>,
 {
     // Manifests and release notes are optional archive members; a lookup
     // failure means the candidate simply does not ship that file.
-    let Ok(mut file) = archive.by_name(path) else {
+    let Some(bytes) = archive.read_optional_bytes(path, MAX_UPDATE_MANIFEST_BYTES)? else {
         return Ok(None);
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {path} from update archive"))?;
     let parsed = serde_json::from_slice::<T>(bytes.as_slice())
         .with_context(|| format!("failed to parse {path} from update archive"))?;
     Ok(Some(parsed))
 }
 
-fn read_optional_zip_text(
-    archive: &mut ZipArchive<fs::File>,
-    path: &str,
-) -> Result<Option<String>> {
-    let Ok(mut file) = archive.by_name(path) else {
+fn read_optional_zip_text(archive: &mut BoundedZipArchive, path: &str) -> Result<Option<String>> {
+    let Some(bytes) = archive.read_optional_bytes(path, MAX_UPDATE_TEXT_BYTES)? else {
         return Ok(None);
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {path} from update archive"))?;
     String::from_utf8(bytes).with_context(|| format!("{path} is not valid UTF-8")).map(Some)
 }
 
