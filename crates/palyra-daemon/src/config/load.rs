@@ -1512,6 +1512,12 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
                     "admin.connector_token_secret_ref",
                 )?);
             }
+            if let Some(connector_allowed_channels) = file_admin.connector_allowed_channels {
+                admin.connector_allowed_channels = parse_channel_identifier_list(
+                    connector_allowed_channels.as_slice(),
+                    "admin.connector_allowed_channels",
+                )?;
+            }
             if let Some(bound_principal) = file_admin.bound_principal {
                 let trimmed = bound_principal.trim();
                 admin.bound_principal =
@@ -2391,6 +2397,17 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         source.push_str(" +env(PALYRA_CONNECTOR_TOKEN)");
     }
 
+    if let Ok(connector_allowed_channels) = env::var("PALYRA_CONNECTOR_ALLOWED_CHANNELS") {
+        let values = connector_allowed_channels
+            .split(',')
+            .map(str::trim)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        admin.connector_allowed_channels =
+            parse_channel_identifier_list(values.as_slice(), "PALYRA_CONNECTOR_ALLOWED_CHANNELS")?;
+        source.push_str(" +env(PALYRA_CONNECTOR_ALLOWED_CHANNELS)");
+    }
+
     if let Ok(bound_principal) = env::var("PALYRA_ADMIN_BOUND_PRINCIPAL") {
         let trimmed = bound_principal.trim();
         admin.bound_principal = if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) };
@@ -2715,6 +2732,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
             Some(resolve_state_relative_path(runtime_state_root.as_path(), state_dir));
     }
     validate_secret_source_conflicts(&model_provider, &tool_call.browser_service, &admin)?;
+    validate_connector_auth_binding(&admin)?;
     validate_acp_runtime_registry(&acp_runtime)?;
     // Without an explicit profile (file or env), derive it from the final
     // deployment mode and whether networked workers are in play.
@@ -4300,6 +4318,22 @@ fn validate_secret_source_conflicts(
     Ok(())
 }
 
+fn validate_connector_auth_binding(admin: &AdminConfig) -> Result<()> {
+    let connector_credential_configured =
+        admin.connector_token.is_some() || admin.connector_token_secret_ref.is_some();
+    if connector_credential_configured && admin.connector_allowed_channels.is_empty() {
+        anyhow::bail!(
+            "admin.connector_token requires at least one admin.connector_allowed_channels entry"
+        );
+    }
+    if !connector_credential_configured && !admin.connector_allowed_channels.is_empty() {
+        anyhow::bail!(
+            "admin.connector_allowed_channels requires admin.connector_token or admin.connector_token_secret_ref"
+        );
+    }
+    Ok(())
+}
+
 /// Rejects any pairwise combination of inline, structured-ref, and legacy
 /// vault-ref sources for a single logical secret field.
 fn validate_secret_field_conflict(
@@ -5507,6 +5541,23 @@ fn parse_channel_identifier(raw: &str, source_name: &str) -> Result<String> {
     Ok(trimmed.to_ascii_lowercase())
 }
 
+fn parse_channel_identifier_list(raw: &[String], source_name: &str) -> Result<Vec<String>> {
+    if raw.len() > 64 {
+        anyhow::bail!("{source_name} exceeds maximum entries ({} > 64)", raw.len());
+    }
+    let mut channels = Vec::with_capacity(raw.len());
+    for (index, candidate) in raw.iter().enumerate() {
+        let channel = parse_channel_identifier(
+            candidate.as_str(),
+            format!("{source_name}[{index}]").as_str(),
+        )?;
+        if !channels.iter().any(|existing| existing == &channel) {
+            channels.push(channel);
+        }
+    }
+    Ok(channels)
+}
+
 fn parse_sender_identifier_list(raw: &[String], source_name: &str) -> Result<Vec<String>> {
     let mut values = Vec::new();
     for candidate in raw.iter().map(String::as_str).map(str::trim).filter(|value| !value.is_empty())
@@ -5953,11 +6004,11 @@ mod tests {
         apply_feature_rollout_env_override, legacy_process_runner_path_access_mode, load_config,
         parse_acp_runtime_backend, parse_anthropic_base_url, parse_anthropic_model,
         parse_broadcast_strategy, parse_browser_service_endpoint,
-        parse_canvas_host_public_base_url, parse_channel_routing_rule,
-        parse_content_type_allowlist, parse_cron_timezone_mode, parse_default_memory_ttl_ms,
-        parse_direct_message_policy, parse_dns_suffix_allowlist, parse_exact_vault_ref_allowlist,
-        parse_host_allowlist, parse_http_header_allowlist, parse_journal_db_path,
-        parse_mcp_server_config, parse_memory_retention_vacuum_schedule,
+        parse_canvas_host_public_base_url, parse_channel_identifier_list,
+        parse_channel_routing_rule, parse_content_type_allowlist, parse_cron_timezone_mode,
+        parse_default_memory_ttl_ms, parse_direct_message_policy, parse_dns_suffix_allowlist,
+        parse_exact_vault_ref_allowlist, parse_host_allowlist, parse_http_header_allowlist,
+        parse_journal_db_path, parse_mcp_server_config, parse_memory_retention_vacuum_schedule,
         parse_model_provider_auth_provider_kind, parse_model_provider_registry_entry,
         parse_model_provider_registry_model, parse_openai_base_url, parse_openai_embeddings_dims,
         parse_optional_auth_profile_id, parse_optional_browser_state_dir,
@@ -5968,7 +6019,7 @@ mod tests {
         parse_promoted_runtime_mode, parse_provider_reasoning_effort, parse_provider_service_tier,
         parse_root_file_config, parse_runtime_preview_mode, parse_storage_prefix_allowlist,
         parse_structured_secret_ref_field, parse_tool_allowlist, parse_vault_dir,
-        parse_vault_ref_allowlist, validate_acp_runtime_registry,
+        parse_vault_ref_allowlist, validate_acp_runtime_registry, validate_connector_auth_binding,
         validate_optional_capability_dependencies, validate_runtime_preview_config,
         AcpRuntimeBackendConfig, AcpRuntimeConfig, AdminConfig, AuxiliaryExecutorConfig,
         BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
@@ -7737,6 +7788,7 @@ vault_ref = "GLOBAL/PALYRA_ADMIN_TOKEN"
         let _admin_token = ScopedEnvVar::unset("PALYRA_ADMIN_TOKEN");
         let _admin_require_auth = ScopedEnvVar::unset("PALYRA_ADMIN_REQUIRE_AUTH");
         let _connector_token = ScopedEnvVar::unset("PALYRA_CONNECTOR_TOKEN");
+        let _connector_allowed_channels = ScopedEnvVar::unset("PALYRA_CONNECTOR_ALLOWED_CHANNELS");
 
         let loaded = super::load_config().expect("admin secret-ref config should load");
         let secret_ref = loaded
@@ -7922,9 +7974,34 @@ allowed_credential_vault_refs = ["global/github_token", "principal:UserA/api_tok
             "connector token should default to missing until explicitly configured"
         );
         assert!(
+            config.connector_allowed_channels.is_empty(),
+            "connector token should default to no channel authority"
+        );
+        assert!(
             config.bound_principal.is_none(),
             "admin token principal binding should default to missing until explicitly configured"
         );
+    }
+
+    #[test]
+    fn connector_token_requires_explicit_channel_authority() {
+        let mut config = AdminConfig {
+            connector_token: Some("connector-secret".to_owned()),
+            ..AdminConfig::default()
+        };
+        let error = validate_connector_auth_binding(&config)
+            .expect_err("unbound connector token must fail closed");
+        assert!(
+            error.to_string().contains("connector_allowed_channels"),
+            "error should identify the missing authority binding: {error}"
+        );
+
+        config.connector_allowed_channels =
+            parse_channel_identifier_list(&["Discord:Default".to_owned()], "test channels")
+                .expect("channel allowlist should parse");
+        validate_connector_auth_binding(&config)
+            .expect("explicit connector channel authority should be accepted");
+        assert_eq!(config.connector_allowed_channels, vec!["discord:default"]);
     }
 
     #[test]

@@ -641,7 +641,7 @@ pub(crate) fn build_discord_onboarding_security_defaults(
     plan: &DiscordOnboardingPlan,
 ) -> Vec<String> {
     let mut defaults = vec![
-        "Connector ingress auth can be scoped with admin.connector_token / PALYRA_CONNECTOR_TOKEN instead of reusing admin token."
+        "Connector ingress auth uses admin.connector_token / PALYRA_CONNECTOR_TOKEN together with the explicit admin.connector_allowed_channels / PALYRA_CONNECTOR_ALLOWED_CHANNELS authority instead of reusing admin token."
             .to_owned(),
         "Discord attachment downloads are deny-by-default in current scope; connector forwards metadata only."
             .to_owned(),

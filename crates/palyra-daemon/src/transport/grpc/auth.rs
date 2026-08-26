@@ -1,7 +1,8 @@
 //! Authentication and request-context extraction for daemon gRPC services.
 //!
 //! Admin tokens authorize general gateway methods; the connector token is
-//! intentionally narrower and can only route messages for its bound channel.
+//! intentionally narrower and can only route messages for explicitly allowed
+//! channels.
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use palyra_common::validate_canonical_id;
@@ -24,6 +25,8 @@ pub struct GatewayAuthConfig {
     pub admin_token: Option<String>,
     /// Connector bearer token for `RouteMessage` calls from channel adapters.
     pub connector_token: Option<String>,
+    /// Exact channels that the connector token may represent.
+    pub connector_allowed_channels: Vec<String>,
     /// Optional principal that the admin token is allowed to impersonate.
     pub bound_principal: Option<String>,
 }
@@ -138,7 +141,9 @@ pub(crate) fn authorize_metadata(
     })?;
     match token_kind {
         RpcTokenKind::Admin => enforce_token_principal_binding(context.principal.as_str(), auth)?,
-        RpcTokenKind::Connector => enforce_connector_token_context_binding(&context)?,
+        RpcTokenKind::Connector => {
+            enforce_connector_token_context_binding(&context, &auth.connector_allowed_channels)?
+        }
     }
     Ok(context)
 }
@@ -168,11 +173,17 @@ fn resolve_rpc_token_kind(
     Err(AuthError::InvalidToken)
 }
 
-fn enforce_connector_token_context_binding(context: &RequestContext) -> Result<(), AuthError> {
+fn enforce_connector_token_context_binding(
+    context: &RequestContext,
+    allowed_channels: &[String],
+) -> Result<(), AuthError> {
     let Some(channel) = context.channel.as_deref().map(str::trim).filter(|value| !value.is_empty())
     else {
         return Err(AuthError::InvalidToken);
     };
+    if !allowed_channels.iter().any(|allowed| channel.eq_ignore_ascii_case(allowed)) {
+        return Err(AuthError::InvalidToken);
+    }
     let expected_principal = format!("channel:{channel}");
     if context.principal.eq_ignore_ascii_case(expected_principal.as_str()) {
         Ok(())

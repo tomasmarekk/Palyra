@@ -2726,6 +2726,7 @@ fn routines_tool_test_auth() -> GatewayAuthConfig {
         require_auth: false,
         admin_token: None,
         connector_token: None,
+        connector_allowed_channels: Vec::new(),
         bound_principal: None,
     }
 }
@@ -3969,6 +3970,7 @@ fn authorize_headers_rejects_missing_token_when_required() {
         require_auth: true,
         admin_token: Some("secret".to_owned()),
         connector_token: None,
+        connector_allowed_channels: Vec::new(),
         bound_principal: Some("user:ops".to_owned()),
     };
     let headers = HeaderMap::new();
@@ -3982,6 +3984,7 @@ fn authorize_headers_accepts_matching_bearer_token() {
         require_auth: true,
         admin_token: Some("secret".to_owned()),
         connector_token: None,
+        connector_allowed_channels: Vec::new(),
         bound_principal: Some("user:ops".to_owned()),
     };
     let mut headers = HeaderMap::new();
@@ -3997,6 +4000,7 @@ fn authorize_headers_accepts_case_insensitive_bearer_scheme() {
         require_auth: true,
         admin_token: Some("secret".to_owned()),
         connector_token: None,
+        connector_allowed_channels: Vec::new(),
         bound_principal: Some("user:ops".to_owned()),
     };
     let mut headers = HeaderMap::new();
@@ -4017,6 +4021,7 @@ fn bound_admin_actor_requires_host_bound_authenticated_principal() {
         require_auth: true,
         admin_token: Some("secret".to_owned()),
         connector_token: None,
+        connector_allowed_channels: Vec::new(),
         bound_principal: Some("user:ops".to_owned()),
     };
     assert_eq!(bound_admin_actor_principal(&bound_auth, &context), Some("user:ops"));
@@ -4037,6 +4042,7 @@ fn authorize_metadata_route_message_accepts_connector_token() {
         require_auth: true,
         admin_token: Some("admin-secret".to_owned()),
         connector_token: Some("connector-secret".to_owned()),
+        connector_allowed_channels: vec!["discord:default".to_owned()],
         bound_principal: Some("admin:ops".to_owned()),
     };
     let mut metadata = tonic::metadata::MetadataMap::new();
@@ -4066,6 +4072,7 @@ fn authorize_metadata_rejects_connector_token_for_non_route_message_method() {
         require_auth: true,
         admin_token: Some("admin-secret".to_owned()),
         connector_token: Some("connector-secret".to_owned()),
+        connector_allowed_channels: vec!["discord:default".to_owned()],
         bound_principal: Some("admin:ops".to_owned()),
     };
     let mut metadata = tonic::metadata::MetadataMap::new();
@@ -4093,6 +4100,7 @@ fn authorize_metadata_rejects_connector_token_when_principal_channel_mismatch() 
         require_auth: true,
         admin_token: Some("admin-secret".to_owned()),
         connector_token: Some("connector-secret".to_owned()),
+        connector_allowed_channels: vec!["discord:default".to_owned()],
         bound_principal: Some("admin:ops".to_owned()),
     };
     let mut metadata = tonic::metadata::MetadataMap::new();
@@ -4111,6 +4119,36 @@ fn authorize_metadata_rejects_connector_token_when_principal_channel_mismatch() 
     metadata
         .insert(HEADER_CHANNEL, "discord:default".parse().expect("channel metadata should parse"));
     let result = authorize_metadata(&metadata, &auth, "RouteMessage");
+    assert_eq!(result, Err(AuthError::InvalidToken));
+}
+
+#[test]
+fn authorize_metadata_rejects_self_consistent_unbound_connector_channel() {
+    let auth = GatewayAuthConfig {
+        require_auth: true,
+        admin_token: Some("admin-secret".to_owned()),
+        connector_token: Some("connector-secret".to_owned()),
+        connector_allowed_channels: vec!["discord:default".to_owned()],
+        bound_principal: Some("admin:ops".to_owned()),
+    };
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    metadata.insert(
+        AUTHORIZATION.as_str(),
+        "Bearer connector-secret".parse().expect("authorization metadata should parse"),
+    );
+    metadata.insert(
+        HEADER_PRINCIPAL,
+        "channel:discord:other".parse().expect("principal metadata should parse"),
+    );
+    metadata.insert(
+        HEADER_DEVICE_ID,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("device metadata should parse"),
+    );
+    metadata
+        .insert(HEADER_CHANNEL, "discord:other".parse().expect("channel metadata should parse"));
+
+    let result = authorize_metadata(&metadata, &auth, "RouteMessage");
+
     assert_eq!(result, Err(AuthError::InvalidToken));
 }
 
@@ -6253,6 +6291,7 @@ fn authorize_headers_rejects_principal_mismatch_with_bound_principal() {
         require_auth: true,
         admin_token: Some("secret".to_owned()),
         connector_token: None,
+        connector_allowed_channels: Vec::new(),
         bound_principal: Some("user:ops".to_owned()),
     };
     let mut headers = HeaderMap::new();
@@ -6681,6 +6720,7 @@ fn status_snapshot_reports_journal_counters_and_storage_metadata() {
             require_auth: true,
             admin_token: Some("token".to_owned()),
             connector_token: None,
+            connector_allowed_channels: Vec::new(),
             bound_principal: Some("user:ops".to_owned()),
         },
     );
@@ -6830,6 +6870,7 @@ async fn status_snapshot_surfaces_model_provider_runtime_aggregates() {
             require_auth: true,
             admin_token: Some("token".to_owned()),
             connector_token: None,
+            connector_allowed_channels: Vec::new(),
             bound_principal: Some("user:ops".to_owned()),
         },
     );
@@ -14334,6 +14375,7 @@ async fn failed_run_does_not_remain_lifecycle_active() {
             require_auth: true,
             admin_token: Some("token".to_owned()),
             connector_token: None,
+            connector_allowed_channels: Vec::new(),
             bound_principal: Some("user:ops".to_owned()),
         },
     );

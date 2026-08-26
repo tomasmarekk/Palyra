@@ -1259,6 +1259,9 @@ pub struct AdminConfig {
     pub auth_token_secret_ref: Option<SecretRef>,
     pub connector_token: Option<String>,
     pub connector_token_secret_ref: Option<SecretRef>,
+    /// Exact normalized channels that the shared connector credential may
+    /// represent. Empty denies all connector-token ingress.
+    pub connector_allowed_channels: Vec<String>,
     /// When set, the admin token is only honored for this principal.
     pub bound_principal: Option<String>,
 }
@@ -1556,6 +1559,7 @@ impl Default for AdminConfig {
             auth_token_secret_ref: None,
             connector_token: None,
             connector_token_secret_ref: None,
+            connector_allowed_channels: Vec::new(),
             bound_principal: None,
         }
     }

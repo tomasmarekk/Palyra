@@ -161,6 +161,39 @@ pub const CONFIG_SCHEMA_ENTRIES: &[ConfigSchemaEntry] = &[
         description: "Structured secret reference for the admin API token.",
     },
     ConfigSchemaEntry {
+        path: "admin.connector_token",
+        value_type: "string",
+        default_value: None,
+        env_vars: &["PALYRA_CONNECTOR_TOKEN"],
+        secret: true,
+        deprecated: false,
+        restart_required: true,
+        category: "admin",
+        description: "Connector ingress bearer token.",
+    },
+    ConfigSchemaEntry {
+        path: "admin.connector_token_secret_ref",
+        value_type: "secret_ref",
+        default_value: None,
+        env_vars: &[],
+        secret: true,
+        deprecated: false,
+        restart_required: true,
+        category: "admin",
+        description: "Structured secret reference for the connector ingress token.",
+    },
+    ConfigSchemaEntry {
+        path: "admin.connector_allowed_channels",
+        value_type: "array<string>",
+        default_value: Some("[]"),
+        env_vars: &["PALYRA_CONNECTOR_ALLOWED_CHANNELS"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "admin",
+        description: "Exact normalized channels that the connector token may represent.",
+    },
+    ConfigSchemaEntry {
         path: "model_provider.kind",
         value_type: "enum(deterministic|openai_compatible|anthropic)",
         default_value: Some("openai_compatible"),
@@ -1644,7 +1677,7 @@ pub struct FileWasmRuntimeConfig {
     pub allowed_channels: Option<Vec<String>>,
 }
 
-/// `[admin]`: admin/connector auth tokens and bound principal.
+/// `[admin]`: admin/connector auth tokens, connector channel authority, and bound principal.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileAdminConfig {
@@ -1653,6 +1686,7 @@ pub struct FileAdminConfig {
     pub auth_token_secret_ref: Option<SecretRef>,
     pub connector_token: Option<String>,
     pub connector_token_secret_ref: Option<SecretRef>,
+    pub connector_allowed_channels: Option<Vec<String>>,
     pub bound_principal: Option<String>,
 }
 
@@ -1704,6 +1738,22 @@ mod tests {
             "execution_backend_profiles.profiles.ssh_worker.identity_handle"
         ));
         assert!(!is_secret_config_path("daemon.port"));
+    }
+
+    #[test]
+    fn connector_auth_schema_catalog_includes_token_and_channel_authority() {
+        let entries = config_schema_entries();
+        assert!(entries.iter().any(|entry| {
+            entry.path == "admin.connector_token"
+                && entry.secret
+                && entry.env_vars.contains(&"PALYRA_CONNECTOR_TOKEN")
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.path == "admin.connector_allowed_channels"
+                && !entry.secret
+                && entry.env_vars.contains(&"PALYRA_CONNECTOR_ALLOWED_CHANNELS")
+        }));
+        assert!(known_config_env_vars().contains(&"PALYRA_CONNECTOR_ALLOWED_CHANNELS"));
     }
 
     #[test]

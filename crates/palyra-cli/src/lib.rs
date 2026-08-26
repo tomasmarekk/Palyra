@@ -12458,7 +12458,25 @@ fn validate_admin_secret_sources(parsed: &RootFileConfig) -> Result<()> {
         config_string_present(admin.connector_token.as_deref()),
         admin.connector_token_secret_ref.is_some(),
         false,
-    )
+    )?;
+
+    let connector_credential_configured = config_string_present(admin.connector_token.as_deref())
+        || admin.connector_token_secret_ref.is_some();
+    let connector_authority_configured = admin
+        .connector_allowed_channels
+        .as_deref()
+        .is_some_and(|channels| channels.iter().any(|channel| !channel.trim().is_empty()));
+    if connector_credential_configured && !connector_authority_configured {
+        anyhow::bail!(
+            "admin.connector_token requires at least one admin.connector_allowed_channels entry"
+        );
+    }
+    if !connector_credential_configured && connector_authority_configured {
+        anyhow::bail!(
+            "admin.connector_allowed_channels requires admin.connector_token or admin.connector_token_secret_ref"
+        );
+    }
+    Ok(())
 }
 
 fn config_string_present(value: Option<&str>) -> bool {
@@ -14891,6 +14909,37 @@ variable = "PALYRA_ADMIN_TOKEN"
         assert!(
             message.contains("admin.auth_token cannot set both inline value and *_secret_ref"),
             "unexpected validation error: {message}"
+        );
+    }
+
+    #[test]
+    fn daemon_document_validation_requires_connector_token_authority_pair() {
+        let unbound_token: toml::Value = toml::from_str(
+            r#"
+[admin]
+connector_token = "connector-token"
+"#,
+        )
+        .expect("fixture config should parse");
+        let token_error = validate_daemon_compatible_document(&unbound_token)
+            .expect_err("connector token without channel authority must fail");
+        assert!(
+            format!("{token_error:#}").contains("connector_allowed_channels"),
+            "error should identify the missing connector authority: {token_error:#}"
+        );
+
+        let unbound_authority: toml::Value = toml::from_str(
+            r#"
+[admin]
+connector_allowed_channels = ["discord:default"]
+"#,
+        )
+        .expect("fixture config should parse");
+        let authority_error = validate_daemon_compatible_document(&unbound_authority)
+            .expect_err("channel authority without a connector token must fail");
+        assert!(
+            format!("{authority_error:#}").contains("requires admin.connector_token"),
+            "error should identify the missing connector credential: {authority_error:#}"
         );
     }
 

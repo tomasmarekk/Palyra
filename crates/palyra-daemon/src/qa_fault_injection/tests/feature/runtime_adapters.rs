@@ -521,6 +521,7 @@ fn bridge_terminate_process_exits_after_durable_connector_activation() {
             require_auth: false,
             admin_token: None,
             connector_token: None,
+            connector_allowed_channels: Vec::new(),
             bound_principal: None,
         },
         connector_db.clone(),

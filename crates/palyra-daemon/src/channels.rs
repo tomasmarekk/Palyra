@@ -1402,6 +1402,7 @@ mod tests {
             require_auth: true,
             admin_token: Some("admin-secret".to_owned()),
             connector_token: Some("connector-secret".to_owned()),
+            connector_allowed_channels: vec!["discord:default".to_owned()],
             bound_principal: Some("admin:ops".to_owned()),
         };
         let (principal, authorization) =
@@ -1424,6 +1425,7 @@ mod tests {
             require_auth: true,
             admin_token: Some("admin-secret".to_owned()),
             connector_token: None,
+            connector_allowed_channels: Vec::new(),
             bound_principal: Some("admin:ops".to_owned()),
         };
         let error = resolve_connector_gateway_auth(&auth, "channel:discord:default")
@@ -1440,6 +1442,7 @@ mod tests {
             require_auth: true,
             admin_token: None,
             connector_token: None,
+            connector_allowed_channels: Vec::new(),
             bound_principal: None,
         };
         let error = resolve_connector_gateway_auth(&auth, "channel:discord:default")
@@ -1447,6 +1450,23 @@ mod tests {
         assert!(
             matches!(error, ConnectorSupervisorError::Router(_)),
             "missing token should be surfaced as router error for deterministic channel logs"
+        );
+    }
+
+    #[test]
+    fn connector_gateway_auth_rejects_channel_outside_token_authority() {
+        let auth = GatewayAuthConfig {
+            require_auth: true,
+            admin_token: Some("admin-secret".to_owned()),
+            connector_token: Some("connector-secret".to_owned()),
+            connector_allowed_channels: vec!["discord:default".to_owned()],
+            bound_principal: Some("admin:ops".to_owned()),
+        };
+        let error = resolve_connector_gateway_auth(&auth, "channel:discord:other")
+            .expect_err("connector token must not authorize an unbound channel");
+        assert!(
+            matches!(error, ConnectorSupervisorError::Router(message) if message.contains("is not allowed")),
+            "channel authority mismatch should be explicit"
         );
     }
 
@@ -1524,6 +1544,7 @@ mod tests {
                 require_auth: false,
                 admin_token: None,
                 connector_token: None,
+                connector_allowed_channels: Vec::new(),
                 bound_principal: None,
             },
             tempdir.path().join("connectors.sqlite3"),

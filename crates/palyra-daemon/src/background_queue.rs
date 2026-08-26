@@ -4397,6 +4397,7 @@ mod tests {
             require_auth: false,
             admin_token: None,
             connector_token: None,
+            connector_allowed_channels: Vec::new(),
             bound_principal: None,
         }
     }
