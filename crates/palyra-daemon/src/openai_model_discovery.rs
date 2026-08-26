@@ -14,6 +14,10 @@ use palyra_model_providers::{
 use reqwest::Url;
 
 use crate::{
+    bounded_http_body::{
+        read_response_text_limited, MAX_PROVIDER_DISCOVERY_RESPONSE_BYTES,
+        MAX_REMOTE_ERROR_RESPONSE_BYTES,
+    },
     model_provider::{build_provider_http_client, sanitize_remote_error},
     openai_auth::OpenAiCredentialValidationError,
 };
@@ -95,7 +99,20 @@ async fn discover_preferred_openai_model_id_from_endpoint(
         .await
         .map_err(|_| OpenAiCredentialValidationError::ProviderUnavailable)?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body_limit = if status.is_success() {
+        MAX_PROVIDER_DISCOVERY_RESPONSE_BYTES
+    } else {
+        MAX_REMOTE_ERROR_RESPONSE_BYTES
+    };
+    let body =
+        match read_response_text_limited(response, body_limit, "provider model discovery").await {
+            Ok(body) => body,
+            Err(error) => {
+                return Err(OpenAiCredentialValidationError::Unexpected(format!(
+                    "model discovery response could not be read: {error}"
+                )));
+            }
+        };
     if status.is_success() {
         return preferred_openai_model_id_from_body(body.as_str(), format).map_err(|error| {
             OpenAiCredentialValidationError::Unexpected(format!(

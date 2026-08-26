@@ -4,7 +4,7 @@
 //! the duration of one refresh call; failure reasons persisted to disk pass through
 //! [`sanitize_refresh_error`] so provider response text never reaches stored state.
 
-use std::time::Duration;
+use std::{io::Read, time::Duration};
 
 use palyra_vault::{Vault, VaultError, VaultRef};
 use reqwest::blocking::Client;
@@ -20,6 +20,8 @@ use crate::{
     },
     validation::validate_runtime_token_endpoint,
 };
+
+const MAX_OAUTH_REFRESH_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// Exchanges a refresh token for a new access token at a provider's token endpoint.
 ///
@@ -103,13 +105,18 @@ impl OAuthRefreshAdapter for HttpOAuthRefreshAdapter {
             .send()
             .map_err(|error| OAuthRefreshError::Transport(error.to_string()))?;
         let status = response.status();
-        let payload =
-            response.text().map_err(|error| OAuthRefreshError::Transport(error.to_string()))?;
         if !status.is_success() {
             return Err(OAuthRefreshError::HttpStatus { status: status.as_u16() });
         }
+        let content_length = response.content_length();
+        let payload = read_blocking_body_limited(
+            response,
+            content_length,
+            MAX_OAUTH_REFRESH_RESPONSE_BYTES,
+            "OAuth refresh",
+        )?;
 
-        let parsed: Value = serde_json::from_str(payload.as_str()).map_err(|error| {
+        let parsed: Value = serde_json::from_slice(payload.as_slice()).map_err(|error| {
             OAuthRefreshError::InvalidResponse(format!("response body is not JSON: {error}"))
         })?;
         let access_token = parsed
@@ -136,6 +143,47 @@ impl OAuthRefreshAdapter for HttpOAuthRefreshAdapter {
 
         Ok(OAuthRefreshResponse { access_token, refresh_token, expires_in_seconds })
     }
+}
+
+fn read_blocking_body_limited<R: Read>(
+    mut reader: R,
+    content_length: Option<u64>,
+    max_bytes: usize,
+    body_kind: &str,
+) -> Result<Vec<u8>, OAuthRefreshError> {
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if content_length.is_some_and(|length| length > max_bytes_u64) {
+        return Err(OAuthRefreshError::InvalidResponse(format!(
+            "{body_kind} response declared more than the {max_bytes}-byte limit"
+        )));
+    }
+
+    let initial_capacity = content_length
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(max_bytes);
+    let mut body = Vec::with_capacity(initial_capacity);
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let bytes_read = reader
+            .read(&mut chunk)
+            .map_err(|error| OAuthRefreshError::Transport(error.to_string()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        let next_len = body.len().checked_add(bytes_read).ok_or_else(|| {
+            OAuthRefreshError::InvalidResponse(format!(
+                "{body_kind} response byte count overflowed"
+            ))
+        })?;
+        if next_len > max_bytes {
+            return Err(OAuthRefreshError::InvalidResponse(format!(
+                "{body_kind} response exceeded the {max_bytes}-byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk[..bytes_read]);
+    }
+    Ok(body)
 }
 
 /// Reads an expiry field that providers send as either a JSON number or a numeric string.

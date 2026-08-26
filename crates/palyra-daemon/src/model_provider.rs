@@ -49,7 +49,12 @@ use ulid::Ulid;
 
 use crate::{
     application::tool_registry::ModelVisibleToolCatalogSnapshot,
-    orchestrator::estimate_token_count, provider_leases::MAX_PROVIDER_CREDENTIAL_RETRY_AFTER_MS,
+    bounded_http_body::{
+        read_remote_error_text, read_response_bytes_limited, read_response_text_limited,
+        MAX_PROVIDER_JSON_RESPONSE_BYTES, MAX_PROVIDER_SSE_RESPONSE_BYTES,
+    },
+    orchestrator::estimate_token_count,
+    provider_leases::MAX_PROVIDER_CREDENTIAL_RETRY_AFTER_MS,
 };
 
 mod adapters;
@@ -4678,10 +4683,8 @@ impl OpenAiCompatibleEmbeddingsProvider {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
             let retry_after_ms = retry_after_ms_from_response(&response);
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<openai-compatible error body unavailable>".to_owned());
+            let body_text =
+                read_remote_error_text(response, "openai-compatible embeddings error body").await;
             return Err(AttemptError::request_failed(
                 format!(
                     "openai-compatible embeddings endpoint returned HTTP {status}: {}",
@@ -4698,12 +4701,25 @@ impl OpenAiCompatibleEmbeddingsProvider {
             ));
         }
 
-        let parsed = response.json::<OpenAiEmbeddingsResponse>().await.map_err(|error| {
+        let response_body = read_response_bytes_limited(
+            response,
+            MAX_PROVIDER_JSON_RESPONSE_BYTES,
+            "openai-compatible embeddings JSON",
+        )
+        .await
+        .map_err(|error| {
             AttemptError::invalid_response(
-                format!("openai-compatible embeddings response JSON parsing failed: {error}"),
-                "openai_compatible_embeddings_response_json",
+                format!("openai-compatible embeddings response read failed: {error}"),
+                "openai_compatible_embeddings_response_body",
             )
         })?;
+        let parsed: OpenAiEmbeddingsResponse = serde_json::from_slice(response_body.as_slice())
+            .map_err(|error| {
+                AttemptError::invalid_response(
+                    format!("openai-compatible embeddings response JSON parsing failed: {error}"),
+                    "openai_compatible_embeddings_response_json",
+                )
+            })?;
         if parsed.data.is_empty() {
             return Err(AttemptError::invalid_response(
                 "openai-compatible embeddings response did not include vectors".to_owned(),
@@ -5100,10 +5116,8 @@ impl OpenAiCompatibleProvider {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
             let retry_after_ms = retry_after_ms_from_response(&response);
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<openai-compatible error body unavailable>".to_owned());
+            let body_text =
+                read_remote_error_text(response, "openai-compatible chat error body").await;
             return Err(AttemptError::request_failed(
                 format!(
                     "openai-compatible endpoint returned HTTP {status}: {}",
@@ -5120,12 +5134,26 @@ impl OpenAiCompatibleProvider {
             ));
         }
 
-        let parsed = response.json::<OpenAiChatCompletionResponse>().await.map_err(|error| {
+        let response_body = read_response_bytes_limited(
+            response,
+            MAX_PROVIDER_JSON_RESPONSE_BYTES,
+            "openai-compatible chat JSON",
+        )
+        .await
+        .map_err(|error| {
             AttemptError::invalid_response(
-                format!("openai-compatible response JSON parsing failed: {error}"),
-                "openai_compatible_chat_response_json",
+                format!("openai-compatible response read failed: {error}"),
+                "openai_compatible_chat_response_body",
             )
         })?;
+        let parsed =
+            serde_json::from_slice::<OpenAiChatCompletionResponse>(response_body.as_slice())
+                .map_err(|error| {
+                    AttemptError::invalid_response(
+                        format!("openai-compatible response JSON parsing failed: {error}"),
+                        "openai_compatible_chat_response_json",
+                    )
+                })?;
         let provider_response_id = parsed.id.clone();
         let provider_model_id = parsed.model.clone();
         let system_fingerprint = parsed.system_fingerprint.clone();
@@ -5316,10 +5344,8 @@ impl OpenAiCompatibleProvider {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
             let retry_after_ms = retry_after_ms_from_response(&response);
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<openai-codex error body unavailable>".to_owned());
+            let body_text =
+                read_remote_error_text(response, "openai-codex responses error body").await;
             return Err(AttemptError::request_failed(
                 format!(
                     "openai-codex responses endpoint returned HTTP {status}: {}",
@@ -5336,11 +5362,16 @@ impl OpenAiCompatibleProvider {
             ));
         }
 
-        response.text().await.map_err(|error| {
-            AttemptError::request_failed(
+        read_response_text_limited(
+            response,
+            MAX_PROVIDER_SSE_RESPONSE_BYTES,
+            "openai-codex responses SSE",
+        )
+        .await
+        .map_err(|error| {
+            AttemptError::invalid_response(
                 format!("openai-codex responses stream read failed: {error}"),
-                true,
-                classify_reqwest_provider_failure("openai_codex_responses_body", &error),
+                "openai_codex_responses_body",
             )
         })
     }
@@ -5405,10 +5436,11 @@ impl OpenAiCompatibleProvider {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
             let retry_after_ms = retry_after_ms_from_response(&response);
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<openai-compatible error body unavailable>".to_owned());
+            let body_text = read_remote_error_text(
+                response,
+                "openai-compatible audio transcription error body",
+            )
+            .await;
             return Err(AttemptError::request_failed(
                 format!(
                     "openai-compatible audio transcription endpoint returned HTTP {status}: {}",
@@ -5425,14 +5457,24 @@ impl OpenAiCompatibleProvider {
             ));
         }
 
-        let parsed =
-            response.json::<OpenAiAudioTranscriptionResponse>().await.map_err(|error| {
-                AttemptError::invalid_response(
-                    format!(
+        let response_body = read_response_bytes_limited(
+            response,
+            MAX_PROVIDER_JSON_RESPONSE_BYTES,
+            "openai-compatible audio transcription JSON",
+        )
+        .await
+        .map_err(|error| {
+            AttemptError::invalid_response(
+                format!("openai-compatible audio transcription response read failed: {error}"),
+                "openai_compatible_audio_response_body",
+            )
+        })?;
+        let parsed: OpenAiAudioTranscriptionResponse =
+            serde_json::from_slice(response_body.as_slice()).map_err(|error| {
+                let message = format!(
                     "openai-compatible audio transcription response JSON parsing failed: {error}"
-                ),
-                    "openai_compatible_audio_response_json",
-                )
+                );
+                AttemptError::invalid_response(message, "openai_compatible_audio_response_json")
             })?;
         let segments = parsed
             .segments
@@ -5510,10 +5552,9 @@ impl OpenAiCompatibleProvider {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
             let retry_after_ms = retry_after_ms_from_response(&response);
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<openai-compatible error body unavailable>".to_owned());
+            let body_text =
+                read_remote_error_text(response, "openai-compatible audio synthesis error body")
+                    .await;
             return Err(AttemptError::request_failed(
                 format!(
                     "openai-compatible audio synthesis endpoint returned HTTP {status}: {}",
@@ -6701,10 +6742,7 @@ impl AnthropicProvider {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
             let retry_after_ms = retry_after_ms_from_response(&response);
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<anthropic error body unavailable>".to_owned());
+            let body_text = read_remote_error_text(response, "anthropic error body").await;
             return Err(AttemptError::request_failed(
                 format!(
                     "anthropic endpoint returned HTTP {status}: {}",
@@ -6721,12 +6759,25 @@ impl AnthropicProvider {
             ));
         }
 
-        let parsed = response.json::<AnthropicMessagesResponse>().await.map_err(|error| {
+        let response_body = read_response_bytes_limited(
+            response,
+            MAX_PROVIDER_JSON_RESPONSE_BYTES,
+            "anthropic response JSON",
+        )
+        .await
+        .map_err(|error| {
             AttemptError::retryable_invalid_response(
-                format!("anthropic response JSON parsing failed: {error}"),
-                "anthropic_chat_response_json",
+                format!("anthropic response read failed: {error}"),
+                "anthropic_chat_response_body",
             )
         })?;
+        let parsed: AnthropicMessagesResponse = serde_json::from_slice(response_body.as_slice())
+            .map_err(|error| {
+                AttemptError::retryable_invalid_response(
+                    format!("anthropic response JSON parsing failed: {error}"),
+                    "anthropic_chat_response_json",
+                )
+            })?;
         let provider_response_id = parsed.id.clone();
         let provider_model_id = parsed.model.clone();
         let provider_usage = parsed.usage.as_ref().map(|usage| {

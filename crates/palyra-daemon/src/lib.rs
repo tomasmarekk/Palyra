@@ -59,6 +59,7 @@ pub mod application;
 mod automation;
 mod auxiliary_executor;
 mod background_queue;
+mod bounded_http_body;
 mod channel_router;
 mod channels;
 mod command_router;

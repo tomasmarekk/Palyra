@@ -16,6 +16,9 @@
 use std::env;
 
 use super::*;
+use crate::bounded_http_body::{
+    read_remote_error_text, read_response_text_limited, MAX_OAUTH_RESPONSE_BYTES,
+};
 use crate::openai_model_discovery::{
     discover_explicit_tool_capable_openai_compatible_model_id,
     discover_preferred_openai_chatgpt_codex_model_id,
@@ -2073,14 +2076,20 @@ async fn request_openai_chatgpt_device_code(
     let response =
         client.post(code_endpoint.clone()).json(&json!({ "client_id": client_id })).send().await?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
+        let body = read_remote_error_text(response, "OpenAI ChatGPT device-code error body").await;
         anyhow::bail!(
             "OpenAI ChatGPT device-code endpoint returned HTTP {}: {}",
             status.as_u16(),
             crate::model_provider::sanitize_remote_error(body.as_str())
         );
     }
+    let body = read_response_text_limited(
+        response,
+        MAX_OAUTH_RESPONSE_BYTES,
+        "OpenAI ChatGPT device-code",
+    )
+    .await?;
     let payload: OpenAiChatGptDeviceCodeResponse = serde_json::from_str(body.as_str())
         .context("OpenAI ChatGPT device-code response was invalid JSON")?;
     if payload.user_code.trim().is_empty() || payload.device_auth_id.trim().is_empty() {
@@ -2112,19 +2121,25 @@ async fn poll_openai_chatgpt_device_token(
         .send()
         .await?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
     if matches!(status.as_u16(), 403 | 404) {
         return Ok(OpenAiChatGptDevicePollOutcome::Pending(
             "Awaiting OpenAI ChatGPT sign-in.".to_owned(),
         ));
     }
     if !status.is_success() {
+        let body = read_remote_error_text(response, "OpenAI ChatGPT device-token error body").await;
         return Ok(OpenAiChatGptDevicePollOutcome::Failed(format!(
             "OpenAI ChatGPT device-token endpoint returned HTTP {}: {}",
             status.as_u16(),
             crate::model_provider::sanitize_remote_error(body.as_str())
         )));
     }
+    let body = read_response_text_limited(
+        response,
+        MAX_OAUTH_RESPONSE_BYTES,
+        "OpenAI ChatGPT device-token",
+    )
+    .await?;
     let payload: OpenAiChatGptDeviceTokenResponse = serde_json::from_str(body.as_str())
         .context("OpenAI ChatGPT device-token response was invalid JSON")?;
     if let Some(error) = payload.error.as_deref().and_then(normalize_optional_text) {
@@ -2620,14 +2635,16 @@ async fn request_minimax_user_code(
     ];
     let response = client.post(code_endpoint.clone()).form(&form_fields).send().await?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
+        let body = read_remote_error_text(response, "MiniMax OAuth code error body").await;
         anyhow::bail!(
             "MiniMax OAuth code endpoint returned HTTP {}: {}",
             status.as_u16(),
             crate::model_provider::sanitize_remote_error(body.as_str())
         );
     }
+    let body = read_response_text_limited(response, MAX_OAUTH_RESPONSE_BYTES, "MiniMax OAuth code")
+        .await?;
     let payload: MinimaxOAuthCodeResponse = serde_json::from_str(body.as_str())
         .context("MiniMax OAuth code response was invalid JSON")?;
     if let Some(returned_state) =
@@ -2674,7 +2691,12 @@ async fn poll_minimax_oauth_token(
     ];
     let response = client.post(token_endpoint.clone()).form(&form_fields).send().await?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = if status.is_success() {
+        read_response_text_limited(response, MAX_OAUTH_RESPONSE_BYTES, "MiniMax OAuth token")
+            .await?
+    } else {
+        read_remote_error_text(response, "MiniMax OAuth token error body").await
+    };
     let sanitized = crate::model_provider::sanitize_remote_error(body.as_str());
     if !status.is_success() {
         let lower = body.to_ascii_lowercase();
@@ -4261,10 +4283,8 @@ async fn validate_anthropic_api_key(
                     Err(AnthropicCredentialValidationError::ProviderUnavailable)
                 }
                 status => {
-                    let body = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<anthropic error body unavailable>".to_owned());
+                    let body =
+                        read_remote_error_text(response, "Anthropic validation error body").await;
                     Err(AnthropicCredentialValidationError::Unexpected(format!(
                         "Anthropic endpoint returned HTTP {status}: {body}"
                     )))

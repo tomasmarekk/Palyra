@@ -5,9 +5,9 @@
 //! resolution from env, and the HTML callback page served to the user's
 //! browser. Consumed by `openai_surface` (console provider-auth handlers).
 //!
-//! Every remote response body passes through `sanitize_remote_error` before
-//! it can reach an error message, so raw provider payloads (which may echo
-//! credentials) never leak into logs or client-visible errors.
+//! Every remote response body is byte-bounded before parsing or sanitization.
+//! Raw provider payloads (which may echo credentials) never reach logs or
+//! client-visible errors.
 
 use std::{env, time::Duration};
 
@@ -17,7 +17,12 @@ use reqwest::Url;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::model_provider::sanitize_remote_error;
+use crate::{
+    bounded_http_body::{
+        read_remote_error_text, read_response_text_limited, MAX_OAUTH_RESPONSE_BYTES,
+    },
+    model_provider::sanitize_remote_error,
+};
 
 /// How long an OAuth attempt stays addressable after creation or completion.
 pub(crate) const OPENAI_OAUTH_ATTEMPT_TTL_MS: i64 = 10 * 60 * 1_000;
@@ -220,8 +225,8 @@ pub(crate) async fn exchange_authorization_code(
             )
         })?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
+        let body = read_remote_error_text(response, "OpenAI OAuth token error body").await;
         let sanitized = sanitize_remote_error(body.as_str());
         return Err(anyhow!(
             "OpenAI OAuth token exchange failed with status {}: {}",
@@ -229,6 +234,9 @@ pub(crate) async fn exchange_authorization_code(
             sanitized
         ));
     }
+    let body = read_response_text_limited(response, MAX_OAUTH_RESPONSE_BYTES, "OpenAI OAuth token")
+        .await
+        .context("OpenAI OAuth token response could not be read safely")?;
     let payload: OAuthTokenExchangePayload = serde_json::from_str(body.as_str())
         .context("OpenAI OAuth token response was not valid JSON")?;
     let refresh_token = payload
@@ -279,7 +287,9 @@ pub(crate) async fn validate_openai_bearer_token(
                 if status.is_success() {
                     return Ok(());
                 }
-                let body = response.text().await.unwrap_or_default();
+                let body =
+                    read_remote_error_text(response, "OpenAI credential validation error body")
+                        .await;
                 let sanitized = sanitize_remote_error(body.as_str());
                 return match status.as_u16() {
                     401 | 403 => Err(OpenAiCredentialValidationError::InvalidCredential),
@@ -336,11 +346,12 @@ pub(crate) async fn revoke_openai_token(
         match response {
             Ok(response) => {
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
                 if status.is_success() {
                     return Ok(());
                 }
 
+                let body =
+                    read_remote_error_text(response, "OpenAI OAuth revocation error body").await;
                 let sanitized = sanitize_remote_error(body.as_str());
                 if status.is_server_error() && attempt_index + 1 < OPENAI_REVOCATION_RETRY_ATTEMPTS
                 {

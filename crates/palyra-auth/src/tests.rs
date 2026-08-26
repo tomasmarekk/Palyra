@@ -189,6 +189,35 @@ fn spawn_redirect_server(location: String) -> (String, thread::JoinHandle<()>) {
     (format!("http://{address}/oauth/token"), handle)
 }
 
+fn spawn_oversized_oauth_server(chunked: bool) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+    let address = listener.local_addr().expect("test server should resolve local addr");
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("test server should accept request");
+        let mut request_buffer = [0_u8; 2_048];
+        let _ = stream.read(&mut request_buffer);
+        let oversized_len = 256 * 1024 + 1;
+        if chunked {
+            let headers =
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            let chunk_header = format!("{oversized_len:X}\r\n");
+            // Crossing the cap closes the client early, so a later server write
+            // may fail with the expected broken-pipe/reset outcome.
+            let _ = stream.write_all(headers.as_bytes());
+            let _ = stream.write_all(chunk_header.as_bytes());
+            let _ = stream.write_all(vec![b'x'; oversized_len].as_slice());
+            let _ = stream.write_all(b"\r\n0\r\n\r\n");
+        } else {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {oversized_len}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(headers.as_bytes());
+        }
+        let _ = stream.flush();
+    });
+    (format!("http://{address}/oauth/token"), handle)
+}
+
 #[test]
 fn compute_backoff_grows_exponentially_and_caps_per_provider() {
     let provider = AuthProvider::known(AuthProviderKind::Openai);
@@ -529,6 +558,58 @@ fn oauth_refresh_adapter_sends_requested_scopes() {
         body.contains("scope=openid+offline_access+api%3Aaccess"),
         "refresh form should preserve requested OAuth scopes: {body}"
     );
+}
+
+#[test]
+fn oauth_refresh_adapter_rejects_oversized_declared_response() {
+    let (token_endpoint, server_thread) = spawn_oversized_oauth_server(false);
+    let adapter = HttpOAuthRefreshAdapter::with_timeout(Duration::from_secs(2))
+        .expect("HTTP adapter should initialize");
+    let request = OAuthRefreshRequest {
+        provider: AuthProvider::known(AuthProviderKind::Openai),
+        token_endpoint,
+        client_id: Some("test-client".to_owned()),
+        client_secret: None,
+        refresh_token: "refresh-token".to_owned(),
+        scopes: Vec::new(),
+    };
+
+    let error = adapter
+        .refresh_access_token(&request)
+        .expect_err("oversized declared OAuth body must be rejected");
+
+    assert!(matches!(
+        error,
+        OAuthRefreshError::InvalidResponse(message)
+            if message.contains("declared") && message.contains("262144-byte limit")
+    ));
+    server_thread.join().expect("test server thread should exit cleanly");
+}
+
+#[test]
+fn oauth_refresh_adapter_rejects_oversized_chunked_response() {
+    let (token_endpoint, server_thread) = spawn_oversized_oauth_server(true);
+    let adapter = HttpOAuthRefreshAdapter::with_timeout(Duration::from_secs(2))
+        .expect("HTTP adapter should initialize");
+    let request = OAuthRefreshRequest {
+        provider: AuthProvider::known(AuthProviderKind::Openai),
+        token_endpoint,
+        client_id: Some("test-client".to_owned()),
+        client_secret: None,
+        refresh_token: "refresh-token".to_owned(),
+        scopes: Vec::new(),
+    };
+
+    let error = adapter
+        .refresh_access_token(&request)
+        .expect_err("oversized chunked OAuth body must be rejected");
+
+    assert!(matches!(
+        error,
+        OAuthRefreshError::InvalidResponse(message)
+            if message.contains("exceeded") && message.contains("262144-byte limit")
+    ));
+    server_thread.join().expect("test server thread should exit cleanly");
 }
 
 #[test]

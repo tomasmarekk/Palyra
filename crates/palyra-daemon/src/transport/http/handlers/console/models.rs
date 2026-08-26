@@ -29,6 +29,9 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 
 use crate::app::state::AppState;
+use crate::bounded_http_body::{
+    read_response_text_limited, MAX_PROVIDER_PROBE_RESPONSE_BYTES, MAX_REMOTE_ERROR_RESPONSE_BYTES,
+};
 use crate::model_provider::{run_provider_failover_self_check, ProviderFailoverSelfCheckReport};
 use crate::*;
 
@@ -567,7 +570,20 @@ async fn probe_console_provider(
             payload.latency_ms =
                 Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body_limit = if status.is_success() {
+                MAX_PROVIDER_PROBE_RESPONSE_BYTES
+            } else {
+                MAX_REMOTE_ERROR_RESPONSE_BYTES
+            };
+            let body =
+                match read_response_text_limited(response, body_limit, "provider probe").await {
+                    Ok(body) => body,
+                    Err(error) => {
+                        payload.state = "endpoint_failed".to_owned();
+                        payload.message = sanitize_probe_error(error.to_string().as_str());
+                        return payload;
+                    }
+                };
             if status.is_success() {
                 payload.state = "ok".to_owned();
                 if discover {
