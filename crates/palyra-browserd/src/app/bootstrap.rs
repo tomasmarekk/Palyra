@@ -1,7 +1,7 @@
 //! Daemon bootstrap: tracing setup, bind policy enforcement, and server startup.
 //!
 //! Runs the HTTP health listener and the gRPC browser service side by side
-//! and refuses non-loopback binds unless request authentication is enabled.
+//! and keeps both plaintext listeners on loopback.
 
 use crate::{transport, *};
 
@@ -14,8 +14,8 @@ use crate::{transport, *};
 ///
 /// # Errors
 /// Returns an error when a bind address fails to parse or bind, when a
-/// non-loopback bind is requested without an auth token, or when either
-/// server terminates with a failure.
+/// non-loopback bind is requested, or when either server terminates with a
+/// failure.
 pub async fn run() -> Result<()> {
     init_tracing();
     let args = Args::parse();
@@ -26,7 +26,7 @@ pub async fn run() -> Result<()> {
         parse_daemon_bind_socket(&args.bind, args.port).context("invalid bind address or port")?;
     let grpc_address = parse_daemon_bind_socket(&args.grpc_bind, args.grpc_port)
         .context("invalid gRPC bind address or port")?;
-    enforce_non_loopback_bind_auth(admin_address, grpc_address, runtime.auth_token.is_some())?;
+    enforce_loopback_bind(admin_address, grpc_address)?;
 
     let build = build_metadata();
     info!(
@@ -74,29 +74,23 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Rejects non-loopback bind addresses unless request authentication is enabled.
+/// Rejects non-loopback bind addresses for the plaintext browserd listeners.
 ///
-/// Fail-closed startup guard: without a shared auth token every gRPC call is
-/// accepted, so exposing the listeners beyond loopback would hand full browser
-/// control to anyone on the network.
+/// The shared bearer token authenticates requests but does not encrypt either
+/// transport. Remote deployments must terminate TLS in a trusted proxy that
+/// reaches browserd through loopback.
 ///
 /// # Errors
-/// Returns an error naming both bind addresses when either one is non-loopback
-/// while auth is disabled.
-pub(crate) fn enforce_non_loopback_bind_auth(
+/// Returns an error naming both bind addresses when either one is non-loopback.
+pub(crate) fn enforce_loopback_bind(
     admin_address: SocketAddr,
     grpc_address: SocketAddr,
-    auth_enabled: bool,
 ) -> Result<()> {
-    if auth_enabled {
-        return Ok(());
-    }
-
     let admin_non_loopback = !admin_address.ip().is_loopback();
     let grpc_non_loopback = !grpc_address.ip().is_loopback();
     if admin_non_loopback || grpc_non_loopback {
         anyhow::bail!(
-            "browser service auth token is required for non-loopback bindings (admin: {admin_address}, grpc: {grpc_address}); set --auth-token or PALYRA_BROWSERD_AUTH_TOKEN"
+            "browserd plaintext listeners must remain on loopback (admin: {admin_address}, grpc: {grpc_address}); use a trusted TLS reverse proxy or tunnel for remote access"
         );
     }
 

@@ -238,8 +238,8 @@ pub(crate) struct ChromiumEngineConfig {
 
 /// Operator CLI flags for the browserd daemon.
 ///
-/// Both listeners default to loopback; binding elsewhere requires `auth_token`
-/// (see `enforce_non_loopback_bind_auth`).
+/// Both plaintext listeners are restricted to loopback. Remote access must use
+/// a trusted TLS reverse proxy or tunnel.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "palyra-browserd", about = "Palyra browser service v1")]
 pub(crate) struct Args {

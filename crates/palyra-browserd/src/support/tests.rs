@@ -7,7 +7,7 @@ use super::{
     build_state_store_from_env, chromium_active_tab_for_session,
     chromium_new_tab_error_is_retryable, chromium_tab_for_session,
     default_browserd_state_dir_from_env, derive_state_encryption_key, encrypt_state_blob,
-    enforce_non_loopback_bind_auth, fetch_http_attachment_download_artifact, navigate_with_guards,
+    enforce_loopback_bind, fetch_http_attachment_download_artifact, navigate_with_guards,
     parse_daemon_bind_socket, persisted_snapshot_hash, persisted_snapshot_legacy_hash,
     record_chromium_remote_ip_incident, reset_dns_validation_tracking_for_tests,
     run_chromium_blocking, sha256_hex, store_dns_nxdomain_cache, store_generated_artifact,
@@ -1791,15 +1791,14 @@ async fn chromium_session_proxy_scoped_private_override_rejects_unrelated_target
 }
 
 #[test]
-fn non_loopback_bind_requires_auth_token() {
+fn non_loopback_bind_is_rejected_without_auth_token() {
     let admin = parse_daemon_bind_socket("0.0.0.0", 7143).expect("admin address should parse");
     let grpc = parse_daemon_bind_socket("127.0.0.1", DEFAULT_GRPC_PORT)
         .expect("grpc address should parse");
-    let error = enforce_non_loopback_bind_auth(admin, grpc, false)
-        .expect_err("non-loopback bind without auth token must fail closed");
+    let error = enforce_loopback_bind(admin, grpc).expect_err("non-loopback bind must fail closed");
     assert!(
-        error.to_string().contains("auth token is required"),
-        "error should explain startup auth requirement: {error}"
+        error.to_string().contains("plaintext listeners must remain on loopback"),
+        "error should explain the transport requirement: {error}"
     );
 }
 
@@ -1808,17 +1807,20 @@ fn loopback_binds_allow_missing_auth_token() {
     let admin = parse_daemon_bind_socket("127.0.0.1", 7143).expect("admin address should parse");
     let grpc =
         parse_daemon_bind_socket("::1", DEFAULT_GRPC_PORT).expect("grpc address should parse");
-    enforce_non_loopback_bind_auth(admin, grpc, false)
-        .expect("loopback-only binds may run without auth token");
+    enforce_loopback_bind(admin, grpc).expect("loopback-only binds should be accepted");
 }
 
 #[test]
-fn non_loopback_bind_allows_when_auth_is_enabled() {
+fn non_loopback_bind_is_rejected_even_with_request_auth_configured() {
     let admin = parse_daemon_bind_socket("0.0.0.0", 7143).expect("admin address should parse");
     let grpc =
         parse_daemon_bind_socket("0.0.0.0", DEFAULT_GRPC_PORT).expect("grpc address should parse");
-    enforce_non_loopback_bind_auth(admin, grpc, true)
-        .expect("configured auth token should allow non-loopback bind");
+    let error = enforce_loopback_bind(admin, grpc)
+        .expect_err("bearer authentication must not authorize a plaintext remote bind");
+    assert!(
+        error.to_string().contains("trusted TLS reverse proxy"),
+        "rejection should explain the supported remote deployment: {error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -15,7 +15,7 @@ pub mod support;
 pub mod transport;
 
 #[cfg(test)]
-pub(crate) use app::bootstrap::enforce_non_loopback_bind_auth;
+pub(crate) use app::bootstrap::enforce_loopback_bind;
 pub use app::bootstrap::run;
 pub(crate) use app::*;
 pub(crate) use domain::*;
