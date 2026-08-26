@@ -884,6 +884,8 @@ fn diagnostics_and_metadata_are_hash_only_and_secret_free() {
 
 #[test]
 fn sensitive_correction_requires_retention_and_preserves_user_evidence() {
+    const RETENTION_WINDOW_MS: i64 = 60 * 60 * 1_000;
+
     let store = JournalStore::open(config(temp_db_path())).expect("journal should open");
     let authority = authority(&store);
     let now = crate::gateway::current_unix_ms();
@@ -905,7 +907,8 @@ fn sensitive_correction_requires_retention_and_preserves_user_evidence() {
         error.to_string(),
         "invalid journal argument: semantic_memory.sensitive_retention_invalid"
     );
-    candidate.retention_expires_at_unix_ms = Some(now + 60_000);
+    let retention_expires_at_unix_ms = now + RETENTION_WINDOW_MS;
+    candidate.retention_expires_at_unix_ms = Some(retention_expires_at_unix_ms);
     let proposed = store
         .propose_semantic_memory(
             "sensitive",
@@ -929,7 +932,7 @@ fn sensitive_correction_requires_retention_and_preserves_user_evidence() {
         .expect("reviewed sensitive memory should activate");
     assert_eq!(
         store
-            .purge_expired_memory_items(now.saturating_add(60_001))
+            .purge_expired_memory_items(retention_expires_at_unix_ms.saturating_add(1))
             .expect("retention expiry should reconcile"),
         1
     );
