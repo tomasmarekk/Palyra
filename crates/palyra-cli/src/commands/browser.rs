@@ -1652,7 +1652,7 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
                     envelope.principal,
                     envelope.downloads_enabled,
                     envelope.persistence_enabled,
-                    redacted_browser_identifier_text(envelope.profile_id.as_deref(), "profile")
+                    browser_resource_handle_text(envelope.profile_id.as_deref())
                 ),
                 "failed to encode browser session create output",
                 json,
@@ -1706,9 +1706,8 @@ async fn run_browser_session_command(command: BrowserSessionCommand) -> Result<(
                 value.pointer("/summary/tab_count").and_then(Value::as_u64).unwrap_or(0),
                 value.pointer("/summary/allow_private_targets").and_then(Value::as_bool).unwrap_or(false),
                 value.pointer("/summary/downloads_enabled").and_then(Value::as_bool).unwrap_or(false),
-                redacted_browser_identifier_text(
-                    value.pointer("/summary/profile_id").and_then(Value::as_str),
-                    "profile"
+                browser_resource_handle_text(
+                    value.pointer("/summary/profile_id").and_then(Value::as_str)
                 ),
             );
             emit_browser_value(&value, text, "failed to encode browser session show output")
@@ -1816,14 +1815,14 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 "browser.profiles.list principal={} count={} active_profile_id={}",
                 envelope.principal,
                 envelope.profiles.len(),
-                redacted_browser_identifier_text(envelope.active_profile_id.as_deref(), "profile"),
+                browser_resource_handle_text(envelope.active_profile_id.as_deref()),
             );
             for profile in &envelope.profiles {
                 text.push('\n');
                 text.push_str(
                     format!(
                         "profile id={} name={} private={} persistence={} active={}",
-                        redacted_browser_identifier_text(profile.profile_id.as_deref(), "profile"),
+                        browser_resource_handle_text(profile.profile_id.as_deref()),
                         profile.name,
                         profile.private_profile,
                         profile.persistence_enabled,
@@ -1864,10 +1863,7 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.create profile_id={} name={} private={} active={}",
-                    redacted_browser_identifier_text(
-                        envelope.profile.profile_id.as_deref(),
-                        "profile"
-                    ),
+                    browser_resource_handle_text(envelope.profile.profile_id.as_deref()),
                     envelope.profile.name,
                     envelope.profile.private_profile,
                     envelope.profile.active,
@@ -1891,10 +1887,7 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.rename profile_id={} name={}",
-                    redacted_browser_identifier_text(
-                        envelope.profile.profile_id.as_deref(),
-                        "profile"
-                    ),
+                    browser_resource_handle_text(envelope.profile.profile_id.as_deref()),
                     envelope.profile.name,
                 ),
                 "failed to encode browser profile rename output",
@@ -1915,12 +1908,9 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.delete profile_id={} deleted={} active_profile_id={}",
-                    redacted_browser_identifier_text(Some(envelope.profile_id.as_str()), "profile"),
+                    browser_resource_handle_text(Some(envelope.profile_id.as_str())),
                     envelope.deleted,
-                    redacted_browser_identifier_text(
-                        envelope.active_profile_id.as_deref(),
-                        "profile"
-                    ),
+                    browser_resource_handle_text(envelope.active_profile_id.as_deref()),
                 ),
                 "failed to encode browser profile delete output",
             )
@@ -1940,10 +1930,7 @@ async fn run_browser_profiles_command(command: BrowserProfilesCommand) -> Result
                 &value,
                 format!(
                     "browser.profiles.activate profile_id={} name={} active={}",
-                    redacted_browser_identifier_text(
-                        envelope.profile.profile_id.as_deref(),
-                        "profile"
-                    ),
+                    browser_resource_handle_text(envelope.profile.profile_id.as_deref()),
                     envelope.profile.name,
                     envelope.profile.active,
                 ),
@@ -1969,14 +1956,14 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
                 "browser.tabs.list session_id={} count={} active_tab_id={}",
                 browser_session_handle_text(Some(session_id.as_str())),
                 envelope.tabs.len(),
-                redacted_browser_identifier_text(envelope.active_tab_id.as_deref(), "tab"),
+                browser_resource_handle_text(envelope.active_tab_id.as_deref()),
             );
             for tab in &envelope.tabs {
                 text.push('\n');
                 text.push_str(
                     format!(
                         "tab id={} active={} title={} url={}",
-                        redacted_browser_identifier_text(tab.tab_id.as_deref(), "tab"),
+                        browser_resource_handle_text(tab.tab_id.as_deref()),
                         tab.active,
                         empty_as_dash(tab.title.as_str()),
                         empty_as_dash(tab.url.as_str()),
@@ -2024,7 +2011,7 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
                             .tab
                             .as_ref()
                             .and_then(|tab| tab.tab_id.as_deref())
-                            .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
+                            .map(|value| browser_resource_handle_text(Some(value)))
                             .unwrap_or_else(|| "-".to_owned()),
                         envelope.success,
                         envelope.status_code,
@@ -2060,7 +2047,7 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
                             .active_tab
                             .as_ref()
                             .and_then(|tab| tab.tab_id.as_deref())
-                            .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
+                            .map(|value| browser_resource_handle_text(Some(value)))
                             .unwrap_or_else(|| "-".to_owned()),
                         envelope.success,
                     ),
@@ -2090,13 +2077,13 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
                     format!(
                         "browser.tabs.close session_id={} closed_tab_id={} tabs_remaining={} active_tab_id={}",
                         browser_session_handle_text(Some(session_id.as_str())),
-                        redacted_browser_identifier_text(envelope.closed_tab_id.as_deref(), "tab"),
+                        browser_resource_handle_text(envelope.closed_tab_id.as_deref()),
                         envelope.tabs_remaining,
                         envelope
                             .active_tab
                             .as_ref()
                             .and_then(|tab| tab.tab_id.as_deref())
-                            .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
+                            .map(|value| browser_resource_handle_text(Some(value)))
                             .unwrap_or_else(|| "-".to_owned()),
                     ),
                     "failed to encode browser tab close output",
@@ -3112,7 +3099,7 @@ async fn run_browser_downloads(
         text.push_str(
             format!(
                 "artifact id={} file={} size_bytes={} quarantined={} sha256={}",
-                redacted_browser_identifier_text(artifact.artifact_id.as_deref(), "artifact"),
+                browser_resource_handle_text(artifact.artifact_id.as_deref()),
                 artifact.file_name,
                 artifact.size_bytes,
                 artifact.quarantined,
@@ -3180,7 +3167,7 @@ async fn run_browser_download_save(
         format!(
             "browser.downloads.save session_id={} artifact_id={} size_bytes={} output={}",
             browser_session_handle_text(Some(session_id.as_str())),
-            redacted_browser_identifier_text(Some(artifact_id.as_str()), "artifact"),
+            browser_resource_handle_text(Some(artifact_id.as_str())),
             response.content.len(),
             output_path.display(),
         ),
@@ -5048,11 +5035,12 @@ fn browser_identifier_scope(kind: &'static str, value: &str) -> String {
     format!("{kind}-{suffix}")
 }
 
-fn redacted_browser_identifier_text(value: Option<&str>, kind: &'static str) -> String {
-    value
-        .filter(|candidate| !candidate.trim().is_empty())
-        .map(|candidate| browser_identifier_scope(kind, candidate))
-        .unwrap_or_else(|| "-".to_owned())
+/// Returns a caller-reusable browser resource handle for text output.
+///
+/// These identifiers carry no authority by themselves; browser-service
+/// authentication and principal ownership remain the authorization boundary.
+fn browser_resource_handle_text(value: Option<&str>) -> String {
+    value.map(str::trim).filter(|candidate| !candidate.is_empty()).unwrap_or("-").to_owned()
 }
 
 fn browser_identifier_json_value(value: Option<&str>) -> Value {
@@ -5155,9 +5143,6 @@ fn quoted_browser_text_field(value: &str) -> String {
 fn browser_identifier_kind_for_key(key: &str) -> Option<&'static str> {
     match key {
         "runtime_session_id" => Some("session"),
-        "active_tab_id" | "tab_id" | "closed_tab_id" => Some("tab"),
-        "profile_id" | "active_profile_id" => Some("profile"),
-        "artifact_id" => Some("artifact"),
         "action_id" => Some("action"),
         _ => None,
     }
@@ -6114,18 +6099,27 @@ mod tests {
     }
 
     #[test]
-    fn browser_output_redaction_preserves_public_session_id() {
+    fn browser_output_redaction_preserves_caller_reusable_resource_handles() {
         let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
         let runtime_session_id = "session-b66347f61acd";
+        let tab_id = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let profile_id = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+        let artifact_id = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
         let mut value = json!({
             "session_id": session_id,
             "runtime_session_id": runtime_session_id,
-            "active_tab_id": "tab-secret-value",
+            "active_tab_id": tab_id,
+            "profile_id": profile_id,
+            "artifact_id": artifact_id,
+            "action_id": "internal-action-id",
         });
 
         redact_browser_output_value(&mut value, None);
 
         assert_eq!(value.get("session_id").and_then(Value::as_str), Some(session_id));
+        assert_eq!(value.get("active_tab_id").and_then(Value::as_str), Some(tab_id));
+        assert_eq!(value.get("profile_id").and_then(Value::as_str), Some(profile_id));
+        assert_eq!(value.get("artifact_id").and_then(Value::as_str), Some(artifact_id));
         assert!(
             value
                 .get("runtime_session_id")
@@ -6135,10 +6129,10 @@ mod tests {
         );
         assert!(
             value
-                .get("active_tab_id")
+                .get("action_id")
                 .and_then(Value::as_str)
-                .is_some_and(|value| value.starts_with("tab-")),
-            "tab id should stay redacted: {value}"
+                .is_some_and(|value| value.starts_with("action-")),
+            "internal action id should stay redacted: {value}"
         );
     }
 
