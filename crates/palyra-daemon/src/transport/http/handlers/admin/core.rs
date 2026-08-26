@@ -183,7 +183,8 @@ pub(crate) async fn admin_status_handler(
         "confirmation_required": startup_recovery_actions
             .iter()
             .filter(|action| action.actuation_kind
-                == crate::journal::StartupRecoveryActuationKind::ConfirmationRequired)
+                == crate::journal::StartupRecoveryActuationKind::ConfirmationRequired
+                && action.resolution.is_none())
             .count(),
         "recent": startup_recovery_actions
             .iter()
@@ -191,6 +192,7 @@ pub(crate) async fn admin_status_handler(
                 "decision": action.decision,
                 "reason_code": action.reason_code,
                 "actuation_kind": action.actuation_kind,
+                "resolution": action.resolution,
                 "created_at_unix_ms": action.created_at_unix_ms,
             }))
             .collect::<Vec<_>>(),

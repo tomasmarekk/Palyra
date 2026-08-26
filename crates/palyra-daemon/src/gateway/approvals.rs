@@ -109,6 +109,9 @@ pub(crate) fn approval_subject_type_to_proto(value: ApprovalSubjectType) -> i32 
             gateway_v1::ApprovalSubjectType::NodeCapability as i32
         }
         ApprovalSubjectType::DevicePairing => gateway_v1::ApprovalSubjectType::DevicePairing as i32,
+        ApprovalSubjectType::StartupRecovery => {
+            gateway_v1::ApprovalSubjectType::StartupRecovery as i32
+        }
     }
 }
 
@@ -127,6 +130,9 @@ pub(crate) fn approval_subject_type_from_proto(value: i32) -> Option<ApprovalSub
             Some(ApprovalSubjectType::NodeCapability)
         }
         gateway_v1::ApprovalSubjectType::DevicePairing => Some(ApprovalSubjectType::DevicePairing),
+        gateway_v1::ApprovalSubjectType::StartupRecovery => {
+            Some(ApprovalSubjectType::StartupRecovery)
+        }
     }
 }
 

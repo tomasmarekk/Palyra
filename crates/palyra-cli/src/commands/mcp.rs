@@ -2606,8 +2606,11 @@ fn approval_subject_type_filter_arg(args: &Map<String, Value>, key: &str) -> Res
         Some("devicepairing") | Some("device_pairing") => {
             gateway_v1::ApprovalSubjectType::DevicePairing as i32
         }
+        Some("startuprecovery") | Some("startup_recovery") => {
+            gateway_v1::ApprovalSubjectType::StartupRecovery as i32
+        }
         Some(other) => anyhow::bail!(
-            "unsupported approval subject type `{other}`; expected tool, channel_send, secret_access, browser_action, node_capability, or device_pairing"
+            "unsupported approval subject type `{other}`; expected tool, channel_send, secret_access, browser_action, node_capability, device_pairing, or startup_recovery"
         ),
     })
 }

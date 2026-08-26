@@ -40,8 +40,8 @@ use crate::{
     journal::{
         MemorySearchHit, MemorySearchRequest, OrchestratorCheckpointRecord,
         OrchestratorCompactionArtifactRecord, OrchestratorSessionResolveRequest,
-        OrchestratorSessionTranscriptRecord, RetrievalBranchDiagnostics, WorkspaceSearchHit,
-        WorkspaceSearchRequest,
+        OrchestratorSessionTranscriptRecord, RetrievalBranchDiagnostics, WorkspaceScoreBreakdown,
+        WorkspaceSearchHit, WorkspaceSearchRequest,
     },
     retrieval::{
         checkpoint_source_quality as retrieval_checkpoint_source_quality,
@@ -831,7 +831,18 @@ async fn execute_recall(
                     include_quarantined: request.include_workspace_quarantined,
                 })
                 .await?;
-            (outcome.hits, vec![outcome.diagnostics])
+            let mut hits = outcome.hits;
+            let exact_project_memory_missing = exact_project_memory_path(request)
+                .is_some_and(|path| !hits.iter().any(|hit| hit.document.path == path));
+            if exact_project_memory_missing {
+                if let Some(hit) =
+                    load_exact_project_memory_fallback(runtime_state, context, request).await?
+                {
+                    hits.insert(0, hit);
+                    hits.truncate(request.workspace_top_k);
+                }
+            }
+            (hits, vec![outcome.diagnostics])
         } else {
             (Vec::new(), Vec::new())
         };
@@ -957,6 +968,60 @@ async fn execute_recall(
     })
 }
 
+async fn load_exact_project_memory_fallback(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    request: &RecallRequest,
+) -> Result<Option<WorkspaceSearchHit>, Status> {
+    const EXACT_PROJECT_MEMORY_CONTEXT_SCORE: f64 = 0.25;
+
+    if request.min_score > EXACT_PROJECT_MEMORY_CONTEXT_SCORE {
+        return Ok(None);
+    }
+    let Some(path) = exact_project_memory_path(request) else {
+        return Ok(None);
+    };
+    let document = runtime_state
+        .workspace_document_by_path(
+            context.principal.clone(),
+            request.channel.clone().or_else(|| context.channel.clone()),
+            request.agent_id.clone(),
+            path,
+            false,
+        )
+        .await?;
+    let Some(document) = document.filter(|document| {
+        request.include_workspace_quarantined || document.risk_state != "quarantined"
+    }) else {
+        return Ok(None);
+    };
+    let snippet = truncate_console_text(document.content_text.as_str(), 512);
+    Ok(Some(WorkspaceSearchHit {
+        version: document.latest_version,
+        chunk_index: 0,
+        chunk_count: 1,
+        score: EXACT_PROJECT_MEMORY_CONTEXT_SCORE,
+        reason: "exact_project_memory_context_fallback".to_owned(),
+        breakdown: WorkspaceScoreBreakdown {
+            lexical_score: 0.0,
+            vector_score: 0.0,
+            recency_score: 1.0,
+            source_quality_score: 1.0,
+            final_score: EXACT_PROJECT_MEMORY_CONTEXT_SCORE,
+        },
+        snippet,
+        document,
+    }))
+}
+
+fn exact_project_memory_path(request: &RecallRequest) -> Option<String> {
+    let prefix = request.workspace_prefix.as_deref()?.trim_end_matches('/');
+    if !prefix.starts_with("projects/") || prefix.ends_with(".md") {
+        return None;
+    }
+    Some(format!("{prefix}/MEMORY.md"))
+}
+
 /// Re-fetches the hits named by an explicit selection against live state.
 ///
 /// Searches over-fetch (4x the selected id count, clamped) so previously
@@ -1027,6 +1092,19 @@ async fn build_selection_context(
             .await?;
         workspace_hits =
             select_workspace_hits(candidate_hits, selection.workspace_document_ids.as_slice());
+        if workspace_hits.is_empty() {
+            if let Some(hit) =
+                load_exact_project_memory_fallback(runtime_state, context, request).await?
+            {
+                if selection
+                    .workspace_document_ids
+                    .iter()
+                    .any(|document_id| document_id == &hit.document.document_id)
+                {
+                    workspace_hits.push(hit);
+                }
+            }
+        }
         // Stamp last_recalled_at on the documents that actually materialized
         // so workspace usage tracking reflects explicit recalls.
         let recalled_at_unix_ms = current_unix_ms();

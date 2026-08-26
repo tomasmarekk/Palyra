@@ -7188,7 +7188,7 @@ mod tests {
         assert!(config.toolset_profiles.is_empty(), "toolset profiles must default empty");
         assert!(config.extra_tools.is_empty(), "extra tool grants must default empty");
         assert!(config.disabled_tools.is_empty(), "disabled tool list must default empty");
-        assert_eq!(config.catalog_exposure_mode, ToolCatalogExposureMode::Direct);
+        assert_eq!(config.catalog_exposure_mode, ToolCatalogExposureMode::Compact);
         assert_eq!(config.compact_tool_threshold, 16);
         assert_eq!(config.max_calls_per_run, 0);
         assert_eq!(config.execution_timeout_ms, 750);

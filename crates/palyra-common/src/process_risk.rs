@@ -1,7 +1,7 @@
-//! Advisory risk classification for `palyra.process.run` command payloads.
+//! Risk classification for `palyra.process.run` command payloads.
 //!
 //! This module does not enforce sandbox or path policy. It describes host-wide side effects
-//! before/after execution so tool outputs and diagnostics can surface blast radius.
+//! before/after execution so tool outputs and approval mediation can surface blast radius.
 
 use std::{
     collections::BTreeSet,
@@ -140,13 +140,13 @@ pub struct TargetRuntimeBoundary {
 pub struct ProcessRiskReport {
     /// Report schema version for downstream clients.
     pub schema_version: u8,
-    /// Enforcement posture; currently always `advisory_only`.
+    /// Enforcement posture selected from the detected risk classes.
     pub policy: String,
-    /// True because the classifier must not block execution.
+    /// True because approval mediation, rather than this classifier, controls execution.
     pub execution_allowed: bool,
-    /// False because the classifier is visibility-only, not a deny gate.
+    /// False because this report requests approval but does not itself make the decision.
     pub blocks_execution: bool,
-    /// False because Task 05 must work out of the box without user approval.
+    /// True only for destructive filesystem operations that require explicit user mediation.
     pub requires_user_approval: bool,
     /// Highest severity across all findings, or `Low` when none were detected.
     pub highest_severity: ProcessRiskSeverity,
@@ -174,7 +174,7 @@ pub struct ProcessRiskContext<'a> {
     pub resolved_cwd: Option<&'a Path>,
 }
 
-/// Classify advisory process risks without denying execution.
+/// Classify process risks without directly denying execution.
 #[must_use]
 pub fn classify_process_run(
     input: &ProcessRunnerToolInput,
@@ -188,17 +188,25 @@ pub fn classify_process_run(
     classify_docker(&signature, &mut findings);
     classify_credentials(input, &signature, &mut findings);
     classify_system_service_mutation(&signature, &mut findings);
-    classify_destructive_filesystem_operation(&signature, &mut findings);
+    classify_destructive_filesystem_operation(input, context, &signature, &mut findings);
     classify_target_runtime_mismatch(&signature, target_runtime.as_ref(), &mut findings);
 
     let highest_severity =
         findings.iter().map(|finding| finding.severity).max().unwrap_or(ProcessRiskSeverity::Low);
+    let requires_user_approval = findings
+        .iter()
+        .any(|finding| finding.risk_class == ProcessRiskClass::DestructiveFilesystemOperation);
     ProcessRiskReport {
         schema_version: 1,
-        policy: "advisory_only".to_owned(),
+        policy: if requires_user_approval {
+            "approval_required_for_destructive_operations"
+        } else {
+            "advisory_only"
+        }
+        .to_owned(),
         execution_allowed: true,
         blocks_execution: false,
-        requires_user_approval: false,
+        requires_user_approval,
         highest_severity,
         target_runtime,
         findings,
@@ -376,16 +384,28 @@ fn classify_system_service_mutation(
 }
 
 fn classify_destructive_filesystem_operation(
+    input: &ProcessRunnerToolInput,
+    context: ProcessRiskContext<'_>,
     signature: &CommandSignature,
     findings: &mut Vec<ProcessRiskFinding>,
 ) {
-    let Some(target) = signature.destructive_filesystem_target() else {
+    let direct_target = signature.destructive_filesystem_target();
+    let destructive_script = destructive_interpreter_script(input, context);
+    let Some(target) = direct_target
+        .clone()
+        .or_else(|| destructive_script.as_ref().map(|script| script.target.clone()))
+    else {
         return;
     };
     findings.push(ProcessRiskFinding {
         risk_class: ProcessRiskClass::DestructiveFilesystemOperation,
         severity: ProcessRiskSeverity::High,
-        message: "Command performs a recursive or forceful filesystem deletion".to_owned(),
+        message: if direct_target.is_some() {
+            "Command performs a recursive or forceful filesystem deletion"
+        } else {
+            "Interpreter script contains a recursive filesystem deletion operation"
+        }
+        .to_owned(),
         detected_manager: None,
         target: Some(target),
         safer_default: Some(
@@ -394,12 +414,61 @@ fn classify_destructive_filesystem_operation(
         cleanup_hint: Some(
             "capture the exact deletion target and operator intent before cleanup".to_owned(),
         ),
-        affected_paths: Vec::new(),
+        affected_paths: destructive_script.map(|script| vec![script.path]).unwrap_or_default(),
         created_paths: Vec::new(),
         cleanup_commands: Vec::new(),
         host_ports: Vec::new(),
         exported_material: false,
     });
+}
+
+struct DestructiveInterpreterScript {
+    path: String,
+    target: String,
+}
+
+fn destructive_interpreter_script(
+    input: &ProcessRunnerToolInput,
+    context: ProcessRiskContext<'_>,
+) -> Option<DestructiveInterpreterScript> {
+    let command = executable_name(input.command.as_str());
+    if !is_python_command(command.as_str())
+        && !matches!(command.as_str(), "node" | "nodejs" | "pwsh" | "powershell")
+    {
+        return None;
+    }
+    let script_arg = input.args.iter().find(|arg| {
+        let arg = arg.trim();
+        !arg.is_empty() && !arg.starts_with('-')
+    })?;
+    let cwd = context.resolved_cwd.or(context.workspace_root)?;
+    let candidate = {
+        let path = Path::new(script_arg);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        }
+    };
+    let canonical_script = candidate.canonicalize().ok()?;
+    let canonical_workspace = context.workspace_root.and_then(|root| root.canonicalize().ok());
+    if canonical_workspace.as_ref().is_some_and(|root| !canonical_script.starts_with(root)) {
+        return None;
+    }
+    let content = read_bounded_process_risk_metadata(canonical_script.as_path())?;
+    let normalized = content.to_ascii_lowercase();
+    let destructive = normalized.contains("shutil.rmtree(")
+        || normalized.contains("os.removedirs(")
+        || ((normalized.contains("fs.rm(") || normalized.contains("fs.rmsync("))
+            && normalized.contains("recursive"))
+        || (normalized.contains("remove-item") && normalized.contains("-recurse"));
+    destructive.then(|| DestructiveInterpreterScript {
+        path: relative_runtime_source(
+            canonical_workspace.as_deref().unwrap_or(cwd),
+            canonical_script.as_path(),
+        ),
+        target: "interpreter_script_recursive_delete".to_owned(),
+    })
 }
 
 fn classify_target_runtime_mismatch(
@@ -770,6 +839,26 @@ impl CommandSignature {
             {
                 first_non_flag_arg(self.args_original.as_slice()).map(|target| target.to_owned())
             }
+            "git"
+                if self.args.first().is_some_and(|arg| arg == "clean")
+                    && git_clean_flag_enabled(self.args.as_slice(), 'f', "--force")
+                    && !git_clean_flag_enabled(self.args.as_slice(), 'n', "--dry-run") =>
+            {
+                Some(
+                    self.args_original
+                        .iter()
+                        .skip_while(|arg| arg.as_str() != "--")
+                        .skip(1)
+                        .filter(|arg| !arg.trim().is_empty())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(",")
+                        .trim()
+                        .to_owned(),
+                )
+                .filter(|target| !target.is_empty())
+                .or_else(|| Some("git_worktree_untracked_files".to_owned()))
+            }
             _ if self.shell_text_contains_any(&["rm -rf", "rm -fr", "remove-item"]) => {
                 Some("shell_recursive_delete".to_owned())
             }
@@ -979,6 +1068,15 @@ fn shell_payload(command_name: &str, args: &[String]) -> Option<String> {
         .map(|window| window[1].to_ascii_lowercase())
 }
 
+fn git_clean_flag_enabled(args: &[String], short_flag: char, long_flag: &str) -> bool {
+    args.iter().skip(1).any(|arg| {
+        arg == long_flag
+            || (arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg.chars().skip(1).any(|flag| flag == short_flag))
+    })
+}
+
 fn first_non_flag_arg(args: &[String]) -> Option<&str> {
     args.iter().find(|arg| !arg.starts_with('-')).map(String::as_str)
 }
@@ -1099,6 +1197,81 @@ mod tests {
 
         assert!(has_class(&report, ProcessRiskClass::CredentialMaterialExport));
         assert!(has_class(&report, ProcessRiskClass::CredentialNamespaceMutation));
+    }
+
+    #[test]
+    fn git_clean_force_requires_user_approval() {
+        let report = classify_process_run(
+            &input("git", &["clean", "-ffd", "-x", "--", "generated", "node_modules"]),
+            ProcessRiskContext::default(),
+        );
+
+        assert!(has_class(&report, ProcessRiskClass::DestructiveFilesystemOperation));
+        assert!(report.requires_user_approval);
+        assert_eq!(report.policy, "approval_required_for_destructive_operations");
+        assert!(!report.blocks_execution);
+    }
+
+    #[test]
+    fn git_clean_long_force_requires_user_approval() {
+        let report = classify_process_run(
+            &input("git", &["clean", "--force", "-d", "--", "generated"]),
+            ProcessRiskContext::default(),
+        );
+
+        assert!(report.requires_user_approval);
+        assert!(has_class(&report, ProcessRiskClass::DestructiveFilesystemOperation));
+    }
+
+    #[test]
+    fn git_clean_dry_run_remains_approval_free() {
+        let report =
+            classify_process_run(&input("git", &["clean", "-nfdx"]), ProcessRiskContext::default());
+
+        assert!(!report.requires_user_approval);
+        assert!(!has_class(&report, ProcessRiskClass::DestructiveFilesystemOperation));
+    }
+
+    #[test]
+    fn recursive_delete_in_workspace_script_requires_user_approval() {
+        let workspace = tempfile::tempdir().expect("temp workspace should be created");
+        let script = workspace.path().join("cleanup.py");
+        fs::write(script.as_path(), b"import shutil\nshutil.rmtree('generated')\n")
+            .expect("cleanup script should be written");
+
+        let report = classify_process_run(
+            &input("python", &["cleanup.py"]),
+            ProcessRiskContext {
+                workspace_root: Some(workspace.path()),
+                resolved_cwd: Some(workspace.path()),
+            },
+        );
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.risk_class == ProcessRiskClass::DestructiveFilesystemOperation)
+            .expect("recursive cleanup script should be classified");
+        assert!(report.requires_user_approval);
+        assert_eq!(finding.affected_paths, vec!["cleanup.py"]);
+    }
+
+    #[test]
+    fn ordinary_workspace_script_remains_approval_free() {
+        let workspace = tempfile::tempdir().expect("temp workspace should be created");
+        fs::write(workspace.path().join("verify.py"), b"print('ok')\n")
+            .expect("verification script should be written");
+
+        let report = classify_process_run(
+            &input("python", &["verify.py"]),
+            ProcessRiskContext {
+                workspace_root: Some(workspace.path()),
+                resolved_cwd: Some(workspace.path()),
+            },
+        );
+
+        assert!(!report.requires_user_approval);
+        assert!(!has_class(&report, ProcessRiskClass::DestructiveFilesystemOperation));
     }
 
     #[test]

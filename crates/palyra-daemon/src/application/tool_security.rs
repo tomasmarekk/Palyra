@@ -35,6 +35,7 @@ use crate::{
     },
     gateway::{
         current_unix_ms, GatewayRuntimeState, ToolApprovalOutcome, ToolSkillContext,
+        PROCESS_RUNNER_ALIAS_TOOL_NAME, PROCESS_RUNNER_TOOL_NAME,
         SKILL_EXECUTION_DENY_REASON_PREFIX,
     },
     journal::{JournalAppendRequest, SkillExecutionStatus},
@@ -592,17 +593,22 @@ pub(crate) async fn evaluate_tool_proposal_security(
     if skill_gate_decision.is_none() {
         skill_gate_decision = evaluate_backend_capability_gate(tool_name, &backend_selection);
     }
-    // Approval is an explicit safe-mode or backend decision. Tool arguments
-    // remain subject to validation, policy, capability, sandbox, and runtime
-    // locks, but do not silently enable interactive approval on a default
-    // installation.
+    let destructive_process_requires_approval =
+        matches!(tool_name, PROCESS_RUNNER_TOOL_NAME | PROCESS_RUNNER_ALIAS_TOOL_NAME)
+            && crate::sandbox_runner::process_runner_input_requires_user_approval(
+                &runtime_state.config.tool_call.process_runner,
+                input_json,
+            );
+    // Ordinary commands remain approval-free by default. Destructive deletion is the narrow
+    // exception because a caller-selected deny mode must mediate it before any process starts.
     let proposal_approval_required = skill_gate_decision
         .as_ref()
         .map(|decision| {
             decision.allowed && effective_posture.effective_state == ToolPostureState::AskEachTime
         })
         .unwrap_or(effective_posture.effective_state == ToolPostureState::AskEachTime)
-        || backend_selection.resolution.approval_required;
+        || backend_selection.resolution.approval_required
+        || destructive_process_requires_approval;
     let approval_subject_id =
         build_tool_approval_subject_id(tool_name, skill_context.as_ref(), input_json);
     ToolProposalSecurityEvaluation {

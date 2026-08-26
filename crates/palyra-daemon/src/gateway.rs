@@ -1559,9 +1559,17 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
     } else if matches!(tool_name, PROCESS_STOP_TOOL_NAME | PROCESS_STATUS_TOOL_NAME) {
         let config =
             process_runner_tool_config_for_session(runtime_state, context, input_json).await;
+        let mut retained_status_process = None;
         if config.process_runner.enabled {
             if let Some(pid) = process_lifecycle_pid_from_tool_input(input_json) {
-                if !process_lifecycle_pid_is_run_owned(runtime_state, context.run_id, pid) {
+                let owned = if tool_name == PROCESS_STATUS_TOOL_NAME {
+                    retained_status_process =
+                        runtime_state.run_background_process_history(context.run_id, pid);
+                    retained_status_process.is_some()
+                } else {
+                    process_lifecycle_pid_is_run_owned(runtime_state, context.run_id, pid)
+                };
+                if !owned {
                     return process_lifecycle_unowned_pid_outcome(
                         &config,
                         proposal_id,
@@ -1571,6 +1579,16 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
                     );
                 }
             }
+        }
+        if let Some(process) = retained_status_process {
+            return execute_exact_process_status_tool(
+                &config,
+                proposal_id,
+                input_json,
+                process.ownership_root_pid(),
+                process.lease.provenance,
+            )
+            .await;
         }
         let outcome = execute_tool_call(&config, proposal_id, tool_name, input_json).await;
         if tool_name == PROCESS_STOP_TOOL_NAME && outcome.success {
@@ -2752,9 +2770,10 @@ fn committed_background_process_outcome_matches(
     outcome: &ToolExecutionOutcome,
 ) -> Result<(), Status> {
     if !outcome.success {
-        return Err(Status::failed_precondition(
-            "background process runner failed after durable ownership registration",
-        ));
+        return Err(Status::failed_precondition(format!(
+            "background process runner failed after durable ownership registration: {}",
+            truncate_with_ellipsis(outcome.error.clone(), 1_024)
+        )));
     }
     let payload = serde_json::from_slice::<Value>(outcome.output_json.as_slice()).map_err(|error| {
         Status::failed_precondition(format!(
@@ -3228,23 +3247,19 @@ fn execute_process_list_tool(
         );
     }
     let processes = runtime_state
-        .list_run_background_processes(context.run_id)
+        .list_run_background_process_history(context.run_id)
         .into_iter()
         .map(|process| {
             let pid = process.ownership_root_pid();
-            let disposition = crate::sandbox_runner::verify_background_process_provenance(
+            let status = crate::sandbox_runner::background_process_status_by_pid_exact(
                 pid,
                 &process.lease.provenance,
-            );
-            let status = if process.lease.authorizes(disposition, current_unix_ms()) {
-                crate::sandbox_runner::background_process_runtime_status(pid)
+            )
+            .map_err(|error| error.message)
+            .and_then(|status| {
+                serde_json::from_slice::<Value>(status.output_json.as_slice())
                     .map_err(|error| error.to_string())
-            } else {
-                Err(format!(
-                    "runtime process lease did not authorize status: {}",
-                    disposition.as_str()
-                ))
-            };
+            });
             background_process_list_entry(pid, status)
         })
         .collect::<Vec<_>>();
@@ -3269,6 +3284,37 @@ fn execute_process_list_tool(
         crate::sandbox_runner::process_runner_sandbox_enforcement_label(
             &runtime_state.config.tool_call.process_runner,
         ),
+    )
+}
+
+async fn execute_exact_process_status_tool(
+    config: &ToolCallConfig,
+    proposal_id: &str,
+    input_json: &[u8],
+    pid: u32,
+    expected_provenance: ProcessProvenance,
+) -> ToolExecutionOutcome {
+    let status = tokio::task::spawn_blocking(move || {
+        crate::sandbox_runner::background_process_status_by_pid_exact(pid, &expected_provenance)
+    })
+    .await;
+    let (success, output_json, error) = match status {
+        Ok(Ok(status)) => (true, status.output_json, String::new()),
+        Ok(Err(error)) => (false, b"{}".to_vec(), error.message),
+        Err(error) => {
+            (false, b"{}".to_vec(), format!("sandbox process status worker failed: {error}"))
+        }
+    };
+    build_tool_execution_outcome(
+        proposal_id,
+        PROCESS_STATUS_TOOL_NAME,
+        input_json,
+        success,
+        output_json,
+        error,
+        false,
+        crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+        crate::sandbox_runner::process_runner_sandbox_enforcement_label(&config.process_runner),
     )
 }
 
@@ -3512,27 +3558,21 @@ async fn record_process_keys_journal_event(
     }
 }
 
-fn background_process_list_entry(
-    pid: u32,
-    status: Result<crate::sandbox_runner::BackgroundProcessRuntimeStatus, String>,
-) -> Value {
-    let (alive, direct_pid_alive, process_tree_alive, tracked_process_count, status_error) =
-        match status {
-            Ok(status) => (
-                Some(status.alive()),
-                Some(status.direct_pid_alive()),
-                Some(status.process_tree_alive()),
-                status.tracked_process_count(),
-                None,
-            ),
-            Err(error) => (None, None, None, None, Some(error)),
-        };
+fn background_process_list_entry(pid: u32, status: Result<Value, String>) -> Value {
+    let (payload, status_error) =
+        status.map_or_else(|error| (Value::Null, Some(error)), |payload| (payload, None));
     json!({
         "pid": pid,
-        "alive": alive,
-        "direct_pid_alive": direct_pid_alive,
-        "process_tree_alive": process_tree_alive,
-        "tracked_process_count": tracked_process_count,
+        "alive": payload.get("alive").cloned().unwrap_or(Value::Null),
+        "direct_pid_alive": payload.get("direct_pid_alive").cloned().unwrap_or(Value::Null),
+        "process_tree_alive": payload.get("process_tree_alive").cloned().unwrap_or(Value::Null),
+        "tracked_process_count": payload.get("tracked_process_count").cloned().unwrap_or(Value::Null),
+        "completed": payload.get("completed").cloned().unwrap_or(Value::Null),
+        "process_state": payload.get("process_state").cloned().unwrap_or(Value::Null),
+        "completion_reason": payload.get("completion_reason").cloned().unwrap_or(Value::Null),
+        "process_exit_code": payload.get("process_exit_code").cloned().unwrap_or(Value::Null),
+        "completed_at_unix_ms": payload.get("completed_at_unix_ms").cloned().unwrap_or(Value::Null),
+        "terminal_frame": payload.get("terminal_frame").cloned().unwrap_or(Value::Null),
         "status_error": status_error,
         "readiness_note": "Process liveness is not an HTTP readiness check. For local servers, verify the exact 127.0.0.1 URL and port with an HTTP/browser probe before treating the server as ready.",
         "portable_stop_command": {
@@ -4377,6 +4417,7 @@ pub(crate) async fn cleanup_run_resources(
                 "failed to finalize metadata trace after empty run cleanup"
             );
         }
+        runtime_state.clear_run_background_process_history(run_id);
         return RunCleanupSummary {
             cleanup_warning: merge_cleanup_warnings(
                 managed_coding_warning,
@@ -4687,6 +4728,7 @@ pub(crate) async fn cleanup_run_resources(
             "failed to finalize metadata trace after run cleanup"
         );
     }
+    runtime_state.clear_run_background_process_history(run_id);
 
     info!(
         run_id,

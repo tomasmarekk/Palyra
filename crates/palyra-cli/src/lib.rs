@@ -5009,6 +5009,7 @@ fn approval_subject_type_to_text(value: i32) -> &'static str {
         gateway_v1::ApprovalSubjectType::BrowserAction => "browser_action",
         gateway_v1::ApprovalSubjectType::NodeCapability => "node_capability",
         gateway_v1::ApprovalSubjectType::DevicePairing => "device_pairing",
+        gateway_v1::ApprovalSubjectType::StartupRecovery => "startup_recovery",
         gateway_v1::ApprovalSubjectType::Unspecified => "unspecified",
     }
 }

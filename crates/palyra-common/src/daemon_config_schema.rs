@@ -293,6 +293,17 @@ pub const CONFIG_SCHEMA_ENTRIES: &[ConfigSchemaEntry] = &[
         description: "Tools removed from the effective tool catalog.",
     },
     ConfigSchemaEntry {
+        path: "tool_call.catalog_exposure_mode",
+        value_type: "enum(direct|compact|hybrid)",
+        default_value: Some("compact"),
+        env_vars: &["PALYRA_TOOL_CATALOG_EXPOSURE_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "tool_call",
+        description: "Provider-facing tool schema projection mode.",
+    },
+    ConfigSchemaEntry {
         path: "tool_call.max_calls_per_run",
         value_type: "u32",
         default_value: Some("0"),
@@ -682,7 +693,6 @@ pub fn known_config_env_vars() -> Vec<&'static str> {
         "PALYRA_HTTP_FETCH_CREDENTIAL_BINDINGS_JSON",
         "PALYRA_CHANNEL_DELIVERY_PIPELINE_MODE",
         "PALYRA_CHANNEL_ROUTER_GROUP_GUARDRAILS",
-        "PALYRA_TOOL_CATALOG_EXPOSURE_MODE",
         "PALYRA_TOOL_CATALOG_COMPACT_THRESHOLD",
         "PALYRA_TOOL_CALL_DENIED_TOOLS",
         "PALYRA_MINIMAX_API_KEY",
@@ -1763,6 +1773,20 @@ mod tests {
                 && entry.env_vars.contains(&"PALYRA_CONNECTOR_ALLOWED_CHANNELS")
         }));
         assert!(known_config_env_vars().contains(&"PALYRA_CONNECTOR_ALLOWED_CHANNELS"));
+    }
+
+    #[test]
+    fn tool_catalog_schema_tracks_the_compact_default() {
+        let entry = config_schema_entries()
+            .iter()
+            .find(|entry| entry.path == "tool_call.catalog_exposure_mode")
+            .expect("tool catalog exposure mode should have config metadata");
+
+        assert_eq!(entry.value_type, "enum(direct|compact|hybrid)");
+        assert_eq!(entry.default_value, Some("compact"));
+        assert_eq!(entry.env_vars, &["PALYRA_TOOL_CATALOG_EXPOSURE_MODE"]);
+        assert!(entry.restart_required);
+        assert!(known_config_env_vars().contains(&"PALYRA_TOOL_CATALOG_EXPOSURE_MODE"));
     }
 
     #[test]

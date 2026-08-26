@@ -283,6 +283,9 @@ pub(crate) enum RunStreamProviderRequestOutcome {
     TimedOut { reason: ProviderRequestTimeoutReason, message: String },
     /// The configured provider changed while this request was in flight.
     Superseded,
+    /// An accepted interrupt redirect superseded this provider turn before
+    /// any response events or tool proposals could be applied.
+    RedirectQueued,
     /// Cancellation was observed and durable settlement selected this state.
     Terminal(RunLifecycleState),
 }
@@ -1626,6 +1629,8 @@ async fn execute_run_stream_provider_request(
                 return Ok(RunStreamProviderRequestOutcome::Terminal(effective_state));
             }
             provider_result = &mut provider_future => {
+                let redirect_queued =
+                    pending_interrupt_redirect_for_run(runtime_state, run_id).await?;
                 dispatch_observer_hook(
                     runtime_state,
                     run_id,
@@ -1635,12 +1640,22 @@ async fn execute_run_stream_provider_request(
                         "schema_version": 1,
                         "run_id": run_id,
                         "provider_request_sha256": provider_request_sha256.as_str(),
-                        "outcome": if provider_result.is_ok() { "completed" } else { "failed" },
+                        "outcome": if redirect_queued {
+                            "redirected"
+                        } else if provider_result.is_ok() {
+                            "completed"
+                        } else {
+                            "failed"
+                        },
                         "duration_ms": duration_millis_u64(provider_started_at.elapsed()),
                         "redaction_level": "hash_only_provider_request",
                     }),
                 )
                 .await?;
+                if redirect_queued {
+                    let _ = harness_cancel_sender.send(true);
+                    return Ok(RunStreamProviderRequestOutcome::RedirectQueued);
+                }
                 return match provider_result {
                     Ok(response) => Ok(RunStreamProviderRequestOutcome::Completed {
                         response: Box::new(response),
@@ -1682,6 +1697,10 @@ async fn execute_run_stream_provider_request(
                     }
                     Ok(false) => {}
                     Err(error) => return Err(error),
+                }
+                if pending_interrupt_redirect_for_run(runtime_state, run_id).await? {
+                    let _ = harness_cancel_sender.send(true);
+                    return Ok(RunStreamProviderRequestOutcome::RedirectQueued);
                 }
             }
             _ = progress_heartbeat.tick() => {
@@ -2834,6 +2853,26 @@ fn revoke_inherited_tool_approvals_after_steering(
 
 fn queued_targets_active_run(queued: &OrchestratorQueuedInputRecord, run_id: &str) -> bool {
     queued.run_id == run_id || queued.origin_run_id.as_deref() == Some(run_id)
+}
+
+/// Checks the durable queue for an accepted interrupt that must preempt an
+/// in-flight provider response before its tool proposals can be applied.
+pub(crate) async fn pending_interrupt_redirect_for_run(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+) -> Result<bool, Status> {
+    let Some(snapshot) = runtime_state.orchestrator_run_status_snapshot(run_id.to_owned()).await?
+    else {
+        return Ok(false);
+    };
+    let queued_inputs = runtime_state.list_orchestrator_queued_inputs(snapshot.session_id).await?;
+    Ok(queued_inputs.iter().any(|queued| {
+        queued.state == QueuedInputState::Pending.as_str()
+            && queued_targets_active_run(queued, run_id)
+            && QueueMode::parse(queued.queue_mode.as_str()) == Some(QueueMode::Interrupt)
+            && QueuedInputDeliveryBoundary::parse(queued.delivery_boundary.as_str())
+                == Some(QueuedInputDeliveryBoundary::CancelThenNextTurn)
+    }))
 }
 
 fn queued_input_sort_key(queued: &OrchestratorQueuedInputRecord) -> (i64, i64) {
@@ -5752,6 +5791,44 @@ async fn process_run_stream_message_inner(
                     run_id.as_str(),
                     tape_seq,
                     "agent_loop.provider_request_superseded",
+                )
+                .await?;
+                continue;
+            }
+            Ok(RunStreamProviderRequestOutcome::RedirectQueued) => {
+                let attempt_outcome = provider_turn_recovery_state.record_failed_attempt(
+                    &attempt_plan,
+                    "redirected",
+                    "turn_control.redirect.provider_superseded",
+                );
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_ATTEMPT_OUTCOME_EVENT,
+                    attempt_outcome.tape_payload().to_string(),
+                )
+                .await?;
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    "turn_control.redirect.provider_superseded",
+                    json!({
+                        "schema_version": 1,
+                        "event": "turn_control.redirect.provider_superseded",
+                        "reason_code": "turn_control.redirect.provider_superseded",
+                        "run_id": run_id.as_str(),
+                    })
+                    .to_string(),
+                )
+                .await?;
+                send_agent_loop_progress_status(
+                    sender,
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    "turn_control.redirect.provider_superseded",
                 )
                 .await?;
                 continue;

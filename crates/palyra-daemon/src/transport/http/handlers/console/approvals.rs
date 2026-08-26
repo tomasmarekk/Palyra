@@ -282,8 +282,9 @@ fn parse_console_approval_subject_type(
         "browser_action" => Ok(Some(ApprovalSubjectType::BrowserAction)),
         "node_capability" => Ok(Some(ApprovalSubjectType::NodeCapability)),
         "device_pairing" => Ok(Some(ApprovalSubjectType::DevicePairing)),
+        "startup_recovery" => Ok(Some(ApprovalSubjectType::StartupRecovery)),
         _ => Err(runtime_status_response(tonic::Status::invalid_argument(
-            "subject_type must be one of tool|channel_send|secret_access|browser_action|node_capability|device_pairing",
+            "subject_type must be one of tool|channel_send|secret_access|browser_action|node_capability|device_pairing|startup_recovery",
         ))),
     }
 }

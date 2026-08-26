@@ -95,6 +95,7 @@ pub enum ApprovalSubjectTypeArg {
     BrowserAction,
     NodeCapability,
     DevicePairing,
+    StartupRecovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

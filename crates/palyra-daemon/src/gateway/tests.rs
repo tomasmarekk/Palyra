@@ -187,7 +187,10 @@ fn managed_coding_process_adapter_accepts_only_plain_foreground_requests() {
 }
 use crate::application::run_stream::{
     cancellation::transition_run_stream_to_cancelled,
-    orchestration::{finalize_run_stream_after_provider_response, RunStreamPostProviderOutcome},
+    orchestration::{
+        finalize_run_stream_after_provider_response, pending_interrupt_redirect_for_run,
+        RunStreamPostProviderOutcome,
+    },
     public_events::{
         public_runtime_event_from_run_stream_event, run_stream_public_event_id,
         PublicRunStreamEventContext,
@@ -218,7 +221,10 @@ use crate::application::{
         memory_auto_inject_tape_payload, prepare_model_provider_input,
         render_memory_augmented_prompt, MemoryPromptFailureMode, PrepareModelProviderInputRequest,
     },
-    recall::{default_recall_request, preview_recall},
+    recall::{
+        default_recall_request, materialize_explicit_recall_context,
+        parse_explicit_recall_selection, preview_recall,
+    },
     route_message::approval::resolve_route_tool_approval_outcome,
     route_message::response::parse_route_message_structured_output,
     semantic_memory::{
@@ -2412,6 +2418,12 @@ async fn redirect_control_preserves_active_run_tape_cursor() {
     assert_eq!(
         queued[0].delivery_boundary,
         QueuedInputDeliveryBoundary::CancelThenNextTurn.as_str()
+    );
+    assert!(
+        pending_interrupt_redirect_for_run(&state, run_id.as_str())
+            .await
+            .expect("provider interrupt probe should succeed"),
+        "an accepted redirect must be visible to the in-flight provider watchdog"
     );
     let after_redirect = state
         .orchestrator_run_status_snapshot(run_id.clone())
@@ -12472,11 +12484,14 @@ async fn cleanup_run_resources_returns_detached_background_warning() {
 fn process_list_entry_reports_runtime_status_details() {
     let payload = super::background_process_list_entry(
         4242,
-        Ok(crate::sandbox_runner::BackgroundProcessRuntimeStatus {
-            direct_pid_alive: false,
-            process_tree_alive: true,
-            tracked_process_count: Some(2),
-        }),
+        Ok(json!({
+            "alive": true,
+            "direct_pid_alive": false,
+            "process_tree_alive": true,
+            "tracked_process_count": 2,
+            "completed": false,
+            "process_state": "running",
+        })),
     );
 
     assert_eq!(payload.get("pid").and_then(Value::as_u64), Some(4242));
@@ -12484,6 +12499,7 @@ fn process_list_entry_reports_runtime_status_details() {
     assert_eq!(payload.get("direct_pid_alive").and_then(Value::as_bool), Some(false));
     assert_eq!(payload.get("process_tree_alive").and_then(Value::as_bool), Some(true));
     assert_eq!(payload.get("tracked_process_count").and_then(Value::as_u64), Some(2));
+    assert_eq!(payload.get("process_state").and_then(Value::as_str), Some("running"));
     assert_eq!(
         payload.pointer("/portable_stop_command/tool").and_then(Value::as_str),
         Some(super::PROCESS_STOP_TOOL_NAME)
@@ -18059,6 +18075,81 @@ async fn project_memory_defaults_to_launch_workspace_prefix() {
         !corrected_document.content_text.contains("Build target for this project is alpha."),
         "{}",
         corrected_document.content_text
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn project_memory_recall_survives_a_new_session_with_a_generic_query() {
+    let state = build_test_runtime_state(false);
+    let retain_context = routines_tool_test_context();
+    ensure_tool_context_session(&state, &retain_context);
+
+    let retain = execute_memory_retain_tool(
+        &state,
+        retain_context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FGA",
+        br#"{"content_text":"Use TypeScript, Vitest, and brief Czech reports.","scope":"project","workspace_prefix":"scenarios/S033","category":"preference","source":"manual","confidence":0.95}"#,
+    )
+    .await;
+    assert!(retain.success, "project retain should succeed: {}", retain.error);
+    let retain_payload = parse_tool_output_json(&retain);
+    assert_eq!(
+        retain_payload.pointer("/document/path").and_then(Value::as_str),
+        Some("projects/scenarios/S033/MEMORY.md")
+    );
+
+    let recall_context = super::ToolRuntimeExecutionContext {
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FGB",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FGC",
+        ..retain_context
+    };
+    ensure_tool_context_session(&state, &recall_context);
+    let recall = execute_memory_recall_tool(
+        &state,
+        recall_context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FGD",
+        br#"{"query":"utility","scope":"project","workspace_prefix":"scenarios/S033","memory_top_k":0,"workspace_top_k":4,"min_score":0.0}"#,
+    )
+    .await;
+    assert!(recall.success, "cross-session project recall should succeed: {}", recall.error);
+    let recall_payload = parse_tool_output_json(&recall);
+    assert_eq!(
+        recall_payload.pointer("/workspace_hits/0/document/path").and_then(Value::as_str),
+        Some("projects/scenarios/S033/MEMORY.md"),
+        "an exact project MEMORY.md should remain recallable when the new task has no lexical overlap: {recall_payload}"
+    );
+
+    let parameter_delta = recall_payload
+        .get("parameter_delta")
+        .expect("recall output should carry its materialization selection")
+        .to_string();
+    let selection = parse_explicit_recall_selection(Some(parameter_delta.as_str()))
+        .expect("recall parameter delta should parse");
+    let mut request = default_recall_request(
+        selection.query.clone(),
+        selection.session_id.clone(),
+        selection.channel.clone(),
+    );
+    request.agent_id = selection.agent_id.clone();
+    request.min_score = selection.min_score.unwrap_or(0.0);
+    request.workspace_prefix = selection.workspace_prefix.clone();
+    request.include_workspace_historical = selection.include_workspace_historical;
+    request.include_workspace_quarantined = selection.include_workspace_quarantined;
+    let materialized = materialize_explicit_recall_context(
+        &state,
+        &RequestContext {
+            principal: recall_context.principal.to_owned(),
+            device_id: recall_context.device_id.to_owned(),
+            channel: recall_context.channel.map(str::to_owned),
+        },
+        request,
+        &selection,
+    )
+    .await
+    .expect("selected project memory should re-materialize for provider input");
+    assert_eq!(
+        materialized.workspace_hits.first().map(|hit| hit.document.path.as_str()),
+        Some("projects/scenarios/S033/MEMORY.md")
     );
 }
 

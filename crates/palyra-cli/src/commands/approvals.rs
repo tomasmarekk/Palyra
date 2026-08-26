@@ -294,6 +294,9 @@ fn approval_subject_type_filter_to_proto(value: Option<ApprovalSubjectTypeArg>) 
         Some(ApprovalSubjectTypeArg::DevicePairing) => {
             gateway_v1::ApprovalSubjectType::DevicePairing as i32
         }
+        Some(ApprovalSubjectTypeArg::StartupRecovery) => {
+            gateway_v1::ApprovalSubjectType::StartupRecovery as i32
+        }
         None => gateway_v1::ApprovalSubjectType::Unspecified as i32,
     }
 }

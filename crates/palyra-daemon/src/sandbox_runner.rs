@@ -688,6 +688,48 @@ fn process_runner_accepts_host_path_fields(policy: &SandboxProcessRunnerPolicy) 
     !matches!(process_runner_effective_path_access_mode(policy), PathAccessMode::WorkspaceOnly)
 }
 
+/// Returns whether a valid process proposal describes a destructive filesystem operation.
+///
+/// Classification uses the same workspace and cwd resolution as execution. Invalid proposals
+/// return `false` because the process runner will reject them before spawning.
+pub(crate) fn process_runner_input_requires_user_approval(
+    policy: &SandboxProcessRunnerPolicy,
+    input_json: &[u8],
+) -> bool {
+    let Ok(input) = parse_process_runner_input(input_json) else {
+        return false;
+    };
+    let Ok(workspace_root) = canonical_workspace_root(policy.workspace_root.as_path()) else {
+        return false;
+    };
+    let path_access_mode = process_runner_effective_path_access_mode(policy);
+    let host_access_roots = process_runner_accepts_host_path_fields(policy).then(host_access_roots);
+    let host_access_path_env = process_runner_accepts_host_path_fields(policy)
+        .then(|| host_access_path_env_for_input(&input));
+    let working_directory = match path_access_mode {
+        PathAccessMode::ApprovedRoots => resolve_host_working_directory_with_roots(
+            workspace_root.as_path(),
+            input.cwd.as_deref(),
+            host_access_roots.as_ref().expect("host roots should be initialized").as_slice(),
+            host_access_path_env.as_ref().expect("host path env should be initialized"),
+        ),
+        PathAccessMode::WorkspaceOnly => {
+            resolve_working_directory(workspace_root.as_path(), input.cwd.as_deref())
+        }
+    };
+    let Ok(working_directory) = working_directory else {
+        return false;
+    };
+    classify_process_run(
+        &input,
+        ProcessRiskContext {
+            workspace_root: Some(workspace_root.as_path()),
+            resolved_cwd: Some(working_directory.as_path()),
+        },
+    )
+    .requires_user_approval
+}
+
 type ProcessRunnerInput = ProcessRunnerToolInput;
 
 /// Callback used by run-stream execution to publish foreground process progress.
@@ -1611,10 +1653,19 @@ struct RegisteredBackgroundProcess {
     target_pid: Option<u32>,
     stdin: Option<Arc<Mutex<BackgroundStdinState>>>,
     output_monitor: Option<BackgroundOutputMonitor>,
+    terminal: Option<BackgroundProcessTerminalState>,
     #[cfg(unix)]
     supervisor_control: Option<Arc<UnixProcessSupervisorControl>>,
     #[cfg(windows)]
     windows_job: Option<Arc<WindowsBackgroundJob>>,
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundProcessTerminalState {
+    process_state: &'static str,
+    completion_reason: &'static str,
+    exit_code: Option<i32>,
+    completed_at_unix_ms: i64,
 }
 
 #[derive(Debug)]
@@ -1642,6 +1693,8 @@ struct RegisteredBackgroundProcessSnapshot {
     lifetime_mode: BackgroundLifetimeMode,
     provenance: ProcessProvenance,
     identity: BackgroundProcessIdentity,
+    output_monitor: Option<BackgroundOutputMonitor>,
+    terminal: Option<BackgroundProcessTerminalState>,
 }
 
 /// Durable-safe ownership snapshot captured before a background process is acknowledged.
@@ -1830,6 +1883,7 @@ fn register_background_process_pid(
                     }))
                 }),
                 output_monitor: None,
+                terminal: None,
                 #[cfg(unix)]
                 supervisor_control,
                 #[cfg(windows)]
@@ -1861,6 +1915,8 @@ fn registered_background_process(
                     lifetime_mode: process.lifetime_mode,
                     provenance: process.provenance.clone(),
                     identity: background_process_identity(pid, process),
+                    output_monitor: process.output_monitor.clone(),
+                    terminal: process.terminal.clone(),
                 })
                 .ok_or_else(|| SandboxProcessRunError {
                     kind: SandboxProcessRunErrorKind::InvalidInput,
@@ -2605,8 +2661,45 @@ fn set_background_process_stopped(
         process.active = false;
         process.unix_cleanup_acknowledged |= unix_cleanup_acknowledged;
         process.stdin.take();
-        process.output_monitor.take();
+        process.terminal.get_or_insert_with(|| BackgroundProcessTerminalState {
+            process_state: "exited",
+            completion_reason: "process_tree_inactive",
+            exit_code: None,
+            completed_at_unix_ms: unix_time_ms(),
+        });
     });
+}
+
+fn record_background_process_terminal_state(
+    expected: &BackgroundProcessIdentity,
+    process_state: &'static str,
+    completion_reason: &'static str,
+    exit_code: Option<i32>,
+) {
+    let _ = compare_update_registered_background_process(expected, |process| {
+        process.active = false;
+        process.stdin.take();
+        process.terminal = Some(BackgroundProcessTerminalState {
+            process_state,
+            completion_reason,
+            exit_code,
+            completed_at_unix_ms: unix_time_ms(),
+        });
+    });
+}
+
+/// Releases bounded terminal diagnostics after the owning run has ended.
+pub(crate) fn release_background_process_history(pid: u32, expected: &ProcessProvenance) {
+    if let Ok(mut processes) = registered_background_processes().lock() {
+        let removable = processes.get(&pid).is_some_and(|process| {
+            !process.active
+                && !process.cleanup_authority_retained
+                && process.provenance == *expected
+        });
+        if removable {
+            processes.remove(&pid);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4118,7 +4211,7 @@ fn execute_builtin_process_command(
             return Ok(Some(builtin_stop_process_success(command, input.args.as_slice())?));
         }
         "palyra.process.status" | "palyra-process-status" => {
-            return Ok(Some(builtin_process_status_success(command, input.args.as_slice())?));
+            return Ok(Some(builtin_process_status_success(command, input.args.as_slice(), None)?));
         }
         _ => {}
     }
@@ -4380,6 +4473,12 @@ fn builtin_stop_process_success(
         }
         #[cfg(not(unix))]
         mark_background_process_stopped(&registration.identity);
+        record_background_process_terminal_state(
+            &registration.identity,
+            "stopped",
+            "explicit_stop",
+            None,
+        );
     }
     let stop_acknowledgement = after_status
         .filter(|status| !status.alive())
@@ -4417,9 +4516,18 @@ fn builtin_stop_process_success(
 fn builtin_process_status_success(
     command: &str,
     args: &[String],
+    expected_provenance: Option<&ProcessProvenance>,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     let pid = parse_builtin_pid_arg(command, args)?;
     let registration = registered_background_process(command, pid)?;
+    if expected_provenance.is_some_and(|expected| registration.provenance != *expected) {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.run builtin '{command}' rejected stale provenance for pid {pid}"
+            ),
+        });
+    }
     if registration.active {
         require_background_process_provenance(
             pid,
@@ -4428,6 +4536,14 @@ fn builtin_process_status_success(
         )?;
     }
     if !registration.active {
+        let terminal = registration.terminal.unwrap_or(BackgroundProcessTerminalState {
+            process_state: "exited",
+            completion_reason: "process_tree_inactive",
+            exit_code: None,
+            completed_at_unix_ms: unix_time_ms(),
+        });
+        let terminal_frame =
+            background_terminal_frame_snapshot(registration.output_monitor.as_ref());
         let output_json = serde_json::to_vec(&json!({
             "exit_code": 0,
             "stdout": format!("pid={pid} alive=false direct_pid_alive=false process_tree_alive=false\n"),
@@ -4438,6 +4554,12 @@ fn builtin_process_status_success(
             "stderr_redacted": false,
             "duration_ms": 0,
             "pid": pid,
+            "completed": true,
+            "process_state": terminal.process_state,
+            "completion_reason": terminal.completion_reason,
+            "process_exit_code": terminal.exit_code,
+            "completed_at_unix_ms": terminal.completed_at_unix_ms,
+            "terminal_frame": terminal_frame,
             "alive": false,
             "direct_pid_alive": false,
             "process_tree_alive": false,
@@ -4463,6 +4585,19 @@ fn builtin_process_status_success(
     if !alive {
         mark_background_process_stopped(&registration.identity);
     }
+    let terminal =
+        (!alive).then(|| registered_background_process(command, pid).ok()?.terminal).flatten();
+    let process_state = terminal
+        .as_ref()
+        .map_or(if alive { "running" } else { "exited" }, |state| state.process_state);
+    let completion_reason = terminal.as_ref().map(|state| state.completion_reason);
+    let process_exit_code = terminal.as_ref().and_then(|state| state.exit_code);
+    let completed_at_unix_ms = terminal.as_ref().map(|state| state.completed_at_unix_ms);
+    let terminal_frame = if alive {
+        Value::Null
+    } else {
+        background_terminal_frame_snapshot(registration.output_monitor.as_ref())
+    };
     let output_json = serde_json::to_vec(&json!({
         "exit_code": 0,
         "stdout": format!(
@@ -4477,6 +4612,12 @@ fn builtin_process_status_success(
         "stderr_redacted": false,
         "duration_ms": 0,
         "pid": pid,
+        "completed": !alive,
+        "process_state": process_state,
+        "completion_reason": completion_reason,
+        "process_exit_code": process_exit_code,
+        "completed_at_unix_ms": completed_at_unix_ms,
+        "terminal_frame": terminal_frame,
         "alive": alive,
         "direct_pid_alive": status.direct_pid_alive,
         "process_tree_alive": status.process_tree_alive,
@@ -4515,7 +4656,20 @@ pub(crate) fn background_process_status_by_pid(
     pid: u32,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     let args = [pid.to_string()];
-    builtin_process_status_success("palyra.process.status", &args)
+    builtin_process_status_success("palyra.process.status", &args, None)
+}
+
+/// Reports a retained process status only when its full provenance still matches.
+///
+/// # Errors
+/// Returns `InvalidInput` when the PID has been reused or no longer identifies the expected
+/// process registration.
+pub(crate) fn background_process_status_by_pid_exact(
+    pid: u32,
+    expected_provenance: &ProcessProvenance,
+) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    let args = [pid.to_string()];
+    builtin_process_status_success("palyra.process.status", &args, Some(expected_provenance))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4843,7 +4997,7 @@ pub(crate) fn send_keys_to_background_process(
         message: format!("failed to serialize palyra.process.send_keys stdin fallback: {error}"),
     })?;
     write_background_process_stdin(stdin_input.as_slice())?;
-    let frame = background_terminal_frame_snapshot(input.pid);
+    let frame = background_terminal_frame_snapshot(snapshot.output_monitor.as_ref());
     send_keys_success_output(
         input.pid,
         payload.len(),
@@ -4965,14 +5119,8 @@ fn process_send_key_bytes(action: &ProcessSendKeyInput) -> Result<Vec<u8>, Sandb
     Ok(bytes.to_vec())
 }
 
-fn background_terminal_frame_snapshot(pid: u32) -> Value {
-    let snapshot = registered_background_processes()
-        .lock()
-        .ok()
-        .and_then(|processes| {
-            processes.get(&pid).and_then(|process| process.output_monitor.clone())
-        })
-        .map(|monitor| monitor.snapshot());
+fn background_terminal_frame_snapshot(monitor: Option<&BackgroundOutputMonitor>) -> Value {
+    let snapshot = monitor.map(BackgroundOutputMonitor::snapshot);
     let Some((stdout, stderr)) = snapshot else {
         return json!({
             "available": false,
@@ -6443,6 +6591,11 @@ fn token_looks_like_absolute_path(raw: &str) -> bool {
         && matches!(bytes[2], b'\\' | b'/')
 }
 
+fn token_looks_like_drive_qualified_path(raw: &str) -> bool {
+    let bytes = raw.trim().as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 // Distinguishes string-escape leftovers (e.g. a "\n" fragment split out of inline source code)
 // from genuine Windows root-relative paths that also start with a backslash.
 fn token_is_escaped_string_fragment(token: &str) -> bool {
@@ -6669,11 +6822,9 @@ fn validate_host_argument_path_scope(
     Ok(())
 }
 
-// Walks the argv once, classifying each argument: known non-path values (test patterns,
-// python module names, Windows switches, sleep durations) pass through untouched,
-// while everything path-like (bare paths, file URLs, --opt=path and -Xpath forms, virtual
-// workspace aliases) is resolved through resolve_scoped_path and replaced with the proven
-// in-scope absolute form. Any path that fails scoping aborts the whole run.
+// Walks the argv once, classifying each argument: known non-path values and opaque tokens pass
+// through untouched, while syntactically path-shaped values, file URLs, compact path options, and
+// virtual workspace aliases are resolved through the workspace boundary.
 fn rewrite_arguments_to_scoped_paths(
     workspace_root: &Path,
     cwd: &Path,
@@ -6861,11 +7012,12 @@ fn windows_acl_option_consumes_non_path_value(command: &str, arg: &str) -> bool 
 }
 
 fn git_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
-    normalize_process_executable_token(command) == "git"
-        && matches!(
-            arg.trim().to_ascii_lowercase().as_str(),
-            "-b" | "--orphan" | "-m" | "--message"
-        )
+    if normalize_process_executable_token(command) != "git" {
+        return false;
+    }
+    let arg = arg.trim();
+    matches!(arg, "-b" | "-c" | "-m")
+        || matches!(arg.to_ascii_lowercase().as_str(), "--create" | "--orphan" | "--message")
 }
 
 fn command_positional_arg_is_non_path_value(command: &str, arg: &str) -> bool {
@@ -6916,8 +7068,28 @@ fn git_invocation_arg_is_non_path_value(command: &str, args: &[String], index: u
     if args[..index].iter().any(|arg| arg.trim() == "--") {
         return false;
     }
-    args.get(subcommand_index)
-        .is_some_and(|subcommand| subcommand.trim().eq_ignore_ascii_case("show"))
+    let current = args[index].trim();
+    if current.starts_with('.')
+        || token_looks_like_absolute_path(current)
+        || token_looks_like_drive_qualified_path(current)
+    {
+        return false;
+    }
+    args.get(subcommand_index).is_some_and(|subcommand| {
+        matches!(
+            subcommand.trim().to_ascii_lowercase().as_str(),
+            "branch"
+                | "checkout"
+                | "diff"
+                | "log"
+                | "rev-list"
+                | "rev-parse"
+                | "show"
+                | "status"
+                | "switch"
+                | "tag"
+        )
+    })
 }
 
 fn npm_invocation_arg_is_non_path_value(command: &str, args: &[String], index: usize) -> bool {
@@ -7122,12 +7294,15 @@ fn argument_requires_path_validation(arg: &str) -> bool {
     if trimmed.is_empty() || trimmed.starts_with('-') || is_builtin_list_flag(trimmed) {
         return false;
     }
-    if token_looks_like_absolute_path(trimmed) {
+    if token_looks_like_absolute_path(trimmed) || token_looks_like_drive_qualified_path(trimmed) {
         return true;
     }
     match reqwest::Url::parse(trimmed) {
         Ok(url) => url.scheme().eq_ignore_ascii_case("file"),
-        Err(_) => true,
+        Err(_) => {
+            let normalized = trimmed.replace('\\', "/");
+            trimmed.starts_with('.') || normalized.contains('/')
+        }
     }
 }
 
@@ -7165,6 +7340,12 @@ fn resolve_scoped_path(
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
             message: "sandbox denied: path contains embedded NUL byte".to_owned(),
+        });
+    }
+    if token_looks_like_drive_qualified_path(raw) && !token_looks_like_absolute_path(raw) {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: "sandbox denied: drive-relative paths are not allowed".to_owned(),
         });
     }
     let candidate = if let Some(suffix) = virtual_workspace_path_suffix(raw) {
@@ -10258,7 +10439,7 @@ fn monitor_background_child_until_lifetime(
 ) {
     let pid = child.id();
     let started_at = Instant::now();
-    let mut direct_child_exited = false;
+    let mut direct_exit_status = None;
     loop {
         if output_monitor.quota_exceeded() {
             #[cfg(unix)]
@@ -10273,6 +10454,12 @@ fn monitor_background_child_until_lifetime(
             if let Err(error) = cleanup {
                 warn!(error = ?error, pid, "background process output-quota cleanup failed");
             } else {
+                record_background_process_terminal_state(
+                    &registration_identity,
+                    "failed",
+                    "output_quota_exceeded",
+                    None,
+                );
                 warn!(
                     pid,
                     reason_code = "process.output_quota_exceeded",
@@ -10281,10 +10468,10 @@ fn monitor_background_child_until_lifetime(
             }
             return;
         }
-        if !direct_child_exited {
+        if direct_exit_status.is_none() {
             match child.try_wait() {
-                Ok(Some(_)) => {
-                    direct_child_exited = true;
+                Ok(Some(status)) => {
+                    direct_exit_status = Some(status);
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -10300,17 +10487,30 @@ fn monitor_background_child_until_lifetime(
                     let cleanup = terminate_background_child_exact(child, &registration_identity);
                     if let Err(cleanup_error) = cleanup {
                         warn!(error = ?cleanup_error, pid, "background process wait-failure cleanup failed");
+                    } else {
+                        record_background_process_terminal_state(
+                            &registration_identity,
+                            "failed",
+                            "wait_failed",
+                            None,
+                        );
                     }
                     return;
                 }
             }
         }
-        if direct_child_exited {
+        if let Some(status) = direct_exit_status {
             #[cfg(unix)]
             {
                 match supervisor_control.terminate() {
                     Ok(()) => {
                         mark_background_process_stopped_after_unix_cleanup(&registration_identity);
+                        record_background_process_terminal_state(
+                            &registration_identity,
+                            if status.success() { "exited" } else { "failed" },
+                            if status.success() { "completed" } else { "nonzero_exit" },
+                            status.code(),
+                        );
                     }
                     Err(error) => {
                         warn!(
@@ -10329,6 +10529,12 @@ fn monitor_background_child_until_lifetime(
             ) {
                 Ok(false) => {
                     release_verified_background_process_tracking_exact(&registration_identity);
+                    record_background_process_terminal_state(
+                        &registration_identity,
+                        if status.success() { "exited" } else { "failed" },
+                        if status.success() { "completed" } else { "nonzero_exit" },
+                        status.code(),
+                    );
                     return;
                 }
                 Ok(true) => {}
@@ -10356,6 +10562,12 @@ fn monitor_background_child_until_lifetime(
             let cleanup = terminate_background_child_exact(child, &registration_identity);
             match cleanup {
                 Ok(()) => {
+                    record_background_process_terminal_state(
+                        &registration_identity,
+                        "lifetime_expired",
+                        "lifetime_expired",
+                        None,
+                    );
                     if let Err(error) = apply_managed_process_fault_after_verified_cleanup(
                         &fault_injection,
                         "managed_process.during_cleanup",
@@ -14453,6 +14665,104 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_arguments_to_scoped_paths_preserves_opaque_node_and_git_arguments() {
+        let workspace = unique_temp_dir("workspace-opaque-process-arguments");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let cases = [
+            ("node", vec!["--experimental-default-type=module", "verify-config.mjs"]),
+            ("git", vec!["status", "--untracked-files=all"]),
+            ("git", vec!["branch", "e2e/local-commit-smoke"]),
+            ("git", vec!["switch", "-c", "e2e/local-commit-smoke"]),
+            ("git", vec!["show", "HEAD:README.md"]),
+            ("git", vec!["diff", "--unified=0"]),
+            ("git", vec!["log", "--date=short"]),
+        ];
+
+        for (command, raw_args) in cases {
+            let args = raw_args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let rewritten = rewrite_arguments_to_scoped_paths(
+                canonical_workspace.as_path(),
+                canonical_workspace.as_path(),
+                command,
+                args.as_slice(),
+            )
+            .expect("opaque command arguments should remain valid");
+            assert_eq!(rewritten, args, "command {command} must preserve argv exactly");
+        }
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn rewrite_arguments_to_scoped_paths_still_rejects_relative_traversal() {
+        let workspace = unique_temp_dir("workspace-process-argument-traversal");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["../outside/script.mjs".to_owned()];
+
+        let error = rewrite_arguments_to_scoped_paths(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "node",
+            args.as_slice(),
+        )
+        .expect_err("relative traversal must still pass through workspace scoping");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+
+        let git_args = vec!["diff".to_owned(), "../outside/secret.txt".to_owned()];
+        let git_error = rewrite_arguments_to_scoped_paths(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "git",
+            git_args.as_slice(),
+        )
+        .expect_err("Git pathspec traversal must still pass through workspace scoping");
+        assert_eq!(git_error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+
+        let drive_relative_args = vec!["C:outside.txt".to_owned()];
+        let drive_relative_error = rewrite_arguments_to_scoped_paths(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "node",
+            drive_relative_args.as_slice(),
+        )
+        .expect_err("drive-relative paths must fail closed");
+        assert_eq!(drive_relative_error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn destructive_process_proposals_require_approval_before_execution() {
+        let workspace = unique_temp_dir("workspace-process-risk-approval");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::write(workspace.join("cleanup.py"), b"import shutil\nshutil.rmtree('generated')\n")
+            .expect("cleanup script should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let policy =
+            sandbox_policy_with_allowed_executables(canonical_workspace, vec!["git".to_owned()]);
+
+        assert!(super::process_runner_input_requires_user_approval(
+            &policy,
+            br#"{"command":"git","args":["clean","-ffd","-x","--","generated"]}"#
+        ));
+        assert!(super::process_runner_input_requires_user_approval(
+            &policy,
+            br#"{"command":"python","args":["cleanup.py"]}"#
+        ));
+        assert!(!super::process_runner_input_requires_user_approval(
+            &policy,
+            br#"{"command":"git","args":["status","--untracked-files=all"]}"#
+        ));
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
     fn rewrite_arguments_to_scoped_paths_preserves_npm_script_and_network_values() {
         let workspace = unique_temp_dir("workspace-npm-network-values");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
@@ -17261,7 +17571,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_background_process_releases_captured_output() {
+    fn stopped_background_process_retains_bounded_output_until_history_release() {
         let pid = 4_010_000_u32.saturating_add(std::process::id());
         let provenance = palyra_common::runtime_contracts::ProcessProvenance {
             ownership_kind: if cfg!(windows) {
@@ -17284,7 +17594,7 @@ mod tests {
                 background: true,
             },
             BackgroundLifetimeMode::RunOwned,
-            provenance,
+            provenance.clone(),
             None,
             #[cfg(unix)]
             None,
@@ -17307,12 +17617,38 @@ mod tests {
         super::mark_background_process_stopped(&identity);
 
         assert!(
+            stdout_weak.upgrade().is_some(),
+            "the owning run should retain bounded terminal stdout"
+        );
+        assert!(
+            stderr_weak.upgrade().is_some(),
+            "the owning run should retain bounded terminal stderr"
+        );
+        let status = super::background_process_status_by_pid_exact(pid, &provenance)
+            .expect("completed process status should remain readable");
+        let output: serde_json::Value =
+            serde_json::from_slice(&status.output_json).expect("status output should parse");
+        assert_eq!(output.get("completed").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(output.get("process_state").and_then(serde_json::Value::as_str), Some("exited"));
+        assert_eq!(
+            output.pointer("/terminal_frame/stdout/tail").and_then(serde_json::Value::as_str),
+            Some("sensitive stdout")
+        );
+        let mut stale_provenance = provenance.clone();
+        stale_provenance.owner_nonce = "reused-pid-owner-nonce".to_owned();
+        stale_provenance.ownership_identity_sha256 = "c".repeat(64);
+        let stale_error = super::background_process_status_by_pid_exact(pid, &stale_provenance)
+            .expect_err("a reused PID with different provenance must fail closed");
+        assert_eq!(stale_error.kind, SandboxProcessRunErrorKind::InvalidInput);
+
+        super::release_background_process_history(pid, &provenance);
+        assert!(
             stdout_weak.upgrade().is_none(),
-            "stopped registry entries must not retain captured stdout"
+            "terminal stdout should be released with the owning run history"
         );
         assert!(
             stderr_weak.upgrade().is_none(),
-            "stopped registry entries must not retain captured stderr"
+            "terminal stderr should be released with the owning run history"
         );
     }
 

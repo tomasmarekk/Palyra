@@ -2811,6 +2811,13 @@ pub(crate) struct RunCleanupResources {
     pub(crate) background_processes: Vec<RunOwnedBackgroundProcess>,
 }
 
+const MAX_RUN_PROCESS_HISTORY_ENTRIES: usize = 64;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RunProcessHistory {
+    processes: VecDeque<RunOwnedBackgroundProcess>,
+}
+
 impl RunCleanupResources {
     /// True when no resources remain registered for the run.
     pub(crate) fn is_empty(&self) -> bool {
@@ -3181,6 +3188,7 @@ pub struct GatewayRuntimeState {
     tool_guardrails: Mutex<HashMap<String, ToolGuardrailController>>,
     run_parameter_delta_cache: Mutex<RunParameterDeltaCache>,
     run_cleanup_resources: Mutex<HashMap<String, RunCleanupResources>>,
+    run_process_history: Mutex<HashMap<String, RunProcessHistory>>,
     run_detached_resources: Mutex<HashMap<String, RunDetachedResources>>,
     pending_process_cleanups: Mutex<HashMap<String, PendingProcessCleanup>>,
     process_lease_reconciliation_lock: AsyncMutex<()>,
@@ -5069,6 +5077,7 @@ impl GatewayRuntimeState {
             tool_guardrails: Mutex::new(HashMap::new()),
             run_parameter_delta_cache: Mutex::new(RunParameterDeltaCache::default()),
             run_cleanup_resources: Mutex::new(HashMap::new()),
+            run_process_history: Mutex::new(HashMap::new()),
             run_detached_resources: Mutex::new(HashMap::new()),
             pending_process_cleanups: Mutex::new(HashMap::new()),
             process_lease_reconciliation_lock: AsyncMutex::new(()),
@@ -5526,11 +5535,51 @@ impl GatewayRuntimeState {
             .iter_mut()
             .find(|existing| existing.ownership_root_pid() == pid)
         {
-            *existing = process;
+            *existing = process.clone();
         } else {
-            resources.background_processes.push(process);
+            resources.background_processes.push(process.clone());
         }
+        drop(resources_by_run);
+        self.record_run_background_process_history(run_id, process);
         Ok(())
+    }
+
+    fn record_run_background_process_history(
+        &self,
+        run_id: &str,
+        process: RunOwnedBackgroundProcess,
+    ) {
+        let mut evicted = None;
+        match self.run_process_history.lock() {
+            Ok(mut history_by_run) => {
+                let history = history_by_run.entry(run_id.to_owned()).or_default();
+                if let Some(existing) = history
+                    .processes
+                    .iter_mut()
+                    .find(|existing| existing.ownership_root_pid() == process.ownership_root_pid())
+                {
+                    *existing = process;
+                    return;
+                }
+                history.processes.push_back(process);
+                if history.processes.len() > MAX_RUN_PROCESS_HISTORY_ENTRIES {
+                    evicted = history.processes.pop_front();
+                }
+            }
+            Err(error) => {
+                warn!(
+                    run_id,
+                    error = %error,
+                    "failed to record bounded background process history"
+                );
+            }
+        }
+        if let Some(evicted) = evicted {
+            crate::sandbox_runner::release_background_process_history(
+                evicted.ownership_root_pid(),
+                &evicted.lease.provenance,
+            );
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -5615,6 +5664,79 @@ impl GatewayRuntimeState {
                     "failed to forget background process for run cleanup"
                 );
             }
+        }
+    }
+
+    /// Returns the exact process descriptor retained for a run and PID.
+    pub(crate) fn run_background_process_history(
+        &self,
+        run_id: &str,
+        pid: u32,
+    ) -> Option<RunOwnedBackgroundProcess> {
+        let run_id = run_id.trim();
+        if run_id.is_empty() || pid == 0 {
+            return None;
+        }
+        self.run_process_history
+            .lock()
+            .ok()
+            .and_then(|history_by_run| {
+                history_by_run.get(run_id).and_then(|history| {
+                    history
+                        .processes
+                        .iter()
+                        .find(|process| process.ownership_root_pid() == pid)
+                        .cloned()
+                })
+            })
+            .or_else(|| self.run_background_process(run_id, pid))
+    }
+
+    /// Lists active and completed PIDs retained for model-visible diagnostics in this run.
+    pub(crate) fn list_run_background_process_history(
+        &self,
+        run_id: &str,
+    ) -> Vec<RunOwnedBackgroundProcess> {
+        let run_id = run_id.trim();
+        if run_id.is_empty() {
+            return Vec::new();
+        }
+        let mut history = self
+            .run_process_history
+            .lock()
+            .ok()
+            .and_then(|history_by_run| history_by_run.get(run_id).cloned())
+            .map(|history| history.processes.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for process in self.list_run_background_processes(run_id) {
+            if !history
+                .iter()
+                .any(|existing| existing.ownership_root_pid() == process.ownership_root_pid())
+            {
+                history.push(process);
+            }
+        }
+        history
+    }
+
+    /// Drops terminal diagnostics once no further tool turn can belong to the owning run.
+    pub(crate) fn clear_run_background_process_history(&self, run_id: &str) {
+        let run_id = run_id.trim();
+        if run_id.is_empty() {
+            return;
+        }
+        let processes = self
+            .run_process_history
+            .lock()
+            .ok()
+            .and_then(|mut history_by_run| history_by_run.remove(run_id))
+            .map(|history| history.processes)
+            .unwrap_or_default();
+        for process in processes {
+            crate::sandbox_runner::release_background_process_history(
+                process.ownership_root_pid(),
+                &process.lease.provenance,
+            );
         }
     }
 

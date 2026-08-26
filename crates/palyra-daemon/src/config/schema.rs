@@ -1433,7 +1433,7 @@ impl Default for ToolCallConfig {
             toolset_profiles: Vec::new(),
             extra_tools: Vec::new(),
             disabled_tools: Vec::new(),
-            catalog_exposure_mode: palyra_common::tool_catalog::ToolCatalogExposureMode::Direct,
+            catalog_exposure_mode: palyra_common::tool_catalog::ToolCatalogExposureMode::Compact,
             compact_tool_threshold: 16,
             max_calls_per_run: DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN,
             execution_timeout_ms: DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS,

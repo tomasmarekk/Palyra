@@ -1317,6 +1317,7 @@ pub enum ApprovalSubjectType {
     BrowserAction,
     NodeCapability,
     DevicePairing,
+    StartupRecovery,
 }
 
 impl ApprovalSubjectType {
@@ -1330,6 +1331,7 @@ impl ApprovalSubjectType {
             Self::BrowserAction => "browser_action",
             Self::NodeCapability => "node_capability",
             Self::DevicePairing => "device_pairing",
+            Self::StartupRecovery => "startup_recovery",
         }
     }
 
@@ -1342,6 +1344,7 @@ impl ApprovalSubjectType {
             "browser_action" => Some(Self::BrowserAction),
             "node_capability" => Some(Self::NodeCapability),
             "device_pairing" => Some(Self::DevicePairing),
+            "startup_recovery" => Some(Self::StartupRecovery),
             _ => None,
         }
     }
@@ -8092,6 +8095,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 105,
         name: "semantic_memory_lifecycle",
         sql: semantic_memory::MIGRATION_105_SQL,
+    },
+    Migration {
+        version: 106,
+        name: "startup_recovery_resolutions",
+        sql: startup_recovery::MIGRATION_106_SQL,
     },
 ];
 
@@ -24550,6 +24558,11 @@ impl JournalStore {
             });
         }
         if updated == 1 {
+            startup_recovery::materialize_startup_recovery_resolution_tx(
+                &transaction,
+                &record,
+                now,
+            )?;
             wait_coordinator::emit_wake_event_tx(
                 &transaction,
                 &wait_coordinator::WakeEventRequest {
@@ -38508,7 +38521,8 @@ mod tests {
             .expect("ambiguous recovery should actuate");
         assert_eq!(report.continuation_queued_count, 0);
         assert_eq!(report.confirmation_required_count, 1);
-        let confirmation_id = report.confirmation_ids.first().expect("approval should be durable");
+        let confirmation_id =
+            report.confirmation_ids.first().expect("approval should be durable").clone();
         let connection = store.connection.lock().expect("connection lock should be available");
         let approval = connection
             .query_row(
@@ -38543,6 +38557,55 @@ mod tests {
             )
             .expect("continuation tasks should count");
         assert_eq!(continuation_count, 0);
+        drop(connection);
+
+        let listed = store
+            .list_approvals(ApprovalsListFilter {
+                after_approval_id: None,
+                limit: 10,
+                since_unix_ms: None,
+                until_unix_ms: None,
+                subject_id: Some(run_id),
+                principal: Some("user:ops"),
+                decision: None,
+                subject_type: Some(ApprovalSubjectType::StartupRecovery),
+            })
+            .expect("startup recovery approval should be publicly listable");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].approval_id, confirmation_id);
+
+        let resolved = store
+            .resolve_approval(&ApprovalResolveRequest {
+                approval_id: confirmation_id.clone(),
+                decision: ApprovalDecision::Allow,
+                decision_scope: ApprovalDecisionScope::Once,
+                decision_reason: "operator reviewed durable recovery evidence".to_owned(),
+                decision_scope_ttl_ms: None,
+            })
+            .expect("allowing startup recovery should queue one continuation");
+        assert_eq!(resolved.subject_type, ApprovalSubjectType::StartupRecovery);
+        assert_eq!(resolved.decision, Some(ApprovalDecision::Allow));
+
+        let actions = store
+            .recent_startup_recovery_actions(4)
+            .expect("resolved recovery action should remain queryable");
+        let resolution = actions[0]
+            .resolution
+            .as_ref()
+            .expect("recovery action should expose its durable resolution");
+        assert_eq!(resolution.confirmation_id, confirmation_id);
+        assert_eq!(resolution.decision, "allow");
+        let continuation =
+            resolution.continuation.as_ref().expect("allow should allocate a continuation");
+        let task = store
+            .get_orchestrator_background_task(continuation.continuation_task_id.as_str())
+            .expect("continuation lookup should succeed")
+            .expect("continuation task should exist");
+        assert_eq!(task.parent_run_id.as_deref(), Some(run_id));
+        assert_eq!(
+            task.planned_child_run_id.as_deref(),
+            Some(continuation.continuation_run_id.as_str())
+        );
     }
 
     #[test]
