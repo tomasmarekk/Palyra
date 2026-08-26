@@ -67,6 +67,7 @@ $desktopPackageOutput = Join-Path $artifactsRoot "desktop"
 $cargoTargetRoot = Join-Path $artifactsRoot "cargo-target"
 $installRoot = Join-Path $workspaceRoot "install"
 $stateRoot = Join-Path $workspaceRoot "state"
+$desktopRuntimeRoot = Join-Path $stateRoot "desktop-control-center/runtime"
 $osFileRoot = Join-Path $workspaceRoot "home"
 $e2eHomeRoot = $osFileRoot
 $e2eOsRoot = Join-Path $workspaceRoot "os-root"
@@ -442,6 +443,7 @@ Write-CleanDesktopCliE2EShim `
     -OsFileRoots $osFileRoots
 
 $seedE2eSkillOutput = & $resolvedCliCommandPath `
+    --state-root $desktopRuntimeRoot `
     skills `
     seed-e2e-fixtures `
     --json
@@ -449,7 +451,11 @@ $seedE2eSkillPayload = ($seedE2eSkillOutput -join [Environment]::NewLine) | Conv
 if ($seedE2eSkillPayload.fixtures[0].skill_id -ne "e2e.reporter" -or $seedE2eSkillPayload.status -ne "active") {
     throw "Clean desktop harness failed to seed active e2e.reporter skill fixture."
 }
-$seedE2eSkillListOutput = & $resolvedCliCommandPath skills list --json
+$seedE2eSkillListOutput = & $resolvedCliCommandPath `
+    --state-root $desktopRuntimeRoot `
+    skills `
+    list `
+    --json
 $seedE2eSkillListPayload = ($seedE2eSkillListOutput -join [Environment]::NewLine) | ConvertFrom-Json
 $seedE2eReporterEntry = @($seedE2eSkillListPayload.entries | Where-Object { $_.skill_id -eq "e2e.reporter" }) | Select-Object -First 1
 if ($null -eq $seedE2eReporterEntry) {

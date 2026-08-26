@@ -37,6 +37,7 @@ const PROFILE_STATE_ROOT_RELATIVE_PREFIX: &str = "profiles";
 const PROFILE_STATE_ROOT_RELATIVE_SUFFIX: &str = "state";
 const PROFILE_CONFIG_RELATIVE_DIR: &str = "config";
 const PROFILE_CONFIG_FILE_NAME: &str = "palyra.toml";
+const DESKTOP_RUNTIME_STATE_ROOT_RELATIVE_PATH: &str = "desktop-control-center/runtime";
 
 /// Fully resolved per-invocation context shared by all command handlers:
 /// formatting options, active profile, state root, config path, and the
@@ -776,7 +777,10 @@ fn build_root_context(
     let profile_name = resolve_active_profile_name(&root, &profiles);
     let expected_profile_name = normalize_owned_text(root.expect_profile.clone());
     let profile = resolve_profile(profile_name.as_deref(), &profiles)?;
-    let state_root = resolve_final_state_root(&root, profile.as_ref())?;
+    let state_root_explicit = normalize_optional_text(root.state_root.as_deref()).is_some();
+    let requested_state_root = resolve_final_state_root(&root, profile.as_ref())?;
+    let state_root =
+        prefer_existing_desktop_runtime_root(requested_state_root, state_root_explicit);
     install_error_render_context(ErrorRenderContext {
         output_format,
         log_level,
@@ -805,7 +809,7 @@ fn build_root_context(
         no_color,
         trace_id,
         state_root,
-        state_root_explicit: normalize_optional_text(root.state_root.as_deref()).is_some(),
+        state_root_explicit,
         config_path,
         profile_name,
         profile,
@@ -1363,6 +1367,27 @@ fn resolve_final_state_root(
     resolve_cli_state_root(None)
 }
 
+/// Selects a running desktop control center's state root for ordinary CLI
+/// invocations while retaining the requested root as the CLI profile namespace.
+///
+/// An explicit `--state-root` remains authoritative. Environment and profile
+/// roots may describe the containing desktop installation, whose supervised
+/// daemon keeps runtime-owned state in a dedicated child.
+fn prefer_existing_desktop_runtime_root(
+    requested_state_root: PathBuf,
+    state_root_explicit: bool,
+) -> PathBuf {
+    if state_root_explicit {
+        return requested_state_root;
+    }
+    let desktop_runtime = requested_state_root.join(DESKTOP_RUNTIME_STATE_ROOT_RELATIVE_PATH);
+    if desktop_runtime.is_dir() {
+        desktop_runtime
+    } else {
+        requested_state_root
+    }
+}
+
 fn resolve_config_path(
     root: &RootOptions,
     profile: Option<&CliConnectionProfile>,
@@ -1551,6 +1576,7 @@ mod tests {
         ensure_bootstrap_local_profile, state_root_config_path, validate_profile_name,
         CliConnectionProfile, ConnectionDefaults, ConnectionOverrides, ExplicitConfigPathPolicy,
         RootOptions, CLI_PROFILES_PATH_ENV, CLI_PROFILES_RELATIVE_PATH, CLI_PROFILE_ENV,
+        DESKTOP_RUNTIME_STATE_ROOT_RELATIVE_PATH,
     };
     use crate::args::{LogLevelArg, OutputFormatArg};
     use anyhow::Result;
@@ -2006,6 +2032,47 @@ port = 9222
         let http = context
             .resolve_http_connection(ConnectionOverrides::default(), ConnectionDefaults::ADMIN)?;
         assert_eq!(http.base_url, "http://127.0.0.1:9222");
+        Ok(())
+    }
+
+    #[test]
+    fn installed_state_root_prefers_existing_desktop_runtime_child() -> Result<()> {
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
+        clear_env();
+        let temp = tempdir()?;
+        let installed_state_root = temp.path().join("installed-state");
+        let desktop_runtime = installed_state_root.join(DESKTOP_RUNTIME_STATE_ROOT_RELATIVE_PATH);
+        fs::create_dir_all(desktop_runtime.as_path())?;
+        env::set_var("PALYRA_STATE_ROOT", &installed_state_root);
+
+        let context =
+            build_root_context(RootOptions::default(), ExplicitConfigPathPolicy::RequireExisting)?;
+
+        assert_eq!(context.cli_state_root(), installed_state_root.as_path());
+        assert_eq!(context.state_root(), desktop_runtime.as_path());
+        assert!(!context.state_root_explicit());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_state_root_does_not_select_desktop_runtime_child() -> Result<()> {
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
+        clear_env();
+        let temp = tempdir()?;
+        let installed_state_root = temp.path().join("installed-state");
+        fs::create_dir_all(installed_state_root.join(DESKTOP_RUNTIME_STATE_ROOT_RELATIVE_PATH))?;
+
+        let context = build_root_context(
+            RootOptions {
+                state_root: Some(installed_state_root.display().to_string()),
+                ..RootOptions::default()
+            },
+            ExplicitConfigPathPolicy::RequireExisting,
+        )?;
+
+        assert_eq!(context.cli_state_root(), installed_state_root.as_path());
+        assert_eq!(context.state_root(), installed_state_root.as_path());
+        assert!(context.state_root_explicit());
         Ok(())
     }
 
