@@ -551,7 +551,6 @@ pub(crate) async fn navigate_with_guards(
     let redirect_limit = max_redirects.clamp(1, 10);
     let mut redirects = 0_u32;
     let initial_scheme = current_url.scheme().to_owned();
-    let initial_cookie_host = current_url.host_str().map(str::to_ascii_lowercase);
     loop {
         if current_url.scheme() == "file" {
             return navigate_local_file_with_guards(
@@ -601,11 +600,7 @@ pub(crate) async fn navigate_with_guards(
 
         let request_started = Instant::now();
         let mut request_builder = client.get(current_url.clone());
-        if let Some(value) = cookie_header_for_redirect_hop(
-            &current_url,
-            initial_cookie_host.as_deref(),
-            cookie_header,
-        ) {
+        if let Some(value) = cookie_header_for_redirect_hop(redirects, cookie_header) {
             request_builder = request_builder.header(COOKIE_HEADER, value);
         }
         let mut response = match request_builder.send().await {
@@ -641,10 +636,10 @@ pub(crate) async fn navigate_with_guards(
                 cookie_updates,
             };
         }
-        if let Some(domain) = current_url.host_str() {
+        if current_url.host_str().is_some() {
             for raw_set_cookie in response.headers().get_all(SET_COOKIE_HEADER).iter() {
                 if let Ok(value) = raw_set_cookie.to_str() {
-                    if let Some(update) = parse_set_cookie_update(domain, value) {
+                    if let Some(update) = parse_set_cookie_update(&current_url, value) {
                         cookie_updates.push(update);
                     }
                 }
@@ -824,16 +819,14 @@ pub(crate) async fn navigate_with_guards(
     }
 }
 
-fn cookie_header_for_redirect_hop<'a>(
-    current_url: &Url,
-    initial_cookie_host: Option<&str>,
-    cookie_header: Option<&'a str>,
-) -> Option<&'a str> {
+fn cookie_header_for_redirect_hop(
+    redirect_count: u32,
+    cookie_header: Option<&str>,
+) -> Option<&str> {
     let value = cookie_header.filter(|value| !value.trim().is_empty())?;
-    let current_host = current_url.host_str()?;
-    initial_cookie_host
-        .filter(|initial_host| current_host.eq_ignore_ascii_case(initial_host))
-        .map(|_| value)
+    // The caller selected this header for the original URL. Reusing it after
+    // any redirect could cross scheme, host, or path scope.
+    (redirect_count == 0).then_some(value)
 }
 
 /// Serves a `file://` navigation after the local-file gate passes, enforcing

@@ -1080,6 +1080,7 @@ fn persisted_state_store_quarantines_snapshot_after_key_change_and_recovers() {
         tab_order: Vec::new(),
         active_tab_id: String::new(),
         permissions: SessionPermissionsInternal::default(),
+        cookie_store: Vec::new(),
         cookie_jar: HashMap::new(),
         storage_entries: HashMap::new(),
         state_revision: 1,
@@ -1222,6 +1223,46 @@ async fn navigate_with_guards_does_not_replay_cookie_header_to_cross_host_redire
     assert!(
         !target_request.to_ascii_lowercase().contains("cookie:"),
         "cross-host redirect target must not receive original cookie header: {target_request}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn navigate_with_guards_does_not_replay_cookie_header_to_same_host_redirect() {
+    let (target_url, target_handle) = spawn_cookie_capture_http_server("127.0.0.1");
+    let (url, redirect_handle) = spawn_redirect_http_server(target_url.as_str());
+
+    let outcome =
+        navigate_with_guards(url.as_str(), 2_000, true, 3, true, 4_096, Some("session=abc123"))
+            .await;
+    redirect_handle.join().expect("redirect server should exit");
+    let target_request = target_handle.join().expect("target server should exit");
+
+    assert!(outcome.success, "redirected navigation should succeed: {}", outcome.error);
+    assert!(
+        !target_request.to_ascii_lowercase().contains("cookie:"),
+        "same-host redirects must not inherit a header selected for the original URL: {target_request}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chromium_navigation_policy_preflight_is_unauthenticated() {
+    let (url, handle) = spawn_cookie_capture_http_server("127.0.0.1");
+    let params = super::ChromiumNavigateParams {
+        raw_url: url,
+        timeout_ms: 2_000,
+        allow_redirects: true,
+        max_redirects: 3,
+        allow_private_targets: true,
+        max_response_bytes: 4_096,
+    };
+
+    let outcome = super::chromium_navigation_policy_preflight(&params).await;
+    let request = handle.join().expect("preflight server should exit");
+
+    assert!(outcome.success, "Chromium policy preflight should succeed: {}", outcome.error);
+    assert!(
+        !request.to_ascii_lowercase().contains("cookie:"),
+        "Chromium policy preflight must leave cookie authority to Chromium: {request}"
     );
 }
 
@@ -5965,6 +6006,7 @@ fn validate_restored_snapshot_against_profile_accepts_legacy_hash_for_revision_z
         tab_order: Vec::new(),
         active_tab_id: String::new(),
         permissions: SessionPermissionsInternal::default(),
+        cookie_store: Vec::new(),
         cookie_jar: HashMap::new(),
         storage_entries: HashMap::new(),
         state_revision: 0,
@@ -6024,17 +6066,21 @@ fn test_session_record() -> super::BrowserSessionRecord {
     })
 }
 
+fn test_cookie_update(request_url: &str, set_cookie: &str) -> super::CookieUpdate {
+    let request_url = Url::parse(request_url).expect("test cookie URL should parse");
+    super::parse_set_cookie_update(&request_url, set_cookie)
+        .expect("test Set-Cookie header should parse")
+}
+
 #[test]
 fn apply_cookie_updates_enforces_domain_and_cookie_quotas() {
     let mut session = test_session_record();
     for idx in 0..(super::MAX_COOKIE_DOMAINS_PER_SESSION + 8) {
+        let request_url = format!("https://d{idx}.example.com/");
+        let set_cookie = format!("sid=v{idx}; Path=/");
         super::apply_cookie_updates(
             &mut session,
-            &[super::CookieUpdate {
-                domain: format!("d{idx}.example.com"),
-                name: "sid".to_owned(),
-                value: format!("v{idx}"),
-            }],
+            &[test_cookie_update(request_url.as_str(), set_cookie.as_str())],
         );
     }
     assert_eq!(
@@ -6046,13 +6092,10 @@ fn apply_cookie_updates_enforces_domain_and_cookie_quotas() {
     let mut capped_domain_session = test_session_record();
     let capped_domain = "quota.example.com".to_owned();
     for idx in 0..(super::MAX_COOKIES_PER_DOMAIN + 8) {
+        let set_cookie = format!("c{idx}=v{idx}; Path=/");
         super::apply_cookie_updates(
             &mut capped_domain_session,
-            &[super::CookieUpdate {
-                domain: capped_domain.clone(),
-                name: format!("c{idx}"),
-                value: format!("v{idx}"),
-            }],
+            &[test_cookie_update("https://quota.example.com/", set_cookie.as_str())],
         );
     }
     let cookies = capped_domain_session
@@ -6067,11 +6110,7 @@ fn apply_cookie_updates_enforces_domain_and_cookie_quotas() {
 
     super::apply_cookie_updates(
         &mut capped_domain_session,
-        &[super::CookieUpdate {
-            domain: capped_domain.clone(),
-            name: "c0".to_owned(),
-            value: "updated".to_owned(),
-        }],
+        &[test_cookie_update("https://quota.example.com/", "c0=updated; Path=/")],
     );
     assert_eq!(
         capped_domain_session
@@ -6085,11 +6124,7 @@ fn apply_cookie_updates_enforces_domain_and_cookie_quotas() {
 
     super::apply_cookie_updates(
         &mut capped_domain_session,
-        &[super::CookieUpdate {
-            domain: capped_domain.clone(),
-            name: "c0".to_owned(),
-            value: String::new(),
-        }],
+        &[test_cookie_update("https://quota.example.com/", "c0=; Max-Age=0; Path=/")],
     );
     assert!(
         capped_domain_session
@@ -6098,6 +6133,111 @@ fn apply_cookie_updates_enforces_domain_and_cookie_quotas() {
             .is_some_and(|domain| !domain.contains_key("c0")),
         "delete updates should still remove existing cookies"
     );
+}
+
+#[test]
+fn cookie_header_enforces_secure_and_path_scope() {
+    let mut session = test_session_record();
+    super::apply_cookie_updates(
+        &mut session,
+        &[test_cookie_update(
+            "https://example.com/login",
+            "sid=secret; Secure; Path=/account; Max-Age=3600",
+        )],
+    );
+
+    assert_eq!(
+        super::cookie_header_for_url(&session, "https://example.com/account/settings").as_deref(),
+        Some("sid=secret")
+    );
+    assert!(
+        super::cookie_header_for_url(&session, "http://example.com/account/settings").is_none(),
+        "Secure cookies must never be replayed over plaintext HTTP"
+    );
+    assert!(
+        super::cookie_header_for_url(&session, "https://example.com/other").is_none(),
+        "cookie replay must honor the stored Path attribute"
+    );
+}
+
+#[test]
+fn cookie_header_enforces_host_only_and_domain_scope() {
+    let mut session = test_session_record();
+    super::apply_cookie_updates(
+        &mut session,
+        &[
+            test_cookie_update(
+                "https://auth.example.com/login",
+                "host_session=host-only; Secure; Path=/",
+            ),
+            test_cookie_update(
+                "https://auth.example.com/login",
+                "domain_session=shared; Secure; Domain=example.com; Path=/",
+            ),
+        ],
+    );
+
+    let auth_header = super::cookie_header_for_url(&session, "https://auth.example.com/")
+        .expect("origin host should receive both cookies");
+    assert!(auth_header.contains("host_session=host-only"));
+    assert!(auth_header.contains("domain_session=shared"));
+    assert_eq!(
+        super::cookie_header_for_url(&session, "https://api.example.com/").as_deref(),
+        Some("domain_session=shared"),
+        "host-only cookies must not cross hosts while Domain cookies may reach matching subdomains"
+    );
+    assert!(
+        super::cookie_header_for_url(&session, "https://notexample.com/").is_none(),
+        "domain matching must stop at label boundaries"
+    );
+}
+
+#[test]
+fn cookie_header_ignores_expired_and_deleted_cookies() {
+    let mut session = test_session_record();
+    super::apply_cookie_updates(
+        &mut session,
+        &[
+            test_cookie_update(
+                "https://example.com/",
+                "expired=old; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/",
+            ),
+            test_cookie_update("https://example.com/", "sid=live; Secure; Path=/"),
+        ],
+    );
+    super::apply_cookie_updates(
+        &mut session,
+        &[test_cookie_update("https://example.com/", "sid=deleted; Secure; Max-Age=0; Path=/")],
+    );
+
+    assert!(
+        super::cookie_header_for_url(&session, "https://example.com/").is_none(),
+        "expired cookies and Max-Age=0 deletions must not be replayed"
+    );
+}
+
+#[test]
+fn persisted_cookie_store_round_trip_retains_transport_scope() {
+    let mut session = test_session_record();
+    super::apply_cookie_updates(
+        &mut session,
+        &[test_cookie_update(
+            "https://example.com/login",
+            "sid=secret; Secure; Path=/account; Max-Age=3600",
+        )],
+    );
+    let serialized = super::serialize_cookie_store(&session.cookie_store)
+        .expect("cookie attributes should serialize");
+    let mut restored = test_session_record();
+    restored.cookie_store = super::restore_cookie_store(serialized);
+    restored.cookie_jar = super::cookie_debug_jar(&restored.cookie_store);
+
+    assert_eq!(
+        super::cookie_header_for_url(&restored, "https://example.com/account/profile").as_deref(),
+        Some("sid=secret")
+    );
+    assert!(super::cookie_header_for_url(&restored, "http://example.com/account/profile").is_none());
+    assert!(super::cookie_header_for_url(&restored, "https://example.com/public").is_none());
 }
 
 #[test]
@@ -6273,6 +6413,7 @@ fn apply_snapshot_clamps_cookie_and_storage_state() {
         tab_order: Vec::new(),
         active_tab_id: String::new(),
         permissions: SessionPermissionsInternal::default(),
+        cookie_store: Vec::new(),
         cookie_jar,
         storage_entries,
         state_revision: 1,
@@ -6369,6 +6510,7 @@ fn apply_snapshot_drops_network_log_and_preserves_missing_tab_append() {
         tab_order: vec![second_tab_id.clone(), second_tab_id.clone()],
         active_tab_id: second_tab_id.clone(),
         permissions: SessionPermissionsInternal::default(),
+        cookie_store: Vec::new(),
         cookie_jar: HashMap::new(),
         storage_entries: HashMap::new(),
         state_revision: 1,
@@ -6433,6 +6575,7 @@ fn persisted_snapshot_hash_is_stable_for_equivalent_hashmap_content() {
         tab_order: vec!["tab-1".to_owned()],
         active_tab_id: "tab-1".to_owned(),
         permissions: SessionPermissionsInternal::default(),
+        cookie_store: Vec::new(),
         cookie_jar: first_cookie_jar,
         storage_entries: first_storage_entries,
         state_revision: 5,
@@ -6446,6 +6589,7 @@ fn persisted_snapshot_hash_is_stable_for_equivalent_hashmap_content() {
         tab_order: vec!["tab-1".to_owned()],
         active_tab_id: "tab-1".to_owned(),
         permissions: SessionPermissionsInternal::default(),
+        cookie_store: Vec::new(),
         cookie_jar: second_cookie_jar,
         storage_entries: second_storage_entries,
         state_revision: 5,

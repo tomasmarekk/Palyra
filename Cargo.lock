@@ -3104,6 +3104,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "clap",
+ "cookie_store",
  "headless_chrome",
  "libc",
  "palyra-common",

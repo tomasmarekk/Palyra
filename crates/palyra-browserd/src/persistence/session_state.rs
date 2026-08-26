@@ -3,7 +3,13 @@
 //! Snapshot hashes are computed over a canonical sorted-map form so they stay stable across
 //! `HashMap` iteration orders; network logs are intentionally never persisted.
 
+use std::io::{BufReader, Cursor};
+
 use crate::*;
+
+const MAX_COOKIE_NAME_BYTES: usize = 128;
+const MAX_COOKIE_VALUE_BYTES: usize = 1024;
+const MAX_PERSISTED_COOKIE_ENTRY_BYTES: usize = 4 * 1024;
 
 fn map_to_sorted_map(map: &HashMap<String, String>) -> BTreeMap<String, String> {
     map.iter().map(|(key, value)| (key.clone(), value.clone())).collect()
@@ -43,6 +49,7 @@ pub(crate) fn persisted_snapshot_hash(snapshot: &PersistedSessionSnapshot) -> Re
         tab_order: snapshot.tab_order.clone(),
         active_tab_id: snapshot.active_tab_id.clone(),
         permissions: snapshot.permissions.clone(),
+        cookie_store: snapshot.cookie_store.clone(),
         cookie_jar: nested_map_to_sorted_map(&snapshot.cookie_jar),
         storage_entries: nested_map_to_sorted_map(&snapshot.storage_entries),
         state_revision: snapshot.state_revision,
@@ -162,6 +169,7 @@ pub(crate) async fn persist_session_snapshot(
         tab.network_log.clear();
     }
     let state_revision = next_profile_state_revision(store, session.profile_id.as_deref())?;
+    let cookie_store = serialize_cookie_store(&session.cookie_store)?;
     let snapshot = PersistedSessionSnapshot {
         v: CANONICAL_PROTOCOL_MAJOR,
         principal: session.principal.clone(),
@@ -170,6 +178,7 @@ pub(crate) async fn persist_session_snapshot(
         tab_order: session.tab_order.clone(),
         active_tab_id: session.active_tab_id.clone(),
         permissions: session.permissions.clone(),
+        cookie_store,
         cookie_jar: session.cookie_jar.clone(),
         storage_entries: session.storage_entries.clone(),
         state_revision,
@@ -225,78 +234,138 @@ pub(crate) fn map_persist_error_to_status(error: anyhow::Error) -> Status {
     Status::internal(error.to_string())
 }
 
-/// Builds a Cookie header value for a URL from the session jar, or `None` when no cookies
-/// apply.
+/// Builds a Cookie header for a URL using RFC6265 scheme, domain, path, and expiry rules.
 ///
-/// Only cookies stored under the URL's exact host are included (no parent-domain matching);
-/// pairs are sorted for deterministic output.
+/// Pairs are sorted for deterministic output. Legacy display-only snapshot entries
+/// without complete attributes are intentionally not replayed.
 pub(crate) fn cookie_header_for_url(
     session: &BrowserSessionRecord,
     raw_url: &str,
 ) -> Option<String> {
-    let domain = Url::parse(raw_url).ok()?.host_str()?.to_ascii_lowercase();
-    let cookies = session.cookie_jar.get(domain.as_str())?;
-    if cookies.is_empty() {
+    let url = Url::parse(raw_url).ok()?;
+    let mut pairs = session
+        .cookie_store
+        .get_request_values(&url)
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
         return None;
     }
-    let mut pairs =
-        cookies.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>();
     pairs.sort();
     Some(pairs.join("; "))
 }
 
-/// Parses a Set-Cookie header into a [`CookieUpdate`] for `domain`.
+/// Parses a bounded Set-Cookie header and binds it to its response URL.
 ///
-/// Only the leading name=value pair is kept; cookie attributes (Path, Expires, ...) are
-/// ignored, the name is lowercased, and the value is capped at 1024 bytes.
-pub(crate) fn parse_set_cookie_update(domain: &str, raw_set_cookie: &str) -> Option<CookieUpdate> {
-    let normalized_domain = domain.trim().trim_matches('.').to_ascii_lowercase();
-    if normalized_domain.is_empty() {
+/// The RFC6265 store later validates Domain/host-only semantics and enforces
+/// Secure, Path, Expires, and Max-Age when selecting request cookies.
+pub(crate) fn parse_set_cookie_update(
+    request_url: &Url,
+    raw_set_cookie: &str,
+) -> Option<CookieUpdate> {
+    if !matches!(request_url.scheme(), "http" | "https")
+        || raw_set_cookie.len() > MAX_PERSISTED_COOKIE_ENTRY_BYTES
+    {
         return None;
     }
-    let first_pair = raw_set_cookie.split(';').next()?.trim();
-    let (name, value) = first_pair.split_once('=')?;
-    let name = name.trim().to_ascii_lowercase();
-    if name.is_empty() {
+    let mut cookie = RawCookie::parse(raw_set_cookie).ok()?.into_owned();
+    if cookie.name().is_empty() || cookie.name().len() > MAX_COOKIE_NAME_BYTES {
         return None;
     }
-    Some(CookieUpdate {
-        domain: normalized_domain,
-        name,
-        value: truncate_utf8_bytes(value.trim(), 1024),
-    })
+    cookie.set_value(truncate_utf8_bytes(cookie.value(), MAX_COOKIE_VALUE_BYTES));
+    Some(CookieUpdate { request_url: request_url.clone(), cookie })
 }
 
-/// Applies cookie updates to the session jar under the per-session/per-domain caps.
+/// Applies RFC6265 cookie updates under the per-session/per-domain caps.
 ///
-/// An empty value deletes the cookie (and the domain once empty). When a cap is reached, new
-/// entries are dropped rather than evicting existing ones.
+/// Invalid updates and updates that would cross a quota are dropped rather than
+/// weakening cookie scoping or evicting existing state.
 pub(crate) fn apply_cookie_updates(session: &mut BrowserSessionRecord, updates: &[CookieUpdate]) {
+    let mut store = session.cookie_store.clone();
     for update in updates {
-        if update.domain.is_empty() || update.name.is_empty() {
-            continue;
-        }
-        if update.value.is_empty() {
-            if let Some(domain_cookies) = session.cookie_jar.get_mut(update.domain.as_str()) {
-                domain_cookies.remove(update.name.as_str());
-                if domain_cookies.is_empty() {
-                    session.cookie_jar.remove(update.domain.as_str());
-                }
-            }
-            continue;
-        }
-        if !session.cookie_jar.contains_key(update.domain.as_str())
-            && session.cookie_jar.len() >= MAX_COOKIE_DOMAINS_PER_SESSION
+        let previous = store.clone();
+        if store.insert_raw(&update.cookie, &update.request_url).is_err()
+            || !cookie_store_within_quotas(&store)
         {
+            store = previous;
             continue;
         }
-        let domain_cookies = session.cookie_jar.entry(update.domain.clone()).or_default();
-        if !domain_cookies.contains_key(update.name.as_str())
-            && domain_cookies.len() >= MAX_COOKIES_PER_DOMAIN
-        {
-            continue;
+    }
+    session.cookie_jar = cookie_debug_jar(&store);
+    session.cookie_store = store;
+}
+
+fn cookie_store_within_quotas(store: &CookieStore) -> bool {
+    let mut cookies_per_domain = HashMap::<String, usize>::new();
+    let mut total = 0_usize;
+    for cookie in store.iter_unexpired() {
+        total = total.saturating_add(1);
+        if total > MAX_COOKIE_DOMAINS_PER_SESSION.saturating_mul(MAX_COOKIES_PER_DOMAIN) {
+            return false;
         }
-        domain_cookies.insert(update.name.clone(), update.value.clone());
+        let domain = String::from(&cookie.domain);
+        let count = cookies_per_domain.entry(domain).or_default();
+        *count = count.saturating_add(1);
+        if *count > MAX_COOKIES_PER_DOMAIN {
+            return false;
+        }
+    }
+    cookies_per_domain.len() <= MAX_COOKIE_DOMAINS_PER_SESSION
+}
+
+/// Builds the bounded compatibility view returned by inspect/session APIs.
+///
+/// Request replay never consults this path-collapsed map; the attribute-aware
+/// store above remains authoritative.
+pub(crate) fn cookie_debug_jar(store: &CookieStore) -> HashMap<String, HashMap<String, String>> {
+    let mut cookies = store
+        .iter_unexpired()
+        .map(|cookie| {
+            (
+                String::from(&cookie.domain),
+                cookie.name().to_owned(),
+                String::from(&cookie.path),
+                truncate_utf8_bytes(cookie.value(), MAX_COOKIE_VALUE_BYTES),
+            )
+        })
+        .collect::<Vec<_>>();
+    cookies.sort();
+    let mut jar = HashMap::<String, HashMap<String, String>>::new();
+    for (domain, name, _path, value) in cookies {
+        jar.entry(domain).or_default().insert(name, value);
+    }
+    jar
+}
+
+/// Serializes complete, unexpired cookie records for the encrypted snapshot.
+pub(crate) fn serialize_cookie_store(store: &CookieStore) -> Result<Vec<String>> {
+    let mut entries = store
+        .iter_unexpired()
+        .map(serde_json::to_string)
+        .collect::<serde_json::Result<Vec<_>>>()
+        .context("failed to serialize browser cookie store")?;
+    entries.sort();
+    Ok(entries)
+}
+
+/// Restores a bounded attribute-aware store, failing closed to an empty store.
+pub(crate) fn restore_cookie_store(entries: Vec<String>) -> CookieStore {
+    let maximum_entries = MAX_COOKIE_DOMAINS_PER_SESSION.saturating_mul(MAX_COOKIES_PER_DOMAIN);
+    if entries.len() > maximum_entries
+        || entries.iter().any(|entry| entry.len() > MAX_PERSISTED_COOKIE_ENTRY_BYTES)
+    {
+        return CookieStore::default();
+    }
+    let serialized = entries.join("\n");
+    let Ok(store) = CookieStore::load(BufReader::new(Cursor::new(serialized.as_bytes())), |line| {
+        serde_json::from_str::<cookie_store::Cookie<'static>>(line)
+    }) else {
+        return CookieStore::default();
+    };
+    if cookie_store_within_quotas(&store) {
+        store
+    } else {
+        CookieStore::default()
     }
 }
 
@@ -405,7 +474,8 @@ pub(crate) fn clamp_cookie_jar(
             if clamped_cookies.len() >= MAX_COOKIES_PER_DOMAIN {
                 break;
             }
-            clamped_cookies.insert(name, truncate_utf8_bytes(value.as_str(), 1024));
+            clamped_cookies
+                .insert(name, truncate_utf8_bytes(value.as_str(), MAX_COOKIE_VALUE_BYTES));
         }
         if !clamped_cookies.is_empty() {
             clamped.insert(domain, clamped_cookies);

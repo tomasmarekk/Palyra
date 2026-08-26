@@ -43,6 +43,7 @@ pub(crate) use anyhow::{Context, Result};
 pub(crate) use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 pub(crate) use base64::Engine as _;
 pub(crate) use clap::Parser;
+pub(crate) use cookie_store::{CookieStore, RawCookie};
 pub(crate) use headless_chrome::{
     browser::tab::RequestPausedDecision,
     protocol::cdp::{Fetch, Network},

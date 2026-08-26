@@ -1445,7 +1445,11 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             session.last_active = Instant::now();
             let timeout_ms =
                 request_timeout_ms(payload.timeout_ms, session.budget.max_navigation_timeout_ms);
-            let cookie_header = cookie_header_for_url(session, url.as_str());
+            let cookie_header = if self.runtime.engine_mode == BrowserEngineMode::Simulated {
+                cookie_header_for_url(session, url.as_str())
+            } else {
+                None
+            };
             (
                 timeout_ms,
                 session.budget.max_response_bytes,
@@ -1485,7 +1489,6 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                         },
                         allow_private_targets,
                         max_response_bytes,
-                        cookie_header: cookie_header.clone(),
                     },
                 )
                 .await
@@ -3762,6 +3765,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             if clear_cookies {
                 cookies_cleared =
                     session.cookie_jar.values().map(|cookies| cookies.len() as u32).sum::<u32>();
+                session.cookie_store.clear();
                 session.cookie_jar.clear();
             }
             if clear_storage {
@@ -3977,7 +3981,11 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             } else {
                 payload.allow_private_targets || session.allow_private_targets
             };
-            let cookie_header = cookie_header_for_url(session, url.as_str());
+            let cookie_header = if self.runtime.engine_mode == BrowserEngineMode::Simulated {
+                cookie_header_for_url(session, url.as_str())
+            } else {
+                None
+            };
             (created_tab_id, timeout_ms, max_response_bytes, allow_private_targets, cookie_header)
         };
         let mut session_for_persist = None;
@@ -4051,7 +4059,6 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                             },
                             allow_private_targets,
                             max_response_bytes,
-                            cookie_header: cookie_header.clone(),
                         },
                     )
                     .await

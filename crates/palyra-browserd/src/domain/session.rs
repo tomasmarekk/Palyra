@@ -291,6 +291,7 @@ pub(crate) struct BrowserSessionRecord {
     pub(crate) tab_order: Vec<String>,
     pub(crate) active_tab_id: String,
     pub(crate) permissions: SessionPermissionsInternal,
+    pub(crate) cookie_store: CookieStore,
     pub(crate) cookie_jar: HashMap<String, HashMap<String, String>>,
     pub(crate) storage_entries: HashMap<String, HashMap<String, String>>,
     pub(crate) persistence: SessionPersistenceState,
@@ -321,6 +322,7 @@ impl BrowserSessionRecord {
             tab_order: vec![initial_tab_id.clone()],
             active_tab_id: initial_tab_id,
             permissions: SessionPermissionsInternal::default(),
+            cookie_store: CookieStore::default(),
             cookie_jar: HashMap::new(),
             storage_entries: HashMap::new(),
             persistence: init.persistence,
@@ -451,7 +453,13 @@ impl BrowserSessionRecord {
         }
         self.tabs = tabs;
         self.permissions = snapshot.permissions;
-        self.cookie_jar = clamp_cookie_jar(snapshot.cookie_jar);
+        let had_attribute_store = !snapshot.cookie_store.is_empty();
+        self.cookie_store = restore_cookie_store(snapshot.cookie_store);
+        self.cookie_jar = if had_attribute_store {
+            cookie_debug_jar(&self.cookie_store)
+        } else {
+            clamp_cookie_jar(snapshot.cookie_jar)
+        };
         self.storage_entries = clamp_storage_entries(snapshot.storage_entries);
     }
 }
@@ -565,12 +573,11 @@ impl BrowserRuntimeState {
     }
 }
 
-/// A single cookie mutation; an empty `value` deletes the cookie (see `apply_cookie_updates`).
+/// One parsed `Set-Cookie` mutation bound to the URL that supplied it.
 #[derive(Debug, Clone)]
 pub(crate) struct CookieUpdate {
-    pub(crate) domain: String,
-    pub(crate) name: String,
-    pub(crate) value: String,
+    pub(crate) request_url: Url,
+    pub(crate) cookie: RawCookie<'static>,
 }
 
 /// Result of a navigation attempt, including captured logs and cookie updates to apply.

@@ -22,6 +22,8 @@ pub(crate) struct PersistedSessionSnapshot {
     pub(crate) tab_order: Vec<String>,
     pub(crate) active_tab_id: String,
     pub(crate) permissions: SessionPermissionsInternal,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) cookie_store: Vec<String>,
     pub(crate) cookie_jar: HashMap<String, HashMap<String, String>>,
     pub(crate) storage_entries: HashMap<String, HashMap<String, String>>,
     #[serde(default)]
@@ -94,6 +96,8 @@ pub(crate) struct PersistedSessionSnapshotForHash {
     pub(crate) tab_order: Vec<String>,
     pub(crate) active_tab_id: String,
     pub(crate) permissions: SessionPermissionsInternal,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) cookie_store: Vec<String>,
     pub(crate) cookie_jar: BTreeMap<String, BTreeMap<String, String>>,
     pub(crate) storage_entries: BTreeMap<String, BTreeMap<String, String>>,
     pub(crate) state_revision: u64,

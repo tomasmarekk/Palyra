@@ -185,7 +185,25 @@ pub(crate) struct ChromiumNavigateParams {
     pub(crate) max_redirects: u32,
     pub(crate) allow_private_targets: bool,
     pub(crate) max_response_bytes: u64,
-    pub(crate) cookie_header: Option<String>,
+}
+
+/// Runs the duplicate Chromium policy fetch without browser session credentials.
+///
+/// Chromium remains the sole cookie authority for the subsequent real
+/// navigation, so this guard must never accept or attach a cookie header.
+pub(crate) async fn chromium_navigation_policy_preflight(
+    params: &ChromiumNavigateParams,
+) -> NavigateOutcome {
+    navigate_with_guards(
+        params.raw_url.as_str(),
+        params.timeout_ms,
+        params.allow_redirects,
+        params.max_redirects,
+        params.allow_private_targets,
+        params.max_response_bytes,
+        None,
+    )
+    .await
 }
 
 fn clamp_chromium_snapshot(
@@ -4037,20 +4055,20 @@ fn chromium_read_document_cookies_script() -> String {
     format!(
         r#"
 (() => {{
-  const MAX_COOKIE_CHARS = {max_cookie_chars};
-  try {{
-    const location = window.location || {{}};
-    const domain = String(location.hostname || "").trim().toLowerCase();
-    const rawCookie = String(document.cookie || "");
-    const cookie = rawCookie.length > MAX_COOKIE_CHARS
-      ? rawCookie.slice(0, MAX_COOKIE_CHARS)
-      : rawCookie;
-    return JSON.stringify({{ ok: true, domain, cookie }});
-  }} catch (error) {{
-    return JSON.stringify({{
-      ok: false,
-      domain: "",
-      cookie: "",
+    const MAX_COOKIE_CHARS = {max_cookie_chars};
+    try {{
+      const location = window.location || {{}};
+      const url = String(location.href || "");
+      const rawCookie = String(document.cookie || "");
+      const cookie = rawCookie.length > MAX_COOKIE_CHARS
+        ? rawCookie.slice(0, MAX_COOKIE_CHARS)
+        : rawCookie;
+      return JSON.stringify({{ ok: true, url, cookie }});
+    }} catch (error) {{
+      return JSON.stringify({{
+        ok: false,
+        url: "",
+        cookie: "",
       error: String((error && (error.message || error)) || "")
     }});
   }}
@@ -4156,16 +4174,12 @@ fn parse_chromium_document_cookie_snapshot(
             .unwrap_or("unknown document.cookie read failure");
         return Err(format!("document.cookie read failed: {error}"));
     }
-    let domain = object
-        .get("domain")
+    let request_url = object
+        .get("url")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .trim_matches('.')
-        .to_ascii_lowercase();
-    if domain.is_empty() {
-        return Ok(Vec::new());
-    }
+        .and_then(|value| Url::parse(value.trim()).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .ok_or_else(|| "document.cookie read returned an invalid page URL".to_owned())?;
     let cookie = object.get("cookie").and_then(serde_json::Value::as_str).unwrap_or_default();
     let mut updates = Vec::new();
     for pair in cookie.split(';').take(MAX_COOKIES_PER_DOMAIN * 4) {
@@ -4177,14 +4191,15 @@ fn parse_chromium_document_cookie_snapshot(
         if name.is_empty() || value.is_empty() {
             continue;
         }
-        if updates.iter().any(|update: &CookieUpdate| update.name == name) {
+        if updates.iter().any(|update: &CookieUpdate| update.cookie.name() == name) {
             continue;
         }
-        updates.push(CookieUpdate {
-            domain: domain.clone(),
-            name,
-            value: truncate_utf8_bytes(value, 1024),
-        });
+        let mut cookie = RawCookie::new(name, truncate_utf8_bytes(value, 1024));
+        // document.cookie omits transport attributes. Marking the auxiliary
+        // copy Secure is a conservative scope reduction; Chromium retains the
+        // authoritative cookie with its complete attributes.
+        cookie.set_secure(true);
+        updates.push(CookieUpdate { request_url: request_url.clone(), cookie });
         if updates.len() >= MAX_COOKIES_PER_DOMAIN {
             break;
         }
@@ -4714,19 +4729,7 @@ pub(crate) async fn navigate_tab_with_chromium(
     tab_id: &str,
     params: &ChromiumNavigateParams,
 ) -> NavigateOutcome {
-    // The guarded HTTP fetch validates the target first (redirect policy,
-    // private-target checks, response budget); Chromium then navigates to the
-    // vetted final URL only when that pre-flight succeeded.
-    let mut outcome = navigate_with_guards(
-        params.raw_url.as_str(),
-        params.timeout_ms,
-        params.allow_redirects,
-        params.max_redirects,
-        params.allow_private_targets,
-        params.max_response_bytes,
-        params.cookie_header.as_deref(),
-    )
-    .await;
+    let mut outcome = chromium_navigation_policy_preflight(params).await;
     if !outcome.success {
         return outcome;
     }
@@ -7010,7 +7013,7 @@ mod tests {
     #[test]
     fn parse_chromium_document_cookie_snapshot_accepts_visible_cookies() {
         let raw = serde_json::Value::String(
-            r#"{"ok":true,"domain":"LOCALHOST","cookie":"qaCookie=visible; theme=dark"}"#
+            r#"{"ok":true,"url":"https://localhost/account/page","cookie":"qaCookie=visible; theme=dark"}"#
                 .to_owned(),
         );
 
@@ -7019,11 +7022,13 @@ mod tests {
                 .expect("document.cookie payload should parse");
 
         assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].domain, "localhost");
-        assert_eq!(updates[0].name, "qacookie");
-        assert_eq!(updates[0].value, "visible");
-        assert_eq!(updates[1].name, "theme");
-        assert_eq!(updates[1].value, "dark");
+        assert_eq!(updates[0].request_url.host_str(), Some("localhost"));
+        assert_eq!(updates[0].cookie.name(), "qacookie");
+        assert_eq!(updates[0].cookie.value(), "visible");
+        assert_eq!(updates[0].cookie.secure(), Some(true));
+        assert_eq!(updates[1].cookie.name(), "theme");
+        assert_eq!(updates[1].cookie.value(), "dark");
+        assert_eq!(updates[1].cookie.secure(), Some(true));
     }
 
     #[test]
