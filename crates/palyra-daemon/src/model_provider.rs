@@ -95,10 +95,10 @@ use palyra_model_providers::{
     failover_provider_classification, invalid_response_classification,
     provider_output_from_text_and_tools, provider_request_has_vision,
     qa_mock_provider_output_for_attempt, qa_mock_provider_turn_for_request,
-    retry_provider_classification, retryable_invalid_response_classification,
-    user_action_provider_classification, ANTHROPIC_API_VERSION, MAX_QA_MOCK_PROVIDER_ATTEMPTS,
-    MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS, MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES,
-    MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS,
+    resolve_openai_base_url_network_policy, retry_provider_classification,
+    retryable_invalid_response_classification, user_action_provider_classification,
+    ANTHROPIC_API_VERSION, MAX_QA_MOCK_PROVIDER_ATTEMPTS, MAX_QA_MOCK_PROVIDER_ATTEMPT_LATENCY_MS,
+    MAX_QA_MOCK_PROVIDER_FIXTURE_BYTES, MAX_QA_MOCK_PROVIDER_TOTAL_LATENCY_MS,
     OPENAI_CODEX_BACKEND_BASE_URL as OPENAI_CODEX_RESPONSES_BASE_URL,
 };
 #[allow(unused_imports)]
@@ -1191,6 +1191,40 @@ pub trait EmbeddingsProvider: Send + Sync {
 pub fn build_model_provider(config: &ModelProviderConfig) -> Result<Arc<dyn ModelProvider>> {
     validate_model_provider_config(config)?;
     Ok(Arc::new(RegistryBackedModelProvider::new(config.clone())?))
+}
+
+/// Builds a provider client whose DNS answers are the exact addresses accepted
+/// by network policy. Redirects and ambient proxies stay disabled so neither
+/// can introduce an unvalidated destination after client construction.
+pub(crate) fn build_provider_http_client(
+    base_urls: &[&str],
+    allow_private_base_url: bool,
+    timeout: Duration,
+) -> Result<Client> {
+    if base_urls.is_empty() {
+        anyhow::bail!("provider HTTP client requires at least one base URL");
+    }
+
+    let mut pinned_hosts = HashMap::<String, Vec<std::net::SocketAddr>>::new();
+    for base_url in base_urls {
+        let target = resolve_openai_base_url_network_policy(base_url, allow_private_base_url)?;
+        if target.resolved_addresses.is_empty() || target.host.parse::<std::net::IpAddr>().is_ok() {
+            continue;
+        }
+        let addresses = pinned_hosts.entry(target.host).or_default();
+        for address in target.resolved_addresses {
+            if !addresses.contains(&address) {
+                addresses.push(address);
+            }
+        }
+    }
+
+    let mut builder =
+        Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none()).no_proxy();
+    for (host, addresses) in &pinned_hosts {
+        builder = builder.resolve_to_addrs(host, addresses);
+    }
+    builder.build().context("failed to build provider HTTP client")
 }
 
 /// Runs an in-memory provider failover self-check without reading real config
@@ -4580,10 +4614,12 @@ impl OpenAiCompatibleEmbeddingsProvider {
         if config.openai_embeddings_model.is_none() {
             return Err(ProviderError::MissingEmbeddingsModel.into());
         }
-        let client = Client::builder()
-            .timeout(Duration::from_millis(config.request_timeout_ms))
-            .build()
-            .context("failed to build openai-compatible embeddings HTTP client")?;
+        let client = build_provider_http_client(
+            &[config.openai_base_url.as_str()],
+            config.allow_private_base_url,
+            Duration::from_millis(config.request_timeout_ms),
+        )
+        .context("failed to build openai-compatible embeddings HTTP client")?;
         Ok(Self { config: config.clone(), client })
     }
 
@@ -4827,10 +4863,16 @@ impl OpenAiCompatibleProvider {
         config: &ModelProviderConfig,
         audio_transcription_model_id: Option<String>,
     ) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_millis(config.request_timeout_ms))
-            .build()
-            .context("failed to build openai-compatible provider HTTP client")?;
+        let mut base_urls = vec![config.openai_base_url.as_str()];
+        if uses_openai_public_api_base_url(config.openai_base_url.as_str()) {
+            base_urls.push(OPENAI_CODEX_RESPONSES_BASE_URL);
+        }
+        let client = build_provider_http_client(
+            base_urls.as_slice(),
+            config.allow_private_base_url,
+            Duration::from_millis(config.request_timeout_ms),
+        )
+        .context("failed to build openai-compatible provider HTTP client")?;
         Ok(Self {
             config: config.clone(),
             audio_transcription_model_id,
@@ -4946,7 +4988,7 @@ impl OpenAiCompatibleProvider {
 
     fn codex_responses_base_url(&self) -> String {
         let configured = self.config.openai_base_url.trim_end_matches('/');
-        if configured.to_ascii_lowercase().contains("api.openai.com") {
+        if uses_openai_public_api_base_url(configured) {
             OPENAI_CODEX_RESPONSES_BASE_URL.to_owned()
         } else {
             configured.to_owned()
@@ -5576,6 +5618,13 @@ fn openai_chatgpt_account_id_from_token(token: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn uses_openai_public_api_base_url(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
 }
 
 fn openai_base_url_supports_service_tier(base_url: &str) -> bool {
@@ -6472,10 +6521,12 @@ struct AnthropicProvider {
 
 impl AnthropicProvider {
     fn new(config: &ModelProviderConfig) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_millis(config.request_timeout_ms))
-            .build()
-            .context("failed to build anthropic provider HTTP client")?;
+        let client = build_provider_http_client(
+            &[config.anthropic_base_url.as_str()],
+            config.allow_private_base_url,
+            Duration::from_millis(config.request_timeout_ms),
+        )
+        .context("failed to build anthropic provider HTTP client")?;
         Ok(Self {
             config: config.clone(),
             client,
@@ -7301,12 +7352,12 @@ mod tests {
     };
 
     use super::{
-        build_embeddings_provider, build_model_provider, capability_defaults_for_kind,
-        classify_http_provider_failure, extract_completion_text, normalize_tool_arguments,
-        parse_openai_codex_sse_response, provider_attempt_index, provider_seconds_to_millis,
-        qa_live_provider_base_url_sha256, qa_live_provider_binding_sha256,
-        qa_provider_binding_sha256, retry_after_ms_from_header_value,
-        run_provider_failover_self_check, sanitize_remote_error,
+        build_embeddings_provider, build_model_provider, build_provider_http_client,
+        capability_defaults_for_kind, classify_http_provider_failure, extract_completion_text,
+        normalize_tool_arguments, parse_openai_codex_sse_response, provider_attempt_index,
+        provider_seconds_to_millis, qa_live_provider_base_url_sha256,
+        qa_live_provider_binding_sha256, qa_provider_binding_sha256,
+        retry_after_ms_from_header_value, run_provider_failover_self_check, sanitize_remote_error,
         validate_openai_base_url_network_policy_with_resolver,
         validate_qa_mock_provider_attempt_bounds, AnthropicCompatibleChatAdapter,
         AnthropicProvider, AudioSynthesisRequest, AudioTranscriptionRequest, EmbeddingsRequest,
@@ -11064,6 +11115,34 @@ turns:
             |_host, _port| Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]),
         )
         .expect("hostname resolving to public IP should pass private-network guard");
+    }
+
+    #[tokio::test]
+    async fn provider_http_client_never_follows_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener address should resolve");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("redirect request should arrive");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("redirect request should be readable");
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("redirect response should be written");
+        });
+        let base_url = format!("http://{address}");
+        let client = build_provider_http_client(&[base_url.as_str()], true, Duration::from_secs(2))
+            .expect("provider client should build");
+
+        let response = client
+            .get(format!("{base_url}/redirect"))
+            .send()
+            .await
+            .expect("redirect response should be returned without following it");
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        handle.join().expect("redirect server should exit");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
 };
 
@@ -1160,7 +1160,35 @@ pub fn validate_openai_base_url_network_policy(
     base_url: &str,
     allow_private_base_url: bool,
 ) -> Result<()> {
-    validate_openai_base_url_network_policy_with_resolver(
+    resolve_openai_base_url_network_policy(base_url, allow_private_base_url).map(|_| ())
+}
+
+/// The hostname, port, and exact addresses accepted by provider network policy.
+///
+/// Runtime HTTP clients must pin `resolved_addresses` to `host` so the
+/// connection cannot perform a second, attacker-controlled DNS resolution.
+/// The address list is empty only when private targets were explicitly opted
+/// into and the host therefore does not require public-address enforcement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderBaseUrlNetworkTarget {
+    /// Normalized URL hostname used as the HTTP client's resolver key.
+    pub host: String,
+    /// Explicit or scheme-default destination port.
+    pub port: u16,
+    /// Policy-approved socket addresses to pin for this hostname.
+    pub resolved_addresses: Vec<SocketAddr>,
+}
+
+/// Resolves and validates a provider base URL for connection-time DNS pinning.
+///
+/// # Errors
+/// Returns an error under the same fail-closed conditions as
+/// [`validate_openai_base_url_network_policy`].
+pub fn resolve_openai_base_url_network_policy(
+    base_url: &str,
+    allow_private_base_url: bool,
+) -> Result<ProviderBaseUrlNetworkTarget> {
+    resolve_openai_base_url_network_policy_with_resolver(
         base_url,
         allow_private_base_url,
         resolve_hostname_ip_addrs,
@@ -1176,14 +1204,36 @@ pub fn validate_openai_base_url_network_policy_with_resolver<F>(
 where
     F: Fn(&str, u16) -> std::io::Result<Vec<IpAddr>>,
 {
+    resolve_openai_base_url_network_policy_with_resolver(base_url, allow_private_base_url, resolver)
+        .map(|_| ())
+}
+
+#[doc(hidden)]
+pub fn resolve_openai_base_url_network_policy_with_resolver<F>(
+    base_url: &str,
+    allow_private_base_url: bool,
+    resolver: F,
+) -> Result<ProviderBaseUrlNetworkTarget>
+where
+    F: Fn(&str, u16) -> std::io::Result<Vec<IpAddr>>,
+{
     let parsed = reqwest::Url::parse(base_url)
         .context("model_provider.openai_base_url must be a valid absolute URL")?;
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("model_provider.openai_base_url must include a host"))?;
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        anyhow::anyhow!(
+            "model_provider.openai_base_url must include an explicit port for unknown URL schemes"
+        )
+    })?;
 
     if allow_private_base_url {
-        return Ok(());
+        return Ok(ProviderBaseUrlNetworkTarget {
+            host: host.to_owned(),
+            port,
+            resolved_addresses: Vec::new(),
+        });
     }
 
     if is_localhost_hostname(host) {
@@ -1199,14 +1249,13 @@ where
                 host
             );
         }
-        return Ok(());
+        return Ok(ProviderBaseUrlNetworkTarget {
+            host: host.to_owned(),
+            port,
+            resolved_addresses: vec![SocketAddr::new(address, port)],
+        });
     }
 
-    let port = parsed.port_or_known_default().ok_or_else(|| {
-        anyhow::anyhow!(
-            "model_provider.openai_base_url must include an explicit port for unknown URL schemes"
-        )
-    })?;
     let resolved_addresses = resolver(host, port).map_err(|error| {
         anyhow::anyhow!(
             "model_provider.openai_base_url host '{}' could not be resolved to enforce private-network guard: {}; set model_provider.allow_private_base_url=true or PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL=true to override for trusted local testing",
@@ -1221,7 +1270,8 @@ where
         );
     }
     if let Some(address) = resolved_addresses
-        .into_iter()
+        .iter()
+        .copied()
         .find(|address| palyra_common::netguard::is_private_or_local_ip(*address))
     {
         anyhow::bail!(
@@ -1230,7 +1280,14 @@ where
             address
         );
     }
-    Ok(())
+    Ok(ProviderBaseUrlNetworkTarget {
+        host: host.to_owned(),
+        port,
+        resolved_addresses: resolved_addresses
+            .into_iter()
+            .map(|address| SocketAddr::new(address, port))
+            .collect(),
+    })
 }
 
 fn resolve_hostname_ip_addrs(host: &str, port: u16) -> std::io::Result<Vec<IpAddr>> {
@@ -1254,6 +1311,7 @@ mod tests {
 
     use super::{
         configured_model_ids_by_provider, preserved_unresolved_default_chat_model_for_provider,
+        resolve_openai_base_url_network_policy_with_resolver,
         validate_openai_base_url_network_policy_with_resolver, ModelProviderAuthProviderKind,
         ModelProviderConfig, ModelProviderKind,
     };
@@ -1379,5 +1437,47 @@ mod tests {
 
         assert!(rendered.contains("resolves to private/local address"));
         assert!(rendered.contains("allow_private_base_url"));
+    }
+
+    #[test]
+    fn base_url_guard_rejects_mixed_public_and_private_dns_results() {
+        let error = validate_openai_base_url_network_policy_with_resolver(
+            "https://api.example.invalid/v1",
+            false,
+            |_host, _port| {
+                Ok(vec![
+                    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                ])
+            },
+        )
+        .expect_err("one private DNS answer must reject the complete answer set");
+
+        assert!(error.to_string().contains("resolves to private/local address"));
+    }
+
+    #[test]
+    fn base_url_guard_returns_exact_public_addresses_for_client_pinning() {
+        let target = resolve_openai_base_url_network_policy_with_resolver(
+            "https://api.example.invalid:8443/v1",
+            false,
+            |_host, _port| {
+                Ok(vec![
+                    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                ])
+            },
+        )
+        .expect("public DNS answers should be retained");
+
+        assert_eq!(target.host, "api.example.invalid");
+        assert_eq!(target.port, 8443);
+        assert_eq!(
+            target.resolved_addresses,
+            vec![
+                "8.8.8.8:8443".parse().expect("socket address should parse"),
+                "1.1.1.1:8443".parse().expect("socket address should parse"),
+            ]
+        );
     }
 }

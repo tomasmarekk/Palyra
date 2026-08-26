@@ -120,9 +120,11 @@ pub(crate) async fn connect_openai_api_key(
     let api_key = normalize_required_openai_text(payload.api_key.as_str(), "api_key")?;
     let (document, _, _) = load_openai_console_config_snapshot()?;
     let validation_base_url = load_openai_validation_base_url(Some(&document));
+    let allow_private_base_url = load_provider_allow_private_base_url(&document);
     validate_openai_bearer_token(
         validation_base_url.as_str(),
         api_key.as_str(),
+        allow_private_base_url,
         OPENAI_HTTP_TIMEOUT,
     )
     .await
@@ -130,6 +132,7 @@ pub(crate) async fn connect_openai_api_key(
     let discovered_model_id = discover_explicit_tool_capable_openai_compatible_model_id(
         validation_base_url.as_str(),
         api_key.as_str(),
+        allow_private_base_url,
         OPENAI_HTTP_TIMEOUT,
     )
     .await
@@ -201,9 +204,11 @@ pub(crate) async fn connect_anthropic_api_key(
     let api_key = normalize_required_openai_text(payload.api_key.as_str(), "api_key")?;
     let (document, _, _) = load_openai_console_config_snapshot()?;
     let validation_base_url = load_anthropic_validation_base_url(Some(&document));
+    let allow_private_base_url = load_provider_allow_private_base_url(&document);
     validate_anthropic_api_key(
         validation_base_url.as_str(),
         api_key.as_str(),
+        allow_private_base_url,
         ANTHROPIC_HTTP_TIMEOUT,
     )
     .await
@@ -368,10 +373,13 @@ pub(crate) async fn connect_xai_oauth_tokens(
         normalize_required_openai_text(payload.refresh_token.as_str(), "refresh_token")?;
     let token_endpoint = normalize_xai_oauth_token_endpoint(payload.token_endpoint.as_str())?;
     let scopes = normalize_provider_oauth_scopes(payload.scopes.as_slice());
+    let (document, _, _) = load_openai_console_config_snapshot()?;
+    let allow_private_base_url = load_provider_allow_private_base_url(&document);
     let discovery_base_url = xai_model_discovery_base_url();
     let discovered_model_id = discover_preferred_openai_compatible_model_id(
         discovery_base_url.as_str(),
         access_token.as_str(),
+        allow_private_base_url,
         OPENAI_HTTP_TIMEOUT,
     )
     .await
@@ -985,9 +993,11 @@ pub(crate) async fn complete_openai_oauth_callback(
     // grant never lands in the vault or the auth registry.
     let (document, _, _) = load_openai_console_config_snapshot()?;
     let validation_base_url = load_openai_validation_base_url(Some(&document));
+    let allow_private_base_url = load_provider_allow_private_base_url(&document);
     if let Err(error) = validate_openai_bearer_token(
         validation_base_url.as_str(),
         token_result.access_token.as_str(),
+        allow_private_base_url,
         OPENAI_HTTP_TIMEOUT,
     )
     .await
@@ -3178,6 +3188,26 @@ fn load_anthropic_validation_base_url_with_env(
         .unwrap_or_else(|| ANTHROPIC_DEFAULT_BASE_URL.to_owned())
 }
 
+fn load_provider_allow_private_base_url(document: &toml::Value) -> bool {
+    let env_override = env::var("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL").ok();
+    load_provider_allow_private_base_url_with_env(env_override.as_deref(), document)
+}
+
+fn load_provider_allow_private_base_url_with_env(
+    env_override: Option<&str>,
+    document: &toml::Value,
+) -> bool {
+    match env_override.map(str::trim) {
+        Some("true") => true,
+        Some(_) => false,
+        None => get_value_at_path(document, "model_provider.allow_private_base_url")
+            .ok()
+            .flatten()
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
 fn xai_model_discovery_base_url() -> String {
     env::var(XAI_MODEL_DISCOVERY_BASE_URL_ENV)
         .ok()
@@ -3202,9 +3232,11 @@ async fn discover_preferred_openai_model_id_for_runtime(
                 ))
             })?;
             let base_url = load_openai_validation_base_url(Some(&document));
+            let allow_private_base_url = load_provider_allow_private_base_url(&document);
             discover_explicit_tool_capable_openai_compatible_model_id(
                 base_url.as_str(),
                 bearer_token,
+                allow_private_base_url,
                 OPENAI_HTTP_TIMEOUT,
             )
             .await
@@ -4195,16 +4227,18 @@ enum AnthropicCredentialValidationError {
 async fn validate_anthropic_api_key(
     base_url: &str,
     api_key: &str,
+    allow_private_base_url: bool,
     timeout: Duration,
 ) -> Result<(), AnthropicCredentialValidationError> {
     let base = base_url.trim().trim_end_matches('/');
     let endpoint =
         if base.ends_with("/v1") { format!("{base}/models") } else { format!("{base}/v1/models") };
-    let client = ReqwestClient::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| AnthropicCredentialValidationError::Unexpected(error.to_string()))?;
+    let client = crate::model_provider::build_provider_http_client(
+        &[endpoint.as_str()],
+        allow_private_base_url,
+        timeout,
+    )
+    .map_err(|error| AnthropicCredentialValidationError::Unexpected(error.to_string()))?;
 
     for attempt in 1..=ANTHROPIC_VALIDATION_RETRY_ATTEMPTS {
         let response = client
@@ -4270,7 +4304,7 @@ async fn discover_minimax_api_key_model_id(
 ) -> Result<String, AnthropicCredentialValidationError> {
     for attempt in 1..=ANTHROPIC_VALIDATION_RETRY_ATTEMPTS {
         let outcome =
-            discover_preferred_openai_compatible_model_id(base_url, api_key, timeout).await;
+            discover_preferred_openai_compatible_model_id(base_url, api_key, false, timeout).await;
         match outcome {
             Ok(Some(model_id)) => return Ok(model_id),
             Ok(None) => {
@@ -4765,6 +4799,7 @@ mod tests {
         let error = validate_anthropic_api_key(
             source_url.as_str(),
             "anthropic-test-secret",
+            true,
             Duration::from_secs(2),
         )
         .await
@@ -5044,6 +5079,29 @@ mod tests {
             ),
             "http://127.0.0.1:9911/v1"
         );
+    }
+
+    #[test]
+    fn provider_private_base_url_env_override_is_explicit_and_fail_closed() {
+        let enabled_document = toml::from_str::<toml::Value>(
+            r#"
+            [model_provider]
+            allow_private_base_url = true
+            "#,
+        )
+        .expect("enabled provider document should parse");
+        let disabled_document = toml::from_str::<toml::Value>(
+            r#"
+            [model_provider]
+            allow_private_base_url = false
+            "#,
+        )
+        .expect("disabled provider document should parse");
+
+        assert!(load_provider_allow_private_base_url_with_env(Some("true"), &disabled_document));
+        assert!(!load_provider_allow_private_base_url_with_env(Some("false"), &enabled_document));
+        assert!(!load_provider_allow_private_base_url_with_env(Some("invalid"), &enabled_document));
+        assert!(load_provider_allow_private_base_url_with_env(None, &enabled_document));
     }
 
     #[test]

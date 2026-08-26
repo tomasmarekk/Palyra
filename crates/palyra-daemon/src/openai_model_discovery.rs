@@ -11,9 +11,12 @@ use palyra_model_providers::{
     select_preferred_discovered_model_id_from_response,
     select_preferred_tool_capable_discovered_model_id_from_response, ProviderModelsResponseFormat,
 };
-use reqwest::{Client as ReqwestClient, Url};
+use reqwest::Url;
 
-use crate::{model_provider::sanitize_remote_error, openai_auth::OpenAiCredentialValidationError};
+use crate::{
+    model_provider::{build_provider_http_client, sanitize_remote_error},
+    openai_auth::OpenAiCredentialValidationError,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiModelDiscoveryFormat {
@@ -25,6 +28,7 @@ enum OpenAiModelDiscoveryFormat {
 pub(crate) async fn discover_preferred_openai_compatible_model_id(
     base_url: &str,
     bearer_token: &str,
+    allow_private_base_url: bool,
     timeout: Duration,
 ) -> Result<Option<String>, OpenAiCredentialValidationError> {
     let endpoint = provider_models_endpoint(base_url)
@@ -32,6 +36,7 @@ pub(crate) async fn discover_preferred_openai_compatible_model_id(
     discover_preferred_openai_model_id_from_endpoint(
         endpoint,
         bearer_token,
+        allow_private_base_url,
         timeout,
         OpenAiModelDiscoveryFormat::OpenAiCompatible,
     )
@@ -41,6 +46,7 @@ pub(crate) async fn discover_preferred_openai_compatible_model_id(
 pub(crate) async fn discover_explicit_tool_capable_openai_compatible_model_id(
     base_url: &str,
     bearer_token: &str,
+    allow_private_base_url: bool,
     timeout: Duration,
 ) -> Result<Option<String>, OpenAiCredentialValidationError> {
     let endpoint = provider_models_endpoint(base_url)
@@ -48,6 +54,7 @@ pub(crate) async fn discover_explicit_tool_capable_openai_compatible_model_id(
     discover_preferred_openai_model_id_from_endpoint(
         endpoint,
         bearer_token,
+        allow_private_base_url,
         timeout,
         OpenAiModelDiscoveryFormat::OpenAiCompatibleExplicitToolCapabilities,
     )
@@ -64,6 +71,7 @@ pub(crate) async fn discover_preferred_openai_chatgpt_codex_model_id(
     discover_preferred_openai_model_id_from_endpoint(
         endpoint,
         bearer_token,
+        false,
         timeout,
         OpenAiModelDiscoveryFormat::ChatGptCodex,
     )
@@ -73,13 +81,11 @@ pub(crate) async fn discover_preferred_openai_chatgpt_codex_model_id(
 async fn discover_preferred_openai_model_id_from_endpoint(
     endpoint: Url,
     bearer_token: &str,
+    allow_private_base_url: bool,
     timeout: Duration,
     format: OpenAiModelDiscoveryFormat,
 ) -> Result<Option<String>, OpenAiCredentialValidationError> {
-    let client = ReqwestClient::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+    let client = build_provider_http_client(&[endpoint.as_str()], allow_private_base_url, timeout)
         .map_err(|error| OpenAiCredentialValidationError::Unexpected(error.to_string()))?;
     let response = client
         .get(endpoint)

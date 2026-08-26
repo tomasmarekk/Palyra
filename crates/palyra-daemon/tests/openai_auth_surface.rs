@@ -43,6 +43,7 @@ fn console_openai_api_key_flow_persists_vault_refs_and_default_selection() -> Re
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
     ])?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -163,6 +164,7 @@ fn console_anthropic_api_key_flow_persists_vault_refs_and_default_selection() ->
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL".to_owned(), mock.base_url()),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
     ])?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -360,6 +362,7 @@ fn console_xai_oauth_token_flow_persists_vault_refs_and_default_selection() -> R
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_XAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
     ])?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -494,6 +497,7 @@ fn console_openai_default_selection_after_xai_resets_shared_endpoint() -> Result
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
         ("PALYRA_MODEL_PROVIDER_XAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
     ])?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -2163,6 +2167,7 @@ fn console_openai_default_selection_and_revoke_use_palyra_config_override() -> R
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_CONFIG".to_owned(), config_path.to_string_lossy().to_string()),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
     ];
     extra_env.extend(isolated_default_config_env());
 
@@ -2238,6 +2243,7 @@ fn console_anthropic_api_key_flow_surfaces_invalid_credentials() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL".to_owned(), mock.base_url()),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
     ])?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -2282,6 +2288,7 @@ fn console_openai_api_key_flow_surfaces_invalid_credentials() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
     ])?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -2359,6 +2366,7 @@ fn console_openai_provider_mutations_require_console_session_and_csrf() -> Resul
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
         ("PALYRA_OPENAI_OAUTH_AUTHORIZATION_ENDPOINT".to_owned(), mock.authorization_endpoint()),
         ("PALYRA_OPENAI_OAUTH_TOKEN_ENDPOINT".to_owned(), mock.token_endpoint()),
         ("PALYRA_OPENAI_OAUTH_REVOCATION_ENDPOINT".to_owned(), mock.revocation_endpoint()),
@@ -2467,6 +2475,7 @@ fn console_openai_oauth_flow_supports_happy_path_refresh_reconnect_and_revoke() 
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
         ("PALYRA_OPENAI_OAUTH_AUTHORIZATION_ENDPOINT".to_owned(), mock.authorization_endpoint()),
         ("PALYRA_OPENAI_OAUTH_TOKEN_ENDPOINT".to_owned(), mock.token_endpoint()),
         ("PALYRA_OPENAI_OAUTH_REVOCATION_ENDPOINT".to_owned(), mock.revocation_endpoint()),
@@ -2755,6 +2764,7 @@ fn console_openai_oauth_bootstrap_uses_configured_remote_base_url_for_redirect_u
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_CONFIG".to_owned(), config_path_string),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), validation_base_url),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
         ("PALYRA_OPENAI_OAUTH_AUTHORIZATION_ENDPOINT".to_owned(), authorization_endpoint),
         ("PALYRA_OPENAI_OAUTH_TOKEN_ENDPOINT".to_owned(), token_endpoint),
         ("PALYRA_OPENAI_OAUTH_REVOCATION_ENDPOINT".to_owned(), revocation_endpoint),
@@ -2807,6 +2817,7 @@ fn console_openai_oauth_bootstrap_rejects_forwarded_host_without_trusted_remote_
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
         ("PALYRA_OPENAI_OAUTH_AUTHORIZATION_ENDPOINT".to_owned(), mock.authorization_endpoint()),
         ("PALYRA_OPENAI_OAUTH_TOKEN_ENDPOINT".to_owned(), mock.token_endpoint()),
         ("PALYRA_OPENAI_OAUTH_REVOCATION_ENDPOINT".to_owned(), mock.revocation_endpoint()),
@@ -2855,6 +2866,7 @@ fn console_openai_oauth_callback_rejects_malformed_token_response_without_persis
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
         ("PALYRA_OPENAI_OAUTH_AUTHORIZATION_ENDPOINT".to_owned(), mock.authorization_endpoint()),
         ("PALYRA_OPENAI_OAUTH_TOKEN_ENDPOINT".to_owned(), mock.token_endpoint()),
         ("PALYRA_OPENAI_OAUTH_REVOCATION_ENDPOINT".to_owned(), mock.revocation_endpoint()),
@@ -2955,6 +2967,7 @@ fn console_openai_oauth_callback_denial_persists_failed_attempt_state() -> Resul
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
         ("PALYRA_OPENAI_OAUTH_AUTHORIZATION_ENDPOINT".to_owned(), mock.authorization_endpoint()),
         ("PALYRA_OPENAI_OAUTH_TOKEN_ENDPOINT".to_owned(), mock.token_endpoint()),
         ("PALYRA_OPENAI_OAUTH_REVOCATION_ENDPOINT".to_owned(), mock.revocation_endpoint()),

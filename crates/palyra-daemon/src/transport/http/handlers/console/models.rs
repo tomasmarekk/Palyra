@@ -521,10 +521,11 @@ async fn probe_console_provider(
     };
     payload.endpoint_base_url = Some(endpoint.base_url.clone());
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(timeout_ms))
-        .build()
-    {
+    let client = match crate::model_provider::build_provider_http_client(
+        &[endpoint.url.as_str()],
+        target.allow_private_base_url,
+        std::time::Duration::from_millis(timeout_ms),
+    ) {
         Ok(client) => client,
         Err(error) => {
             payload.state = "endpoint_failed".to_owned();

@@ -259,15 +259,17 @@ pub(crate) async fn exchange_authorization_code(
 pub(crate) async fn validate_openai_bearer_token(
     base_url: &str,
     bearer_token: &str,
+    allow_private_base_url: bool,
     timeout: Duration,
 ) -> Result<(), OpenAiCredentialValidationError> {
     let endpoint = openai_models_endpoint(base_url)
         .map_err(|error| OpenAiCredentialValidationError::Unexpected(error.to_string()))?;
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| OpenAiCredentialValidationError::Unexpected(error.to_string()))?;
+    let client = crate::model_provider::build_provider_http_client(
+        &[endpoint.as_str()],
+        allow_private_base_url,
+        timeout,
+    )
+    .map_err(|error| OpenAiCredentialValidationError::Unexpected(error.to_string()))?;
 
     for attempt_index in 0..OPENAI_VALIDATION_RETRY_ATTEMPTS {
         let response = client.get(endpoint.clone()).bearer_auth(bearer_token).send().await;
