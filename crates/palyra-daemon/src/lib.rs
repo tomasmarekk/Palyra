@@ -5418,10 +5418,11 @@ struct RemoteBindGuardConfig {
 
 /// Fail-closed gate for exposing any listener beyond loopback.
 ///
-/// Loopback-only binds always pass. A non-loopback bind requires all of: a
-/// bind profile that allows remote exposure, gateway TLS, an authenticated
-/// admin surface, node-RPC mTLS for remote gRPC/QUIC, active admin rate
-/// limits, and the dual (config + env) dangerous-remote-bind acknowledgement.
+/// The plaintext admin listener must remain on loopback. A non-loopback
+/// gRPC/QUIC bind requires all of: a bind profile that allows remote exposure,
+/// gateway TLS, an authenticated admin surface, node-RPC mTLS, active admin
+/// rate limits, and the dual (config + env) dangerous-remote-bind
+/// acknowledgement.
 ///
 /// # Errors
 ///
@@ -5441,6 +5442,13 @@ fn enforce_remote_bind_guard(
     let remote_bind_detected = admin_remote || grpc_remote || quic_remote;
     if !remote_bind_detected {
         return Ok(());
+    }
+
+    if admin_remote {
+        anyhow::bail!(
+            "refusing non-loopback admin bind because the admin/console listener has no TLS termination: admin={} (keep daemon.bind_addr on loopback and expose it only through a trusted TLS reverse proxy or tunnel)",
+            admin_address,
+        );
     }
 
     let bind_profile_allows_remote =
@@ -6803,7 +6811,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_bind_guard_allows_hardened_remote_profile() {
+    fn remote_bind_guard_rejects_remote_admin_even_with_gateway_tls() {
         let result = enforce_remote_bind_guard(
             RemoteBindEndpoints {
                 admin_address: "0.0.0.0:7142".parse().expect("remote endpoint should parse"),
@@ -6821,7 +6829,34 @@ mod tests {
                 env_dangerous_remote_bind_ack: true,
             },
         );
-        assert!(result.is_ok(), "hardened public TLS profile should allow remote bind");
+        let error =
+            result.expect_err("gateway TLS must not authorize the plaintext admin listener");
+        assert!(
+            error.to_string().contains("admin/console listener has no TLS termination"),
+            "rejection should identify the unencrypted listener: {error}"
+        );
+    }
+
+    #[test]
+    fn remote_bind_guard_allows_hardened_gateway_with_loopback_admin() {
+        let result = enforce_remote_bind_guard(
+            RemoteBindEndpoints {
+                admin_address: "127.0.0.1:7142".parse().expect("loopback endpoint should parse"),
+                grpc_address: "0.0.0.0:7443".parse().expect("remote endpoint should parse"),
+                quic_address: None,
+            },
+            RemoteBindGuardConfig {
+                bind_profile: crate::config::GatewayBindProfile::PublicTls,
+                allow_insecure_remote: true,
+                gateway_tls_enabled: true,
+                admin_auth_required: true,
+                admin_token_configured: true,
+                node_rpc_mtls_required: true,
+                config_dangerous_remote_bind_ack: true,
+                env_dangerous_remote_bind_ack: true,
+            },
+        );
+        assert!(result.is_ok(), "hardened gateway exposure should remain available");
     }
 
     #[test]
