@@ -2,8 +2,10 @@
 //!
 //! Approval decisions may have side effects in channel pairing, device pairing,
 //! routine execution, and chat streams, so the handler keeps those follow-up
-//! synchronizations in one place after resolving the approval record.
+//! synchronizations in one place after resolving the approval record. General
+//! console access is restricted to the authenticated principal's records.
 
+use crate::app::state::ConsoleSession;
 use crate::*;
 
 /// Lists approval records visible to the console.
@@ -16,7 +18,8 @@ pub(crate) async fn console_approvals_list_handler(
     headers: HeaderMap,
     Query(query): Query<ConsoleApprovalsQuery>,
 ) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
+    let principal = scoped_console_approval_principal(&session, query.principal.as_deref())?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let decision = parse_console_approval_decision(query.decision.as_deref())?;
     let subject_type = parse_console_approval_subject_type(query.subject_type.as_deref())?;
@@ -28,7 +31,7 @@ pub(crate) async fn console_approvals_list_handler(
             query.since_unix_ms,
             query.until_unix_ms,
             query.subject_id,
-            query.principal,
+            Some(principal),
             decision,
             subject_type,
         )
@@ -51,7 +54,7 @@ pub(crate) async fn console_approval_get_handler(
     headers: HeaderMap,
     Path(approval_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    let session = authorize_console_session(&state, &headers, false)?;
     validate_canonical_id(approval_id.as_str()).map_err(|_| {
         runtime_status_response(tonic::Status::invalid_argument(
             "approval_id must be a canonical ULID",
@@ -67,6 +70,7 @@ pub(crate) async fn console_approval_get_handler(
                 "approval record not found: {approval_id}"
             )))
         })?;
+    authorize_console_approval_principal(&session, record.principal.as_str())?;
     Ok(Json(json!({ "approval": record })))
 }
 
@@ -112,6 +116,7 @@ pub(crate) async fn console_approval_decision_handler(
                 "approval record not found: {approval_id}"
             )))
         })?;
+    authorize_console_approval_principal(&session, pending.principal.as_str())?;
     super::routines::authorize_routine_approval_decision(
         &state,
         &pending,
@@ -120,17 +125,20 @@ pub(crate) async fn console_approval_decision_handler(
     .await?;
     let resolved = state
         .runtime
-        .resolve_approval_record(journal::ApprovalResolveRequest {
-            approval_id,
-            decision: if payload.approved {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
+        .resolve_approval_record_for_principal(
+            journal::ApprovalResolveRequest {
+                approval_id,
+                decision: if payload.approved {
+                    ApprovalDecision::Allow
+                } else {
+                    ApprovalDecision::Deny
+                },
+                decision_scope,
+                decision_reason: reason,
+                decision_scope_ttl_ms: payload.decision_scope_ttl_ms,
             },
-            decision_scope,
-            decision_reason: reason,
-            decision_scope_ttl_ms: payload.decision_scope_ttl_ms,
-        })
+            session.context.principal.clone(),
+        )
         .await
         .map_err(runtime_status_response)?;
     let pairing_outcome = if matches!(resolved.subject_type, ApprovalSubjectType::ChannelSend)
@@ -204,6 +212,40 @@ pub(crate) async fn console_approval_decision_handler(
 
 #[expect(
     clippy::result_large_err,
+    reason = "console authorization helpers return Response directly to preserve HTTP contracts"
+)]
+fn scoped_console_approval_principal(
+    session: &ConsoleSession,
+    requested_principal: Option<&str>,
+) -> Result<String, Response> {
+    if requested_principal.is_some_and(|principal| principal != session.context.principal) {
+        return Err(approval_scope_denied_response());
+    }
+    Ok(session.context.principal.clone())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "console authorization helpers return Response directly to preserve HTTP contracts"
+)]
+fn authorize_console_approval_principal(
+    session: &ConsoleSession,
+    approval_principal: &str,
+) -> Result<(), Response> {
+    if approval_principal != session.context.principal {
+        return Err(approval_scope_denied_response());
+    }
+    Ok(())
+}
+
+fn approval_scope_denied_response() -> Response {
+    runtime_status_response(tonic::Status::permission_denied(
+        "approval is outside the current console principal scope",
+    ))
+}
+
+#[expect(
+    clippy::result_large_err,
     reason = "console parsing helpers return Response directly to preserve HTTP contracts"
 )]
 fn parse_console_approval_decision(
@@ -261,5 +303,49 @@ fn parse_console_decision_scope(value: Option<&str>) -> Result<ApprovalDecisionS
         _ => Err(runtime_status_response(tonic::Status::invalid_argument(
             "decision_scope must be one of once|session|timeboxed",
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        authorize_console_approval_principal, scoped_console_approval_principal, ConsoleSession,
+    };
+    use crate::gateway::RequestContext;
+    use axum::http::StatusCode;
+
+    fn console_session(principal: &str) -> ConsoleSession {
+        ConsoleSession {
+            session_token_hash_sha256: "session-hash".to_owned(),
+            csrf_token: "csrf-token".to_owned(),
+            context: RequestContext {
+                principal: principal.to_owned(),
+                device_id: "console-device".to_owned(),
+                channel: Some("web".to_owned()),
+            },
+            issued_at_unix_ms: 1,
+            expires_at_unix_ms: 2,
+        }
+    }
+
+    #[test]
+    fn console_approval_authorization_rejects_foreign_principal() {
+        let session = console_session("user:alice");
+        let response = authorize_console_approval_principal(&session, "user:bob")
+            .expect_err("foreign approval must be denied");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn console_approval_list_is_pinned_to_authenticated_principal() {
+        let session = console_session("user:alice");
+        assert_eq!(
+            scoped_console_approval_principal(&session, None)
+                .expect("omitted filter should default to the session principal"),
+            "user:alice"
+        );
+        let response = scoped_console_approval_principal(&session, Some("user:bob"))
+            .expect_err("foreign principal filter must be denied");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

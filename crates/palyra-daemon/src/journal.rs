@@ -24484,6 +24484,28 @@ impl JournalStore {
         &self,
         request: &ApprovalResolveRequest,
     ) -> Result<ApprovalRecord, JournalError> {
+        self.resolve_approval_authorized(request, None)
+    }
+
+    /// Records a decision only when the approval belongs to
+    /// `expected_principal`.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::ApprovalNotFound`] for a missing or foreign
+    /// approval, or [`JournalError`] on storage failure.
+    pub fn resolve_approval_for_principal(
+        &self,
+        request: &ApprovalResolveRequest,
+        expected_principal: &str,
+    ) -> Result<ApprovalRecord, JournalError> {
+        self.resolve_approval_authorized(request, Some(expected_principal))
+    }
+
+    fn resolve_approval_authorized(
+        &self,
+        request: &ApprovalResolveRequest,
+        expected_principal: Option<&str>,
+    ) -> Result<ApprovalRecord, JournalError> {
         let now = current_unix_ms()?;
         let decision_reason =
             sanitize_object_text_field("reason", request.decision_reason.as_str())?;
@@ -24501,6 +24523,7 @@ impl JournalStore {
                     updated_at_unix_ms = ?6
                 WHERE approval_ulid = ?1
                     AND decision IS NULL
+                    AND (?7 IS NULL OR principal = ?7)
             "#,
             params![
                 request.approval_id,
@@ -24508,13 +24531,19 @@ impl JournalStore {
                 request.decision_scope.as_str(),
                 decision_reason,
                 request.decision_scope_ttl_ms,
-                now
+                now,
+                expected_principal,
             ],
         )?;
         let record =
             load_approval_by_id(&transaction, request.approval_id.as_str())?.ok_or_else(|| {
                 JournalError::ApprovalNotFound { approval_id: request.approval_id.clone() }
             })?;
+        if expected_principal.is_some_and(|principal| record.principal != principal) {
+            return Err(JournalError::ApprovalNotFound {
+                approval_id: request.approval_id.clone(),
+            });
+        }
         if updated == 0 && record.decision.is_none() {
             return Err(JournalError::ApprovalNotFound {
                 approval_id: request.approval_id.clone(),
@@ -54623,6 +54652,43 @@ mod tests {
 
         assert_eq!(denied.decision, Some(ApprovalDecision::Allow));
         assert_eq!(denied.decision_reason.as_deref(), Some("approved_by_external_console"));
+    }
+
+    #[test]
+    fn approval_resolution_is_principal_scoped_before_mutation() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let approval_id = "01ARZ3NDEKTSV4RRFFQ69G5FBZ";
+        store
+            .create_approval(&sample_approval_request(approval_id))
+            .expect("approval create should persist");
+        let request = ApprovalResolveRequest {
+            approval_id: approval_id.to_owned(),
+            decision: ApprovalDecision::Allow,
+            decision_scope: ApprovalDecisionScope::Once,
+            decision_reason: "approved_by_foreign_console".to_owned(),
+            decision_scope_ttl_ms: None,
+        };
+
+        let error = store
+            .resolve_approval_for_principal(&request, "user:other")
+            .expect_err("foreign principal must not resolve the approval");
+        assert!(matches!(
+            error,
+            JournalError::ApprovalNotFound { approval_id: ref rejected_id }
+                if rejected_id == approval_id
+        ));
+        let stored = store
+            .approval(approval_id)
+            .expect("approval lookup should succeed")
+            .expect("approval should still exist");
+        assert!(stored.decision.is_none(), "foreign resolution must not record a decision");
+
+        let resolved = store
+            .resolve_approval_for_principal(&request, "user:ops")
+            .expect("owning principal should resolve the approval");
+        assert_eq!(resolved.decision, Some(ApprovalDecision::Allow));
     }
 
     #[test]

@@ -17420,13 +17420,39 @@ impl GatewayRuntimeState {
         self: &Arc<Self>,
         request: ApprovalResolveRequest,
     ) -> Result<ApprovalRecord, Status> {
+        self.resolve_approval_record_authorized(request, None).await
+    }
+
+    /// Resolves an approval only when it belongs to `expected_principal`.
+    ///
+    /// # Errors
+    /// Returns not-found for a missing or foreign approval, the mapped
+    /// approval store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn resolve_approval_record_for_principal(
+        self: &Arc<Self>,
+        request: ApprovalResolveRequest,
+        expected_principal: String,
+    ) -> Result<ApprovalRecord, Status> {
+        self.resolve_approval_record_authorized(request, Some(expected_principal)).await
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn resolve_approval_record_authorized(
+        self: &Arc<Self>,
+        request: ApprovalResolveRequest,
+        expected_principal: Option<String>,
+    ) -> Result<ApprovalRecord, Status> {
         let decision = request.decision;
         let state = Arc::clone(self);
         let result = tokio::task::spawn_blocking(move || {
-            state
-                .journal_store
-                .resolve_approval(&request)
-                .map_err(|error| map_approval_store_error("resolve approval", error))
+            let resolved = match expected_principal {
+                Some(principal) => {
+                    state.journal_store.resolve_approval_for_principal(&request, principal.as_str())
+                }
+                None => state.journal_store.resolve_approval(&request),
+            };
+            resolved.map_err(|error| map_approval_store_error("resolve approval", error))
         })
         .await
         .map_err(|_| Status::internal("approval resolve worker panicked"))??;
