@@ -17,9 +17,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,6 +27,8 @@ jobs:
   prepare-release:
     name: Release / Prepare metadata (ubuntu-latest)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
@@ -62,16 +62,30 @@ jobs:
       - name: Derive release metadata
         id: meta
         shell: pwsh
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_RAW_REF: ${{ github.ref }}
+          RELEASE_REQUESTED_PUBLISH: ${{ github.event.inputs.publish }}
+          RELEASE_REQUESTED_VERSION: ${{ github.event.inputs.version }}
         run: |
           $repoVersion = (./scripts/release/assert-version-coherence.ps1).Trim()
-          $requestedVersion = "${{ github.event.inputs.version }}"
+          $versionPattern = '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$'
+          $tagPattern = '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$'
+          if ($repoVersion -notmatch $versionPattern) {
+            throw "Repo version '$repoVersion' is not a valid release version"
+          }
+
+          $requestedVersion = $env:RELEASE_REQUESTED_VERSION
+          if ($requestedVersion -and $requestedVersion -notmatch $versionPattern) {
+            throw "workflow_dispatch version '$requestedVersion' is not a valid release version"
+          }
           if ($requestedVersion -and $requestedVersion -ne $repoVersion) {
             throw "workflow_dispatch version '$requestedVersion' does not match repo version '$repoVersion'"
           }
 
           $tag =
-            if ("${{ github.event_name }}" -eq "push") {
-              $rawRef = "${{ github.ref }}"
+            if ($env:RELEASE_EVENT_NAME -eq "push") {
+              $rawRef = $env:RELEASE_RAW_REF
               if (-not $rawRef.StartsWith("refs/tags/v")) {
                 throw "Release workflow expects a refs/tags/v* ref, got $rawRef"
               }
@@ -80,14 +94,17 @@ jobs:
               "v$repoVersion"
             }
 
+          if ($tag -notmatch $tagPattern) {
+            throw "Release tag '$tag' is not a valid release tag"
+          }
           if ($tag -ne "v$repoVersion") {
             throw "Release tag '$tag' does not match repo version '$repoVersion'"
           }
 
           $publish =
-            if ("${{ github.event_name }}" -eq "push") {
+            if ($env:RELEASE_EVENT_NAME -eq "push") {
               "true"
-            } elseif ("${{ github.event.inputs.publish }}" -eq "true") {
+            } elseif ($env:RELEASE_REQUESTED_PUBLISH -eq "true") {
               "true"
             } else {
               "false"
@@ -135,9 +152,11 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          $version = "${{ steps.meta.outputs.version }}"
-          $tag = "${{ steps.meta.outputs.tag }}"
+          $version = $env:RELEASE_VERSION
+          $tag = $env:RELEASE_TAG
           $outputRoot = Join-Path $PWD "target/release-artifacts/release-metadata"
           $releaseNotesPath = Join-Path $outputRoot "release-notes-$version.md"
           $migrationNotesPath = Join-Path $outputRoot "migration-notes-$version.md"
@@ -152,6 +171,10 @@ jobs:
     name: Release / Desktop portable bundle (${{ matrix.os }})
     needs: prepare-release
     runs-on: ${{ matrix.runner }}
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -201,9 +224,11 @@ jobs:
       - name: Package portable desktop bundle
         id: package
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
           . ./scripts/release/common.ps1
-          $version = "${{ needs.prepare-release.outputs.version }}"
+          $version = $env:RELEASE_VERSION
           $platform = Get-PlatformSlug
           $outputRoot = Join-Path $PWD "target/release-artifacts/desktop"
           ./scripts/release/package-portable.ps1 `
@@ -262,20 +287,30 @@ jobs:
         if: needs.prepare-release.outputs.publish == 'true'
         shell: pwsh
         env:
+          ARCHIVE_CHECKSUM_PATH: ${{ steps.package.outputs.archive_checksum_path }}
+          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
+          CHECKSUMS_PATH: ${{ steps.package.outputs.checksums_path }}
           GH_TOKEN: ${{ github.token }}
+          MANIFEST_PATH: ${{ steps.package.outputs.manifest_path }}
+          PROVENANCE_PATH: ${{ steps.package.outputs.provenance_path }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
         run: |
-          gh release upload "${{ needs.prepare-release.outputs.tag }}" `
-            "${{ steps.package.outputs.archive_path }}" `
-            "${{ steps.package.outputs.manifest_path }}" `
-            "${{ steps.package.outputs.checksums_path }}" `
-            "${{ steps.package.outputs.archive_checksum_path }}" `
-            "${{ steps.package.outputs.provenance_path }}" `
+          gh release upload $env:RELEASE_TAG `
+            $env:ARCHIVE_PATH `
+            $env:MANIFEST_PATH `
+            $env:CHECKSUMS_PATH `
+            $env:ARCHIVE_CHECKSUM_PATH `
+            $env:PROVENANCE_PATH `
             --clobber
 
   headless-portable-package:
     name: Release / Headless portable package (ubuntu-latest)
     needs: prepare-release
     runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -307,9 +342,11 @@ jobs:
       - name: Package portable headless bundle
         id: package
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
           . ./scripts/release/common.ps1
-          $version = "${{ needs.prepare-release.outputs.version }}"
+          $version = $env:RELEASE_VERSION
           $platform = Get-PlatformSlug
           $outputRoot = Join-Path $PWD "target/release-artifacts/headless"
           ./scripts/release/package-portable.ps1 `
@@ -367,12 +404,18 @@ jobs:
         if: needs.prepare-release.outputs.publish == 'true'
         shell: pwsh
         env:
+          ARCHIVE_CHECKSUM_PATH: ${{ steps.package.outputs.archive_checksum_path }}
+          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
+          CHECKSUMS_PATH: ${{ steps.package.outputs.checksums_path }}
           GH_TOKEN: ${{ github.token }}
+          MANIFEST_PATH: ${{ steps.package.outputs.manifest_path }}
+          PROVENANCE_PATH: ${{ steps.package.outputs.provenance_path }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
         run: |
-          gh release upload "${{ needs.prepare-release.outputs.tag }}" `
-            "${{ steps.package.outputs.archive_path }}" `
-            "${{ steps.package.outputs.manifest_path }}" `
-            "${{ steps.package.outputs.checksums_path }}" `
-            "${{ steps.package.outputs.archive_checksum_path }}" `
-            "${{ steps.package.outputs.provenance_path }}" `
+          gh release upload $env:RELEASE_TAG `
+            $env:ARCHIVE_PATH `
+            $env:MANIFEST_PATH `
+            $env:CHECKSUMS_PATH `
+            $env:ARCHIVE_CHECKSUM_PATH `
+            $env:PROVENANCE_PATH `
             --clobber

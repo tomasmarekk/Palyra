@@ -31,4 +31,35 @@ while IFS=: read -r file line_number raw_line; do
   status=1
 done < <(grep -HnE '^[[:space:]]*uses:[[:space:]]*' "${workflow_files[@]}")
 
+# Release metadata and artifact paths can contain actor-controlled text. Keep
+# expressions in environment mappings so shells never parse them as source.
+unsafe_release_lines="$(
+  awk '
+    /^[[:space:]]+run:[[:space:]]*\|[[:space:]]*$/ {
+      in_run = 1
+      run_indent = match($0, /[^ ]/) - 1
+      next
+    }
+
+    in_run {
+      if ($0 ~ /^[[:space:]]*$/) {
+        next
+      }
+
+      indent = match($0, /[^ ]/) - 1
+      if (indent <= run_indent) {
+        in_run = 0
+      } else if ($0 ~ /\$\{\{/) {
+        print FNR ":" $0
+      }
+    }
+  ' .github/workflows/release.yml
+)"
+
+if [[ -n "$unsafe_release_lines" ]]; then
+  echo "ERROR: .github/workflows/release.yml interpolates GitHub expressions inside shell source:" >&2
+  echo "$unsafe_release_lines" >&2
+  status=1
+fi
+
 exit "$status"
