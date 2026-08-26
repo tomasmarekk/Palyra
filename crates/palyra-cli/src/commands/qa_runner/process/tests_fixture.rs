@@ -76,6 +76,10 @@ fn no_tool_environment_uses_an_empty_allowlist() {
         command_env(&command, "PALYRA_QA_PROVIDER_BINDING_SHA256"),
         Some(OsStr::new(&"b".repeat(64)))
     );
+    assert_eq!(
+        command_env(&command, "PALYRA_TOOL_CATALOG_EXPOSURE_MODE"),
+        Some(OsStr::new("direct"))
+    );
 }
 
 #[test]

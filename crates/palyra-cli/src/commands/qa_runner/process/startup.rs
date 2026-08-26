@@ -275,6 +275,7 @@ pub(super) fn configure_isolated_environment(
             command
                 .env("PALYRA_MODEL_PROVIDER_KIND", "deterministic")
                 .env("PALYRA_QA_MOCK_PROVIDER_FIXTURE_PATH", provider_fixture)
+                .env("PALYRA_TOOL_CATALOG_EXPOSURE_MODE", "direct")
                 .env("PALYRA_OFFLINE", "true");
         }
         QaDaemonProviderEnvironment::Live { registry_path, auth_provider_kind, transport } => {
