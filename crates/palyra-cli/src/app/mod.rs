@@ -986,7 +986,7 @@ pub(crate) fn load_cli_profiles_registry() -> Result<(PathBuf, CliProfilesDocume
     Ok((path, document))
 }
 
-/// Writes the registry to `path`, stamping the current schema version.
+/// Atomically writes the registry to `path`, stamping the current schema version.
 ///
 /// # Errors
 /// Returns an error when the parent directory cannot be created or the file
@@ -997,14 +997,9 @@ pub(crate) fn persist_cli_profiles_registry(
 ) -> Result<()> {
     let mut persisted = document.clone();
     persisted.version = Some(CLI_PROFILE_SCHEMA_VERSION);
-    if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create CLI profiles directory {}", parent.display())
-        })?;
-    }
     let rendered =
         toml::to_string_pretty(&persisted).context("failed to serialize CLI profiles registry")?;
-    fs::write(path, rendered.as_bytes())
+    crate::write_file_atomically(path, rendered.as_bytes())
         .with_context(|| format!("failed to write CLI profiles {}", path.display()))
 }
 

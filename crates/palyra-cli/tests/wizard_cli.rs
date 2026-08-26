@@ -1709,6 +1709,52 @@ fn profile_clone_copies_config_into_isolated_namespace() -> Result<()> {
             && registry.contains("staging")
             && registry.contains("config")
     );
+
+    let cloned_state_marker = workdir
+        .path()
+        .join("state-root")
+        .join("profiles")
+        .join("staging")
+        .join("state")
+        .join("runtime.marker");
+    fs::create_dir_all(
+        cloned_state_marker.parent().context("cloned state marker should have a parent")?,
+    )?;
+    fs::write(&cloned_state_marker, b"preserve-state")?;
+    let renamed =
+        run_cli(&workdir, &["profile", "rename", "staging", "staging-renamed", "--json"], &[])?;
+    assert!(
+        renamed.status.success(),
+        "profile rename should succeed: {}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    let renamed_payload: Value =
+        serde_json::from_slice(&renamed.stdout).context("profile rename stdout should be JSON")?;
+    assert_eq!(renamed_payload.get("action").and_then(Value::as_str), Some("rename"));
+    assert_eq!(
+        renamed_payload.pointer("/profile/name").and_then(Value::as_str),
+        Some("staging-renamed")
+    );
+    let old_namespace = workdir.path().join("state-root").join("profiles").join("staging");
+    let renamed_namespace =
+        workdir.path().join("state-root").join("profiles").join("staging-renamed");
+    assert!(
+        !old_namespace.exists(),
+        "profile rename must not leave the old owned namespace behind"
+    );
+    assert!(
+        renamed_namespace.join("config").join("palyra.toml").exists(),
+        "profile rename must move the cloned config snapshot"
+    );
+    assert_eq!(
+        fs::read(renamed_namespace.join("state").join("runtime.marker"))?,
+        b"preserve-state",
+        "profile rename must move profile-owned runtime state"
+    );
+    let renamed_registry = fs::read_to_string(profiles_registry_path(&workdir))?;
+    assert!(renamed_registry.contains("default_profile = \"staging-renamed\""));
+    assert!(renamed_registry.contains("[profiles.staging-renamed]"));
+    assert!(!renamed_registry.contains("[profiles.staging]"));
     Ok(())
 }
 

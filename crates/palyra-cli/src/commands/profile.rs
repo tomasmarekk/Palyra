@@ -802,27 +802,40 @@ fn run_profile_rename(name: String, new_name: String, json: bool) -> Result<()> 
         .profiles
         .remove(name.as_str())
         .ok_or_else(|| anyhow!("CLI profile not found: {name}"))?;
-    // Follow the rename only for the derived default paths; operator-chosen custom
-    // state roots and config paths must stay untouched.
-    if let Some(state_root) =
-        profile.state_root.as_deref().and_then(|value| app::normalized_profile_text(Some(value)))
-    {
-        let expected_old = app::default_profile_state_root(name.as_str())?;
-        let actual = PathBuf::from(state_root.as_str());
-        if paths_equivalent(actual.as_path(), expected_old.as_path()) {
-            profile.state_root =
-                Some(app::default_profile_state_root(new_name.as_str())?.display().to_string());
-        }
+    let old_default_state_root = app::default_profile_state_root(name.as_str())?;
+    let new_default_state_root = app::default_profile_state_root(new_name.as_str())?;
+    let old_default_config_path = app::default_profile_config_path(name.as_str())?;
+    let new_default_config_path = app::default_profile_config_path(new_name.as_str())?;
+    let state_root_follows_profile_name = profile
+        .state_root
+        .as_deref()
+        .and_then(|value| app::normalized_profile_text(Some(value)))
+        .is_some_and(|value| {
+            paths_equivalent(Path::new(value.as_str()), old_default_state_root.as_path())
+        });
+    let config_path_follows_profile_name = profile
+        .config_path
+        .as_deref()
+        .and_then(|value| app::normalized_profile_text(Some(value)))
+        .is_some_and(|value| {
+            paths_equivalent(Path::new(value.as_str()), old_default_config_path.as_path())
+        });
+
+    // Only profile-owned defaults move with the name. Operator-selected paths may
+    // live outside this namespace and must never be renamed implicitly.
+    let namespace_move = if state_root_follows_profile_name || config_path_follows_profile_name {
+        move_default_profile_namespace(
+            old_default_state_root.as_path(),
+            new_default_state_root.as_path(),
+        )?
+    } else {
+        None
+    };
+    if state_root_follows_profile_name {
+        profile.state_root = Some(new_default_state_root.display().to_string());
     }
-    if let Some(config_path) =
-        profile.config_path.as_deref().and_then(|value| app::normalized_profile_text(Some(value)))
-    {
-        let expected_old = app::default_profile_config_path(name.as_str())?;
-        let actual = PathBuf::from(config_path.as_str());
-        if paths_equivalent(actual.as_path(), expected_old.as_path()) {
-            profile.config_path =
-                Some(app::default_profile_config_path(new_name.as_str())?.display().to_string());
-        }
+    if config_path_follows_profile_name {
+        profile.config_path = Some(new_default_config_path.display().to_string());
     }
     let now = now_unix_ms()?;
     profile.updated_at_unix_ms = Some(now);
@@ -830,7 +843,19 @@ fn run_profile_rename(name: String, new_name: String, json: bool) -> Result<()> 
     if document.default_profile.as_deref() == Some(name.as_str()) {
         document.default_profile = Some(new_name.clone());
     }
-    app::persist_cli_profiles_registry(path.as_path(), &document)?;
+    if let Err(persist_error) = app::persist_cli_profiles_registry(path.as_path(), &document) {
+        if let Some((old_namespace, new_namespace)) = namespace_move.as_ref() {
+            if let Err(rollback_error) = fs::rename(new_namespace, old_namespace) {
+                return Err(persist_error).context(format!(
+                    "failed to restore profile namespace {} from {} after registry write failure: {}",
+                    old_namespace.display(),
+                    new_namespace.display(),
+                    rollback_error
+                ));
+            }
+        }
+        return Err(persist_error);
+    }
     let active_profile =
         current_profile_name().map(|value| if value == name { new_name.clone() } else { value });
     let payload = ProfileMutationPayload {
@@ -852,6 +877,42 @@ fn run_profile_rename(name: String, new_name: String, json: bool) -> Result<()> 
         warnings: Vec::new(),
     };
     emit_mutation_payload(&payload, json)
+}
+
+fn move_default_profile_namespace(
+    old_default_state_root: &Path,
+    new_default_state_root: &Path,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    let old_namespace = old_default_state_root
+        .parent()
+        .ok_or_else(|| anyhow!("default profile state root has no namespace parent"))?
+        .to_path_buf();
+    let new_namespace = new_default_state_root
+        .parent()
+        .ok_or_else(|| anyhow!("renamed profile state root has no namespace parent"))?
+        .to_path_buf();
+    if !old_namespace.exists() {
+        return Ok(None);
+    }
+    if new_namespace.exists() {
+        anyhow::bail!(
+            "cannot rename profile namespace because the destination already exists: {}",
+            new_namespace.display()
+        );
+    }
+    if let Some(parent) = new_namespace.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create profile namespace parent {}", parent.display())
+        })?;
+    }
+    fs::rename(old_namespace.as_path(), new_namespace.as_path()).with_context(|| {
+        format!(
+            "failed to move profile namespace {} to {}",
+            old_namespace.display(),
+            new_namespace.display()
+        )
+    })?;
+    Ok(Some((old_namespace, new_namespace)))
 }
 
 fn run_profile_delete(name: String, yes: bool, delete_state_root: bool, json: bool) -> Result<()> {
