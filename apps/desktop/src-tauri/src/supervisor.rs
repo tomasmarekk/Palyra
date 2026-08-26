@@ -380,6 +380,22 @@ struct ConfigRuntimePortOverrides {
     browser_grpc_port: Option<u16>,
 }
 
+impl ConfigRuntimePortOverrides {
+    fn pins_service_ports(&self, kind: ServiceKind) -> bool {
+        match kind {
+            ServiceKind::Gateway => {
+                self.gateway_admin_port.is_some()
+                    || self.gateway_grpc_port.is_some()
+                    || self.gateway_quic_port.is_some()
+            }
+            ServiceKind::Browserd => {
+                self.browser_health_port.is_some() || self.browser_grpc_port.is_some()
+            }
+            ServiceKind::NodeHost => false,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct DesktopRuntimeAuthConfig {
     admin_token: String,
@@ -1337,6 +1353,12 @@ impl ControlCenter {
                 if unavailable.is_empty() {
                     return Ok(());
                 }
+                if self.must_preserve_service_ports(kind)? {
+                    bail!(
+                        "gateway port collision detected ({}); preserving the existing endpoint for retry",
+                        format_port_availability_summary(unavailable.as_slice())
+                    );
+                }
                 let ports =
                     palyra_common::local_runtime_ports::select_available_gateway_runtime_ports(
                         LOOPBACK_HOST,
@@ -1368,6 +1390,12 @@ impl ControlCenter {
                 if unavailable.is_empty() {
                     return Ok(());
                 }
+                if self.must_preserve_service_ports(kind)? {
+                    bail!(
+                        "browserd port collision detected ({}); preserving the existing endpoint for retry",
+                        format_port_availability_summary(unavailable.as_slice())
+                    );
+                }
                 let ports =
                     palyra_common::local_runtime_ports::select_available_browser_runtime_ports(
                         LOOPBACK_HOST,
@@ -1395,6 +1423,17 @@ impl ControlCenter {
             }
             ServiceKind::NodeHost => Ok(()),
         }
+    }
+
+    fn must_preserve_service_ports(&self, kind: ServiceKind) -> Result<bool> {
+        // Once an endpoint has served traffic, silently moving it would invalidate
+        // clients and turn a single-sidecar restart into a wider runtime outage.
+        if self.service_ref(kind).last_start_unix_ms.is_some() {
+            return Ok(true);
+        }
+        let overrides =
+            config_runtime_port_overrides(self.active_profile.config_path.as_deref())?;
+        Ok(overrides.pins_service_ports(kind))
     }
 
     fn persist_runtime_port_selection(&mut self, kind: ServiceKind) -> Result<()> {

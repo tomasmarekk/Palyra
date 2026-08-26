@@ -240,19 +240,7 @@ fn browserd_port_fallback_restarts_gateway_for_new_endpoint() {
     let health_port =
         health_listener.local_addr().expect("health fixture address should resolve").port();
     let grpc_port = grpc_listener.local_addr().expect("grpc fixture address should resolve").port();
-    let config_path = write_config_file(
-        fixture.path(),
-        format!(
-            r#"
-version = 1
-
-[tool_call.browser_service]
-endpoint = "http://127.0.0.1:{grpc_port}"
-health_base_url = "http://127.0.0.1:{health_port}"
-"#
-        )
-        .as_str(),
-    );
+    let config_path = write_config_file(fixture.path(), "version = 1\n");
     let mut control_center = build_test_control_center(fixture.path());
     control_center.active_profile.config_path = Some(config_path.clone());
     control_center.config_reload_watch =
@@ -283,6 +271,136 @@ health_base_url = "http://127.0.0.1:{health_port}"
         ),
         "config should point gateway at the fallback browserd gRPC endpoint: {config_toml}"
     );
+}
+
+#[test]
+fn configured_browserd_ports_are_preserved_when_temporarily_unavailable() {
+    let fixture = TempFixtureDir::new();
+    let health_listener =
+        TcpListener::bind("127.0.0.1:0").expect("health fixture listener should bind");
+    let grpc_listener =
+        TcpListener::bind("127.0.0.1:0").expect("grpc fixture listener should bind");
+    let health_port =
+        health_listener.local_addr().expect("health fixture address should resolve").port();
+    let grpc_port = grpc_listener.local_addr().expect("grpc fixture address should resolve").port();
+    let original_config = format!(
+        r#"
+version = 1
+
+[tool_call.browser_service]
+endpoint = "http://127.0.0.1:{grpc_port}"
+health_base_url = "http://127.0.0.1:{health_port}"
+"#
+    );
+    let config_path = write_config_file(fixture.path(), original_config.as_str());
+    let mut control_center = build_test_control_center(fixture.path());
+    control_center.active_profile.config_path = Some(config_path.clone());
+    control_center.config_reload_watch =
+        DesktopConfigReloadWatchState::from_profile(&control_center.active_profile);
+    control_center.runtime.browser_health_port = health_port;
+    control_center.runtime.browser_grpc_port = grpc_port;
+    control_center.browserd.bound_ports = vec![health_port, grpc_port];
+    control_center.gateway.desired_running = true;
+    control_center.gateway.next_restart_unix_ms = Some(i64::MAX);
+
+    let error = control_center
+        .ensure_service_ports_available_before_spawn(ServiceKind::Browserd)
+        .expect_err("configured browserd ports should be retried without endpoint drift");
+
+    assert!(
+        error.to_string().contains("preserving the existing endpoint for retry"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(control_center.runtime.browser_health_port, health_port);
+    assert_eq!(control_center.runtime.browser_grpc_port, grpc_port);
+    assert_eq!(control_center.gateway.next_restart_unix_ms, Some(i64::MAX));
+    assert_eq!(
+        std::fs::read_to_string(config_path.as_path()).expect("config should remain readable"),
+        original_config
+    );
+}
+
+#[test]
+fn configured_gateway_ports_are_preserved_when_temporarily_unavailable() {
+    let fixture = TempFixtureDir::new();
+    let admin_listener =
+        TcpListener::bind("127.0.0.1:0").expect("admin fixture listener should bind");
+    let grpc_listener =
+        TcpListener::bind("127.0.0.1:0").expect("gRPC fixture listener should bind");
+    let quic_listener =
+        TcpListener::bind("127.0.0.1:0").expect("QUIC fixture listener should bind");
+    let admin_port =
+        admin_listener.local_addr().expect("admin fixture address should resolve").port();
+    let grpc_port = grpc_listener.local_addr().expect("gRPC fixture address should resolve").port();
+    let quic_port = quic_listener.local_addr().expect("QUIC fixture address should resolve").port();
+    let original_config = format!(
+        r#"
+version = 1
+
+[daemon]
+port = {admin_port}
+
+[gateway]
+grpc_port = {grpc_port}
+quic_port = {quic_port}
+"#
+    );
+    let config_path = write_config_file(fixture.path(), original_config.as_str());
+    let mut control_center = build_test_control_center(fixture.path());
+    control_center.active_profile.config_path = Some(config_path.clone());
+    control_center.config_reload_watch =
+        DesktopConfigReloadWatchState::from_profile(&control_center.active_profile);
+    control_center.runtime.gateway_admin_port = admin_port;
+    control_center.runtime.gateway_grpc_port = grpc_port;
+    control_center.runtime.gateway_quic_port = quic_port;
+    control_center.gateway.bound_ports = vec![admin_port, grpc_port, quic_port];
+
+    let error = control_center
+        .ensure_service_ports_available_before_spawn(ServiceKind::Gateway)
+        .expect_err("configured gateway ports should be retried without endpoint drift");
+
+    assert!(
+        error.to_string().contains("preserving the existing endpoint for retry"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(control_center.runtime.gateway_admin_port, admin_port);
+    assert_eq!(control_center.runtime.gateway_grpc_port, grpc_port);
+    assert_eq!(control_center.runtime.gateway_quic_port, quic_port);
+    assert_eq!(
+        std::fs::read_to_string(config_path.as_path()).expect("config should remain readable"),
+        original_config
+    );
+}
+
+#[test]
+fn previously_started_browserd_keeps_default_ports_during_restart() {
+    let fixture = TempFixtureDir::new();
+    let health_listener =
+        TcpListener::bind("127.0.0.1:0").expect("health fixture listener should bind");
+    let grpc_listener =
+        TcpListener::bind("127.0.0.1:0").expect("grpc fixture listener should bind");
+    let health_port =
+        health_listener.local_addr().expect("health fixture address should resolve").port();
+    let grpc_port = grpc_listener.local_addr().expect("grpc fixture address should resolve").port();
+    let mut control_center = build_test_control_center(fixture.path());
+    control_center.runtime.browser_health_port = health_port;
+    control_center.runtime.browser_grpc_port = grpc_port;
+    control_center.browserd.bound_ports = vec![health_port, grpc_port];
+    control_center.browserd.last_start_unix_ms = Some(1);
+    control_center.gateway.desired_running = true;
+    control_center.gateway.next_restart_unix_ms = Some(i64::MAX);
+
+    let error = control_center
+        .ensure_service_ports_available_before_spawn(ServiceKind::Browserd)
+        .expect_err("a restarted browserd should keep the endpoint already used by the gateway");
+
+    assert!(
+        error.to_string().contains("preserving the existing endpoint for retry"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(control_center.runtime.browser_health_port, health_port);
+    assert_eq!(control_center.runtime.browser_grpc_port, grpc_port);
+    assert_eq!(control_center.gateway.next_restart_unix_ms, Some(i64::MAX));
 }
 
 #[test]
