@@ -4,9 +4,15 @@
 //! compressed archive cannot turn a one-shot CLI check into unbounded memory,
 //! CPU, or metadata work.
 
-use std::{collections::HashSet, fs, io::Read, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use zip::{read::ZipArchive, result::ZipError};
 
 pub(crate) const MAX_ARCHIVE_MEMBER_BYTES: u64 = 512 * 1024 * 1024;
@@ -81,6 +87,31 @@ impl BoundedZipArchive {
     /// Returns the validated member names in archive order.
     pub(crate) fn member_names(&self) -> &[String] {
         self.member_names.as_slice()
+    }
+
+    /// Consumes the archive and hashes the exact file handle that was inspected.
+    pub(crate) fn into_sha256(self) -> Result<String> {
+        let mut file = self.archive.into_inner();
+        file.seek(SeekFrom::Start(0)).context("failed to rewind inspected archive")?;
+        let mut hasher = Sha256::new();
+        let mut limited = file.take(self.limits.archive_bytes.saturating_add(1));
+        let mut buffer = [0_u8; READ_BUFFER_BYTES];
+        let mut read_bytes = 0_u64;
+        loop {
+            let read = limited.read(&mut buffer).context("failed to hash inspected archive")?;
+            if read == 0 {
+                break;
+            }
+            read_bytes = read_bytes.saturating_add(read as u64);
+            if read_bytes > self.limits.archive_bytes {
+                anyhow::bail!(
+                    "archive exceeds the {} byte compressed-size limit while hashing",
+                    self.limits.archive_bytes
+                );
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hex::encode(hasher.finalize()))
     }
 
     /// Reads an optional member into a bounded buffer.

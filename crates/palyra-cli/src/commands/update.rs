@@ -4,16 +4,28 @@
 //! In-place self-update is intentionally unimplemented; applying with
 //! `--yes` fails closed so the trust chain stays a manual operator action.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    env, fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, Context, Result};
-use serde::Serialize;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::cli::UpdateCommand;
 use crate::commands::archive::{
-    BoundedZipArchive, MAX_UPDATE_MANIFEST_BYTES, MAX_UPDATE_TEXT_BYTES,
+    BoundedZipArchive, MAX_ARCHIVE_MEMBER_BYTES, MAX_UPDATE_MANIFEST_BYTES, MAX_UPDATE_TEXT_BYTES,
 };
 use crate::*;
+
+const RELEASE_PUBLISHER_KEY_ENV: &str = "PALYRA_RELEASE_PUBLISHER_ED25519_PUBLIC_KEY";
+const MAX_RELEASE_SIDECAR_BYTES: u64 = 64 * 1024;
+const RELEASE_SIGNATURE_ALGORITHM: &str = "ed25519-sha256";
+const RELEASE_SIGNATURE_CONTEXT: &str = "palyra.release-signature.v1";
 
 /// Manifest and release-note details read from a candidate update archive.
 #[derive(Debug, Clone, Serialize)]
@@ -23,12 +35,43 @@ struct UpdateArchiveSnapshot {
     artifact_kind: Option<String>,
     platform: Option<String>,
     manifest_binary_hash_count: usize,
+    verified_manifest_binary_hash_count: usize,
+    manifest_binary_hashes_verified: bool,
+    archive_sha256: String,
     sbom_present: bool,
     provenance_present: bool,
     checksum_present: bool,
+    checksum_verified: bool,
     signature_present: bool,
+    signature_verified: bool,
+    verification_details: Vec<String>,
     rollback_hint: Option<String>,
     migration_notes: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct VerificationEvidence {
+    present: bool,
+    verified: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone)]
+struct ManifestHashEvidence {
+    verified_count: usize,
+    verified: bool,
+    detail: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseSignatureEnvelope {
+    schema_version: u32,
+    algorithm: String,
+    artifact_file_name: String,
+    artifact_sha256: String,
+    publisher_key_sha256: String,
+    signature_hex: String,
 }
 
 /// One release gate entry in the readiness scorecard.
@@ -129,6 +172,12 @@ pub(crate) fn run_update(command: UpdateCommand) -> Result<()> {
             "in-place self-update is not implemented yet; use `palyra update --archive <zip> --dry-run` to validate the candidate and follow the emitted manual steps"
         );
     }
+    let next_steps = build_update_next_steps(
+        manifest.as_ref(),
+        service.as_ref(),
+        command.skip_service_restart,
+        candidate.as_ref(),
+    );
 
     let report = UpdateReport {
         mode: if command.release_readiness && candidate.is_some() {
@@ -153,16 +202,20 @@ pub(crate) fn run_update(command: UpdateCommand) -> Result<()> {
         candidate,
         release_readiness,
         apply_supported: false,
-        next_steps: build_update_next_steps(
-            manifest.as_ref(),
-            service.as_ref(),
-            command.skip_service_restart,
-        ),
+        next_steps,
     };
     emit_update_report(&report, command.json)
 }
 
 fn load_candidate_archive_snapshot(archive_path: String) -> Result<UpdateArchiveSnapshot> {
+    let trusted_publisher_key = env::var(RELEASE_PUBLISHER_KEY_ENV).ok();
+    load_candidate_archive_snapshot_with_key(archive_path, trusted_publisher_key.as_deref())
+}
+
+fn load_candidate_archive_snapshot_with_key(
+    archive_path: String,
+    trusted_publisher_key: Option<&str>,
+) -> Result<UpdateArchiveSnapshot> {
     let archive_path_buf = PathBuf::from(archive_path.as_str());
     let mut archive = BoundedZipArchive::open(archive_path_buf.as_path()).with_context(|| {
         format!("failed to inspect update archive {}", archive_path_buf.display())
@@ -173,31 +226,39 @@ fn load_candidate_archive_snapshot(archive_path: String) -> Result<UpdateArchive
         &mut archive,
         "release-manifest.json",
     )?;
+    let manifest_hashes = verify_manifest_binary_hashes(&mut archive, manifest.as_ref());
     let rollback_hint = read_optional_zip_text(&mut archive, "ROLLBACK.txt")?;
     let migration_notes = read_optional_zip_text(&mut archive, "MIGRATION_NOTES.txt")?;
     let manifest_binary_hash_count =
         manifest.as_ref().map(release_manifest_hash_count).unwrap_or_default();
+    let archive_sha256 = archive.into_sha256()?;
+    let checksum = verify_checksum_sidecar(archive_path_buf.as_path(), archive_sha256.as_str())?;
+    let signature = verify_signature_sidecar(
+        archive_path_buf.as_path(),
+        archive_sha256.as_str(),
+        trusted_publisher_key,
+    )?;
+    let verification_details =
+        vec![manifest_hashes.detail.clone(), checksum.detail.clone(), signature.detail.clone()];
     Ok(UpdateArchiveSnapshot {
         archive_path,
         manifest_version: manifest.as_ref().map(|value| value.version.clone()),
         artifact_kind: manifest.as_ref().map(|value| value.artifact_kind.clone()),
         platform: manifest.as_ref().map(|value| value.platform.clone()),
         manifest_binary_hash_count,
+        verified_manifest_binary_hash_count: manifest_hashes.verified_count,
+        manifest_binary_hashes_verified: manifest_hashes.verified,
+        archive_sha256,
         sbom_present: archive_members.iter().any(|name| is_sbom_member(name.as_str()))
-            || release_sidecar_present(
-                archive_path_buf.as_path(),
-                &[".sbom.json", "-sbom.json", ".cdx.json"],
-            ),
-        provenance_present: archive_members.iter().any(|name| name.ends_with(".provenance.json"))
-            || release_sidecar_present(archive_path_buf.as_path(), &[".provenance.json"]),
-        checksum_present: release_sidecar_present(
-            archive_path_buf.as_path(),
-            &[".sha256", ".zip.sha256", ".sha256.txt"],
-        ),
-        signature_present: release_sidecar_present(
-            archive_path_buf.as_path(),
-            &[".sig", ".minisig", ".sigstore", ".intoto.jsonl"],
-        ),
+            || archive_members.iter().any(|name| name == "sbom.json"),
+        provenance_present: archive_members
+            .iter()
+            .any(|name| name.ends_with(".provenance.json") || name == "provenance.json"),
+        checksum_present: checksum.present,
+        checksum_verified: checksum.verified,
+        signature_present: signature.present,
+        signature_verified: signature.verified,
+        verification_details,
         rollback_hint,
         migration_notes,
     })
@@ -208,16 +269,386 @@ fn is_sbom_member(name: &str) -> bool {
     file_name.contains("sbom") && file_name.ends_with(".json")
 }
 
-fn release_sidecar_present(archive_path: &Path, suffixes: &[&str]) -> bool {
+fn verify_manifest_binary_hashes(
+    archive: &mut BoundedZipArchive,
+    manifest: Option<&support::lifecycle::ReleaseManifest>,
+) -> ManifestHashEvidence {
+    let Some(manifest) = manifest else {
+        return ManifestHashEvidence {
+            verified_count: 0,
+            verified: false,
+            detail: "release manifest is missing; no binary hashes were verified".to_owned(),
+        };
+    };
+    if manifest.binaries.is_empty() {
+        return ManifestHashEvidence {
+            verified_count: 0,
+            verified: false,
+            detail: "release manifest contains no binary hashes".to_owned(),
+        };
+    }
+
+    let mut file_names = HashSet::with_capacity(manifest.binaries.len());
+    let mut logical_names = HashSet::with_capacity(manifest.binaries.len());
+    let mut verified_count = 0_usize;
+    for binary in manifest.binaries.as_slice() {
+        let file_name = binary.file_name.trim();
+        if binary.logical_name.trim().is_empty() || !is_safe_release_member_name(file_name) {
+            return ManifestHashEvidence {
+                verified_count,
+                verified: false,
+                detail: format!(
+                    "manifest binary {} has an unsafe archive member name",
+                    binary.logical_name
+                ),
+            };
+        }
+        if !file_names.insert(file_name.to_ascii_lowercase())
+            || !logical_names.insert(binary.logical_name.trim().to_ascii_lowercase())
+        {
+            return ManifestHashEvidence {
+                verified_count,
+                verified: false,
+                detail: "release manifest contains duplicate binary identities".to_owned(),
+            };
+        }
+        if binary.size_bytes > MAX_ARCHIVE_MEMBER_BYTES {
+            return ManifestHashEvidence {
+                verified_count,
+                verified: false,
+                detail: format!("manifest binary {file_name} exceeds the verification size limit"),
+            };
+        }
+        if binary.sha256.len() != 64 || !binary.sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return ManifestHashEvidence {
+                verified_count,
+                verified: false,
+                detail: format!("manifest binary {file_name} has an invalid SHA-256 value"),
+            };
+        }
+
+        let mut hasher = Sha256::new();
+        let actual_size =
+            match archive.read_required_with(file_name, MAX_ARCHIVE_MEMBER_BYTES, |chunk| {
+                hasher.update(chunk);
+                Ok(())
+            }) {
+                Ok(size) => size,
+                Err(error) => {
+                    return ManifestHashEvidence {
+                        verified_count,
+                        verified: false,
+                        detail: format!(
+                            "manifest binary {file_name} could not be verified: {error:#}"
+                        ),
+                    };
+                }
+            };
+        let actual_hash = hex::encode(hasher.finalize());
+        if actual_size != binary.size_bytes
+            || !actual_hash.eq_ignore_ascii_case(binary.sha256.as_str())
+        {
+            return ManifestHashEvidence {
+                verified_count,
+                verified: false,
+                detail: format!("manifest binary {file_name} failed size or SHA-256 verification"),
+            };
+        }
+        verified_count = verified_count.saturating_add(1);
+    }
+
+    ManifestHashEvidence {
+        verified_count,
+        verified: true,
+        detail: format!("verified {verified_count} manifest binary hashes"),
+    }
+}
+
+fn is_safe_release_member_name(file_name: &str) -> bool {
+    !file_name.is_empty()
+        && file_name != "."
+        && file_name != ".."
+        && !file_name.contains(['/', '\\', ':'])
+        && Path::new(file_name).file_name().and_then(|value| value.to_str()) == Some(file_name)
+}
+
+fn verify_checksum_sidecar(
+    archive_path: &Path,
+    archive_sha256: &str,
+) -> Result<VerificationEvidence> {
+    let sidecar = match select_adjacent_sidecar(archive_path, ".sha256")? {
+        SidecarSelection::Missing => {
+            return Ok(VerificationEvidence {
+                present: false,
+                verified: false,
+                detail: "archive checksum sidecar is missing".to_owned(),
+            });
+        }
+        SidecarSelection::Invalid(detail) => {
+            return Ok(VerificationEvidence { present: true, verified: false, detail });
+        }
+        SidecarSelection::Selected(path) => path,
+    };
+    let bytes = match read_bounded_sidecar(sidecar.as_path()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Ok(VerificationEvidence {
+                present: true,
+                verified: false,
+                detail: format!("checksum sidecar could not be read: {error:#}"),
+            });
+        }
+    };
+    let text = match std::str::from_utf8(bytes.as_slice()) {
+        Ok(text) => text,
+        Err(_) => {
+            return Ok(VerificationEvidence {
+                present: true,
+                verified: false,
+                detail: "checksum sidecar is not valid UTF-8".to_owned(),
+            });
+        }
+    };
+    let lines = text.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    if lines.len() != 1 {
+        return Ok(VerificationEvidence {
+            present: true,
+            verified: false,
+            detail: "checksum sidecar must contain exactly one non-empty record".to_owned(),
+        });
+    }
+    let mut fields = lines[0].split_whitespace();
+    let Some(expected_hash) = fields.next() else {
+        return Ok(VerificationEvidence {
+            present: true,
+            verified: false,
+            detail: "checksum sidecar is missing the SHA-256 value".to_owned(),
+        });
+    };
+    let Some(target_name) = fields.next().map(|value| value.trim_start_matches('*')) else {
+        return Ok(VerificationEvidence {
+            present: true,
+            verified: false,
+            detail: "checksum sidecar is not bound to an artifact file name".to_owned(),
+        });
+    };
+    let archive_name =
+        archive_path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+    let valid = fields.next().is_none()
+        && expected_hash.len() == 64
+        && expected_hash.chars().all(|ch| ch.is_ascii_hexdigit())
+        && target_name == archive_name
+        && expected_hash.eq_ignore_ascii_case(archive_sha256);
+    Ok(VerificationEvidence {
+        present: true,
+        verified: valid,
+        detail: if valid {
+            format!("checksum sidecar verified {archive_name}")
+        } else {
+            "checksum sidecar does not match the exact candidate archive".to_owned()
+        },
+    })
+}
+
+fn verify_signature_sidecar(
+    archive_path: &Path,
+    archive_sha256: &str,
+    trusted_publisher_key: Option<&str>,
+) -> Result<VerificationEvidence> {
+    let sidecar = match select_adjacent_sidecar(archive_path, ".sig")? {
+        SidecarSelection::Missing => {
+            return Ok(VerificationEvidence {
+                present: false,
+                verified: false,
+                detail: "supported release signature sidecar is missing".to_owned(),
+            });
+        }
+        SidecarSelection::Invalid(detail) => {
+            return Ok(VerificationEvidence { present: true, verified: false, detail });
+        }
+        SidecarSelection::Selected(path) => path,
+    };
+    let Some(trusted_publisher_key) =
+        trusted_publisher_key.map(str::trim).filter(|value| !value.is_empty())
+    else {
+        return Ok(VerificationEvidence {
+            present: true,
+            verified: false,
+            detail: format!(
+                "signature is present but {RELEASE_PUBLISHER_KEY_ENV} is not configured"
+            ),
+        });
+    };
+    let bytes = match read_bounded_sidecar(sidecar.as_path()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Ok(VerificationEvidence {
+                present: true,
+                verified: false,
+                detail: format!("signature sidecar could not be read: {error:#}"),
+            });
+        }
+    };
+    let envelope = match serde_json::from_slice::<ReleaseSignatureEnvelope>(bytes.as_slice()) {
+        Ok(envelope) => envelope,
+        Err(_) => {
+            return Ok(VerificationEvidence {
+                present: true,
+                verified: false,
+                detail: "signature sidecar is not a supported JSON envelope".to_owned(),
+            });
+        }
+    };
+    let verifying_key_bytes = match parse_hex_array::<32>(trusted_publisher_key) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(VerificationEvidence {
+                present: true,
+                verified: false,
+                detail: format!("{RELEASE_PUBLISHER_KEY_ENV} is not a 32-byte hex key"),
+            });
+        }
+    };
+    let verifying_key = match VerifyingKey::from_bytes(&verifying_key_bytes) {
+        Ok(key) => key,
+        Err(_) => {
+            return Ok(VerificationEvidence {
+                present: true,
+                verified: false,
+                detail: format!("{RELEASE_PUBLISHER_KEY_ENV} is not a valid Ed25519 key"),
+            });
+        }
+    };
+    let publisher_key_sha256 = hex::encode(Sha256::digest(verifying_key_bytes));
+    let archive_name =
+        archive_path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+    if envelope.schema_version != 1
+        || envelope.algorithm != RELEASE_SIGNATURE_ALGORITHM
+        || envelope.artifact_file_name != archive_name
+        || !envelope.artifact_sha256.eq_ignore_ascii_case(archive_sha256)
+        || !envelope.publisher_key_sha256.eq_ignore_ascii_case(&publisher_key_sha256)
+    {
+        return Ok(VerificationEvidence {
+            present: true,
+            verified: false,
+            detail: "signature envelope is not bound to the candidate and trusted publisher"
+                .to_owned(),
+        });
+    }
+    let signature_bytes = match parse_hex_array::<64>(envelope.signature_hex.as_str()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(VerificationEvidence {
+                present: true,
+                verified: false,
+                detail: "signature envelope contains an invalid Ed25519 signature".to_owned(),
+            });
+        }
+    };
+    let signature = Signature::from_bytes(&signature_bytes);
+    let signed_message =
+        release_signature_message(archive_name, archive_sha256, publisher_key_sha256.as_str());
+    let verified = verifying_key.verify(signed_message.as_bytes(), &signature).is_ok();
+    Ok(VerificationEvidence {
+        present: true,
+        verified,
+        detail: if verified {
+            format!("verified Ed25519 signature from publisher {publisher_key_sha256}")
+        } else {
+            "Ed25519 signature verification failed".to_owned()
+        },
+    })
+}
+
+fn release_signature_message(
+    artifact_file_name: &str,
+    artifact_sha256: &str,
+    publisher_key_sha256: &str,
+) -> String {
+    format!(
+        "{RELEASE_SIGNATURE_CONTEXT}\n{artifact_file_name}\n{artifact_sha256}\n{publisher_key_sha256}\n"
+    )
+}
+
+enum SidecarSelection {
+    Missing,
+    Selected(PathBuf),
+    Invalid(String),
+}
+
+fn select_adjacent_sidecar(archive_path: &Path, suffix: &str) -> Result<SidecarSelection> {
     let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
     let Some(file_name) = archive_path.file_name().and_then(|value| value.to_str()) else {
-        return false;
+        return Ok(SidecarSelection::Invalid(
+            "candidate archive file name is not valid UTF-8".to_owned(),
+        ));
     };
     let stem = file_name.strip_suffix(".zip").unwrap_or(file_name);
-    suffixes.iter().any(|suffix| {
-        parent.join(format!("{file_name}{suffix}")).is_file()
-            || parent.join(format!("{stem}{suffix}")).is_file()
-    })
+    let mut candidates =
+        [parent.join(format!("{file_name}{suffix}")), parent.join(format!("{stem}{suffix}"))]
+            .into_iter()
+            .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+
+    let mut existing = Vec::new();
+    for candidate in candidates {
+        match fs::symlink_metadata(candidate.as_path()) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                    return Ok(SidecarSelection::Invalid(format!(
+                        "release sidecar {} is not a non-symlink regular file",
+                        candidate.display()
+                    )));
+                }
+                existing.push(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect sidecar {}", candidate.display()));
+            }
+        }
+    }
+    match existing.as_slice() {
+        [] => Ok(SidecarSelection::Missing),
+        [path] => Ok(SidecarSelection::Selected(path.clone())),
+        _ => Ok(SidecarSelection::Invalid(
+            "multiple adjacent sidecars make the release evidence ambiguous".to_owned(),
+        )),
+    }
+}
+
+fn read_bounded_sidecar(path: &Path) -> Result<Vec<u8>> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.len() > MAX_RELEASE_SIDECAR_BYTES {
+        anyhow::bail!(
+            "sidecar {} exceeds the {} byte limit",
+            path.display(),
+            MAX_RELEASE_SIDECAR_BYTES
+        );
+    }
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut limited = file.take(MAX_RELEASE_SIDECAR_BYTES.saturating_add(1));
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    limited
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_RELEASE_SIDECAR_BYTES {
+        anyhow::bail!(
+            "sidecar {} exceeds the {} byte limit",
+            path.display(),
+            MAX_RELEASE_SIDECAR_BYTES
+        );
+    }
+    Ok(bytes)
+}
+
+fn parse_hex_array<const N: usize>(value: &str) -> Result<[u8; N]> {
+    let bytes = hex::decode(value).context("invalid hex")?;
+    bytes.try_into().map_err(|_| anyhow!("expected {N} bytes"))
 }
 
 fn release_manifest_hash_count(manifest: &support::lifecycle::ReleaseManifest) -> usize {
@@ -256,7 +687,12 @@ fn build_release_readiness_scorecard(
         .map(|value| value.provenance_present)
         .unwrap_or_else(|| manifest.and_then(|value| value.source_sha.as_deref()).is_some());
     let checksum_present = candidate.map(|value| value.checksum_present).unwrap_or(hash_count > 0);
+    let checksum_verified =
+        candidate.map(|value| value.checksum_verified).unwrap_or(hash_count > 0);
     let signature_present = candidate.map(|value| value.signature_present).unwrap_or(false);
+    let signature_verified = candidate.map(|value| value.signature_verified).unwrap_or(false);
+    let manifest_hashes_verified =
+        candidate.map(|value| value.manifest_binary_hashes_verified).unwrap_or(hash_count > 0);
 
     let gates = vec![
         readiness_gate(
@@ -271,12 +707,14 @@ fn build_release_readiness_scorecard(
         ),
         readiness_gate(
             "artifact_hashes",
-            hash_count > 0 && checksum_present,
+            hash_count > 0 && manifest_hashes_verified && checksum_verified,
             vec![
                 format!("manifest_binary_hash_count={hash_count}"),
                 format!("checksum_present={checksum_present}"),
+                format!("manifest_binary_hashes_verified={manifest_hashes_verified}"),
+                format!("checksum_verified={checksum_verified}"),
             ],
-            vec!["release artifact hashes or checksum sidecar are missing"],
+            vec!["release member hashes and the exact archive checksum must verify"],
         ),
         readiness_gate(
             "sbom",
@@ -292,9 +730,12 @@ fn build_release_readiness_scorecard(
         ),
         readiness_gate(
             "signed_artifact",
-            signature_present,
-            vec![format!("signature_present={signature_present}")],
-            vec!["signed artifact or attestation sidecar is required"],
+            signature_verified,
+            vec![
+                format!("signature_present={signature_present}"),
+                format!("signature_verified={signature_verified}"),
+            ],
+            vec!["artifact signature must verify against the configured publisher identity"],
         ),
         readiness_gate(
             "rollback_plan",
@@ -444,14 +885,30 @@ fn build_update_next_steps(
     manifest: Option<&support::lifecycle::ReleaseManifest>,
     service: Option<&support::service::GatewayServiceStatus>,
     skip_service_restart: bool,
+    candidate: Option<&UpdateArchiveSnapshot>,
 ) -> Vec<String> {
+    if let Some(candidate) = candidate.filter(|candidate| !candidate_is_trusted(candidate)) {
+        return vec![
+            format!(
+                "Do not replace the installation with {}; the candidate is not cryptographically verified.",
+                candidate.archive_path
+            ),
+            format!(
+                "Provide a matching SHA-256 sidecar and a supported Ed25519 signature from the publisher configured in {RELEASE_PUBLISHER_KEY_ENV}, then inspect the candidate again."
+            ),
+        ];
+    }
+
     let mut steps = Vec::new();
     if !skip_service_restart && service.is_some_and(|value| value.running) {
         steps.push("Stop the gateway service before replacing installed binaries.".to_owned());
     } else if skip_service_restart {
         steps.push("Service restart handling was intentionally skipped; verify runtime health manually after replacing binaries.".to_owned());
     }
-    if manifest.is_some_and(|value| value.artifact_kind == "headless") {
+    let artifact_kind = candidate
+        .and_then(|value| value.artifact_kind.as_deref())
+        .or_else(|| manifest.map(|value| value.artifact_kind.as_str()));
+    if artifact_kind == Some("headless") {
         steps.push("After unpacking the new portable archive, run `palyra config migrate --path <config>` before restart.".to_owned());
     } else {
         steps.push(
@@ -461,6 +918,14 @@ fn build_update_next_steps(
     }
     steps.push("Run `palyra doctor --json` after the update and export a support bundle if regressions remain.".to_owned());
     steps
+}
+
+fn candidate_is_trusted(candidate: &UpdateArchiveSnapshot) -> bool {
+    candidate.manifest_version.is_some()
+        && candidate.manifest_binary_hash_count > 0
+        && candidate.manifest_binary_hashes_verified
+        && candidate.checksum_verified
+        && candidate.signature_verified
 }
 
 fn emit_update_report(report: &UpdateReport, json: bool) -> Result<()> {
@@ -484,17 +949,23 @@ fn emit_update_report(report: &UpdateReport, json: bool) -> Result<()> {
     );
     if let Some(candidate) = report.candidate.as_ref() {
         println!(
-            "update.candidate archive_path={} version={} artifact_kind={} platform={} hashes={} sbom={} provenance={} checksum={} signature={}",
+            "update.candidate archive_path={} version={} artifact_kind={} platform={} hashes={} verified_hashes={} sbom={} provenance={} checksum_present={} checksum_verified={} signature_present={} signature_verified={}",
             candidate.archive_path,
             candidate.manifest_version.as_deref().unwrap_or("unknown"),
             candidate.artifact_kind.as_deref().unwrap_or("unknown"),
             candidate.platform.as_deref().unwrap_or("unknown"),
             candidate.manifest_binary_hash_count,
+            candidate.verified_manifest_binary_hash_count,
             candidate.sbom_present,
             candidate.provenance_present,
             candidate.checksum_present,
-            candidate.signature_present
+            candidate.checksum_verified,
+            candidate.signature_present,
+            candidate.signature_verified
         );
+        for detail in candidate.verification_details.as_slice() {
+            println!("update.candidate.verification={detail}");
+        }
     }
     if let Some(scorecard) = report.release_readiness.as_ref() {
         println!(
@@ -551,11 +1022,21 @@ fn read_optional_zip_text(archive: &mut BoundedZipArchive, path: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        build_release_readiness_scorecard, build_update_next_steps, UpdateArchiveSnapshot,
+        build_release_readiness_scorecard, build_update_next_steps,
+        load_candidate_archive_snapshot_with_key, release_signature_message,
+        ReleaseSignatureEnvelope, UpdateArchiveSnapshot, RELEASE_SIGNATURE_ALGORITHM,
     };
     use crate::support::{
         lifecycle::{ReleaseManifest, ReleaseManifestBinaryEntry},
         service::GatewayServiceStatus,
+    };
+    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+    use sha2::{Digest, Sha256};
+    use std::{fs, io::Write, path::PathBuf};
+    use tempfile::{tempdir, TempDir};
+    use zip::{
+        write::{SimpleFileOptions, ZipWriter},
+        CompressionMethod,
     };
 
     fn manifest(artifact_kind: &str) -> ReleaseManifest {
@@ -585,10 +1066,16 @@ mod tests {
             artifact_kind: Some("headless".to_owned()),
             platform: Some("windows-x64".to_owned()),
             manifest_binary_hash_count: 1,
+            verified_manifest_binary_hash_count: 1,
+            manifest_binary_hashes_verified: true,
+            archive_sha256: "b".repeat(64),
             sbom_present,
             provenance_present: true,
             checksum_present: true,
+            checksum_verified: true,
             signature_present,
+            signature_verified: signature_present,
+            verification_details: Vec::new(),
             rollback_hint: Some("restore previous archive".to_owned()),
             migration_notes: Some("no migration required".to_owned()),
         }
@@ -608,10 +1095,68 @@ mod tests {
         }
     }
 
+    fn signed_candidate_fixture() -> anyhow::Result<(TempDir, PathBuf, String)> {
+        let temp = tempdir()?;
+        let archive_path = temp.path().join("palyra-headless.zip");
+        let binary = b"verified-palyra-binary";
+        let mut release_manifest = manifest("headless");
+        release_manifest.binaries[0].sha256 = hex::encode(Sha256::digest(binary));
+        release_manifest.binaries[0].size_bytes = binary.len() as u64;
+
+        let file = fs::File::create(archive_path.as_path())?;
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        writer.start_file("palyra.exe", options)?;
+        writer.write_all(binary)?;
+        writer.start_file("release-manifest.json", options)?;
+        writer.write_all(serde_json::to_vec(&release_manifest)?.as_slice())?;
+        writer.start_file("ROLLBACK.txt", options)?;
+        writer.write_all(b"restore previous archive")?;
+        writer.start_file("MIGRATION_NOTES.txt", options)?;
+        writer.write_all(b"no migration required")?;
+        writer.start_file("sbom.json", options)?;
+        writer.write_all(b"{}")?;
+        writer.start_file("provenance.json", options)?;
+        writer.write_all(b"{}")?;
+        writer.finish()?;
+
+        let archive_sha256 = hex::encode(Sha256::digest(fs::read(archive_path.as_path())?));
+        let archive_name =
+            archive_path.file_name().and_then(|value| value.to_str()).expect("UTF-8 test name");
+        fs::write(
+            temp.path().join(format!("{archive_name}.sha256")),
+            format!("{archive_sha256}  {archive_name}"),
+        )?;
+
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let publisher_key_sha256 = hex::encode(Sha256::digest(verifying_key.as_bytes()));
+        let message = release_signature_message(
+            archive_name,
+            archive_sha256.as_str(),
+            publisher_key_sha256.as_str(),
+        );
+        let signature = signing_key.sign(message.as_bytes());
+        let envelope = ReleaseSignatureEnvelope {
+            schema_version: 1,
+            algorithm: RELEASE_SIGNATURE_ALGORITHM.to_owned(),
+            artifact_file_name: archive_name.to_owned(),
+            artifact_sha256: archive_sha256,
+            publisher_key_sha256,
+            signature_hex: hex::encode(signature.to_bytes()),
+        };
+        fs::write(temp.path().join(format!("{archive_name}.sig")), serde_json::to_vec(&envelope)?)?;
+        Ok((temp, archive_path, hex::encode(verifying_key.as_bytes())))
+    }
+
     #[test]
     fn build_update_next_steps_includes_service_stop_for_running_service() {
-        let steps =
-            build_update_next_steps(Some(&manifest("headless")), Some(&running_service()), false);
+        let steps = build_update_next_steps(
+            Some(&manifest("headless")),
+            Some(&running_service()),
+            false,
+            None,
+        );
         assert!(
             steps.iter().any(|step| step.contains("Stop the gateway service")),
             "running services should produce an explicit stop step"
@@ -624,8 +1169,12 @@ mod tests {
 
     #[test]
     fn build_update_next_steps_honors_skip_service_restart() {
-        let steps =
-            build_update_next_steps(Some(&manifest("desktop")), Some(&running_service()), true);
+        let steps = build_update_next_steps(
+            Some(&manifest("desktop")),
+            Some(&running_service()),
+            true,
+            None,
+        );
         assert!(
             steps.iter().any(|step| step.contains("restart handling was intentionally skipped")),
             "skip_service_restart should be reflected in the plan"
@@ -679,5 +1228,68 @@ mod tests {
                 .any(|area| area.area == "supply_chain" && area.maturity_state == "blocked"),
             "supply-chain area should remain blocked without SBOM/provenance evidence"
         );
+    }
+
+    #[test]
+    fn signed_candidate_verifies_archive_members_checksum_and_publisher() -> anyhow::Result<()> {
+        let (_temp, archive_path, publisher_key) = signed_candidate_fixture()?;
+
+        let candidate = load_candidate_archive_snapshot_with_key(
+            archive_path.display().to_string(),
+            Some(publisher_key.as_str()),
+        )?;
+        let scorecard = build_release_readiness_scorecard(None, None, None, Some(&candidate));
+
+        assert!(candidate.manifest_binary_hashes_verified);
+        assert_eq!(candidate.verified_manifest_binary_hash_count, 1);
+        assert!(candidate.checksum_verified);
+        assert!(candidate.signature_verified);
+        assert_eq!(scorecard.overall_state, "ready");
+        Ok(())
+    }
+
+    #[test]
+    fn present_but_unverified_sidecars_block_readiness_and_replacement_guidance() {
+        let mut candidate = candidate(true, true);
+        candidate.checksum_verified = false;
+        candidate.signature_verified = false;
+
+        let scorecard = build_release_readiness_scorecard(None, None, None, Some(&candidate));
+        let steps = build_update_next_steps(
+            Some(&manifest("headless")),
+            Some(&running_service()),
+            false,
+            Some(&candidate),
+        );
+
+        assert_eq!(scorecard.overall_state, "blocked");
+        assert!(scorecard
+            .gates
+            .iter()
+            .any(|gate| { gate.gate == "artifact_hashes" && gate.state == "blocked" }));
+        assert!(scorecard
+            .gates
+            .iter()
+            .any(|gate| { gate.gate == "signed_artifact" && gate.state == "blocked" }));
+        assert!(steps.iter().any(|step| step.starts_with("Do not replace")));
+        assert!(steps.iter().all(|step| !step.starts_with("Stop the gateway")));
+    }
+
+    #[test]
+    fn tampering_after_signing_invalidates_candidate_evidence() -> anyhow::Result<()> {
+        let (_temp, archive_path, publisher_key) = signed_candidate_fixture()?;
+        let mut file = fs::OpenOptions::new().append(true).open(archive_path.as_path())?;
+        file.write_all(b"tampered")?;
+        drop(file);
+
+        let candidate = load_candidate_archive_snapshot_with_key(
+            archive_path.display().to_string(),
+            Some(publisher_key.as_str()),
+        )?;
+
+        assert!(!candidate.checksum_verified);
+        assert!(!candidate.signature_verified);
+        assert!(!super::candidate_is_trusted(&candidate));
+        Ok(())
     }
 }
