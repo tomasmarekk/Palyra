@@ -3061,11 +3061,17 @@ pub async fn run() -> Result<()> {
                     .http_fetch
                     .allowed_request_headers
                     .clone(),
-                allowed_credential_vault_refs: loaded
+                credential_bindings: loaded
                     .tool_call
                     .http_fetch
-                    .allowed_credential_vault_refs
-                    .clone(),
+                    .credential_bindings
+                    .iter()
+                    .map(|binding| gateway::HttpFetchCredentialBindingRuntimeConfig {
+                        vault_ref: binding.vault_ref.clone(),
+                        header_name: binding.header_name.clone(),
+                        origin: binding.origin.clone(),
+                    })
+                    .collect(),
                 cache_enabled: loaded.tool_call.http_fetch.cache_enabled,
                 cache_ttl_ms: loaded.tool_call.http_fetch.cache_ttl_ms,
                 max_cache_entries: usize::try_from(loaded.tool_call.http_fetch.max_cache_entries)

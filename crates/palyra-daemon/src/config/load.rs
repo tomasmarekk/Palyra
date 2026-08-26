@@ -32,10 +32,11 @@ use palyra_common::{
         FileAcpRuntimeBackendConfig, FileAgentHarnessConfig, FileContainerEnvBindingConfig,
         FileContainerExecutionProfileConfig, FileContainerResourceLimitsConfig,
         FileContainerWorkspaceMountConfig, FileDoctorCheckConfig,
-        FileExecutionBackendProfileConfig, FileMcpCommandValue, FileMcpEnvVaultRefConfig,
-        FileMcpOAuthGrantConfig, FileMcpSamplingPolicyConfig, FileMcpServerConfig,
-        FileMemoryRetrievalConfig, FileObservabilityExporterConfig,
-        FileRetrievalSourceScoringProfile, FileSshWorkerExecutionProfileConfig, RootFileConfig,
+        FileExecutionBackendProfileConfig, FileHttpFetchCredentialBindingConfig,
+        FileMcpCommandValue, FileMcpEnvVaultRefConfig, FileMcpOAuthGrantConfig,
+        FileMcpSamplingPolicyConfig, FileMcpServerConfig, FileMemoryRetrievalConfig,
+        FileObservabilityExporterConfig, FileRetrievalSourceScoringProfile,
+        FileSshWorkerExecutionProfileConfig, RootFileConfig,
     },
     default_config_search_paths, default_state_root,
     feature_rollouts::{
@@ -1265,13 +1266,11 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
                         "tool_call.http_fetch.allowed_request_headers",
                     )?;
                 }
-                if let Some(allowed_credential_vault_refs) =
-                    file_http_fetch.allowed_credential_vault_refs
-                {
-                    tool_call.http_fetch.allowed_credential_vault_refs =
-                        parse_exact_vault_ref_allowlist(
-                            allowed_credential_vault_refs.join(",").as_str(),
-                            "tool_call.http_fetch.allowed_credential_vault_refs",
+                if let Some(credential_bindings) = file_http_fetch.credential_bindings {
+                    tool_call.http_fetch.credential_bindings =
+                        parse_http_fetch_credential_bindings(
+                            credential_bindings,
+                            "tool_call.http_fetch.credential_bindings",
                         )?;
                 }
                 if let Some(cache_enabled) = file_http_fetch.cache_enabled {
@@ -2117,14 +2116,22 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
         )?;
         source.push_str(" +env(PALYRA_HTTP_FETCH_ALLOWED_HEADERS)");
     }
-    if let Ok(allowed_credential_vault_refs) =
-        env::var("PALYRA_HTTP_FETCH_ALLOWED_CREDENTIAL_VAULT_REFS")
-    {
-        tool_call.http_fetch.allowed_credential_vault_refs = parse_exact_vault_ref_allowlist(
-            allowed_credential_vault_refs.as_str(),
-            "PALYRA_HTTP_FETCH_ALLOWED_CREDENTIAL_VAULT_REFS",
+    if let Ok(credential_bindings_json) = env::var("PALYRA_HTTP_FETCH_CREDENTIAL_BINDINGS_JSON") {
+        let credential_bindings =
+            serde_json::from_str::<Vec<FileHttpFetchCredentialBindingConfig>>(
+                credential_bindings_json.as_str(),
+            )
+            .context("PALYRA_HTTP_FETCH_CREDENTIAL_BINDINGS_JSON must be a JSON array")?;
+        tool_call.http_fetch.credential_bindings = parse_http_fetch_credential_bindings(
+            credential_bindings,
+            "PALYRA_HTTP_FETCH_CREDENTIAL_BINDINGS_JSON",
         )?;
-        source.push_str(" +env(PALYRA_HTTP_FETCH_ALLOWED_CREDENTIAL_VAULT_REFS)");
+        source.push_str(" +env(PALYRA_HTTP_FETCH_CREDENTIAL_BINDINGS_JSON)");
+    }
+    if env::var_os("PALYRA_HTTP_FETCH_ALLOWED_CREDENTIAL_VAULT_REFS").is_some() {
+        anyhow::bail!(
+            "PALYRA_HTTP_FETCH_ALLOWED_CREDENTIAL_VAULT_REFS is no longer supported; configure recipient-bound PALYRA_HTTP_FETCH_CREDENTIAL_BINDINGS_JSON"
+        );
     }
     if let Ok(cache_enabled) = env::var("PALYRA_HTTP_FETCH_CACHE_ENABLED") {
         tool_call.http_fetch.cache_enabled = cache_enabled
@@ -5223,11 +5230,64 @@ fn parse_vault_ref_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>
     Ok(refs)
 }
 
-/// Wrapper for config fields whose semantics require exact vault-ref
-/// matching. The shared parser already preserves case-sensitive scope
-/// segments and secret keys.
-fn parse_exact_vault_ref_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
-    parse_vault_ref_allowlist(raw, source_name)
+fn parse_http_fetch_credential_bindings(
+    raw: Vec<FileHttpFetchCredentialBindingConfig>,
+    source_name: &str,
+) -> Result<Vec<HttpFetchCredentialBindingConfig>> {
+    if raw.len() > 32 {
+        anyhow::bail!("{source_name} cannot contain more than 32 recipient bindings");
+    }
+    let mut bindings = Vec::with_capacity(raw.len());
+    let mut recipients = HashSet::with_capacity(raw.len());
+    for (index, binding) in raw.into_iter().enumerate() {
+        let parsed_vault_ref = VaultRef::parse(binding.vault_ref.trim()).with_context(|| {
+            format!("{source_name}[{index}].vault_ref must be one exact <scope>/<key> reference")
+        })?;
+        let vault_ref = format!("{}/{}", parsed_vault_ref.scope, parsed_vault_ref.key);
+        let parsed_headers = parse_http_header_allowlist(
+            binding.header_name.as_str(),
+            format!("{source_name}[{index}].header_name").as_str(),
+        )?;
+        if parsed_headers.len() != 1 {
+            anyhow::bail!("{source_name}[{index}].header_name must contain exactly one header");
+        }
+        let Some(header_name) = parsed_headers.into_iter().next() else {
+            anyhow::bail!("{source_name}[{index}].header_name must contain exactly one header");
+        };
+        if !(header_name.starts_with("authorization")
+            || header_name.starts_with("x-")
+            || header_name.ends_with("-token")
+            || header_name.ends_with("-api-key")
+            || header_name == "cookie")
+        {
+            anyhow::bail!("{source_name}[{index}].header_name must be a credential-shaped header");
+        }
+
+        let origin_url = reqwest::Url::parse(binding.origin.trim()).with_context(|| {
+            format!("{source_name}[{index}].origin must be an absolute HTTPS origin")
+        })?;
+        if origin_url.scheme() != "https"
+            || origin_url.host_str().is_none()
+            || !origin_url.username().is_empty()
+            || origin_url.password().is_some()
+            || origin_url.query().is_some()
+            || origin_url.fragment().is_some()
+            || origin_url.path() != "/"
+        {
+            anyhow::bail!(
+                "{source_name}[{index}].origin must contain only an exact HTTPS scheme, host, and optional port"
+            );
+        }
+        let origin = origin_url.origin().ascii_serialization();
+        let recipient_key = format!("{origin}\0{header_name}");
+        if !recipients.insert(recipient_key) {
+            anyhow::bail!(
+                "{source_name} contains duplicate recipient header '{header_name}' for origin '{origin}'"
+            );
+        }
+        bindings.push(HttpFetchCredentialBindingConfig { vault_ref, header_name, origin });
+    }
+    Ok(bindings)
 }
 
 fn parse_tool_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
@@ -6007,7 +6067,7 @@ mod tests {
         parse_canvas_host_public_base_url, parse_channel_identifier_list,
         parse_channel_routing_rule, parse_content_type_allowlist, parse_cron_timezone_mode,
         parse_default_memory_ttl_ms, parse_direct_message_policy, parse_dns_suffix_allowlist,
-        parse_exact_vault_ref_allowlist, parse_host_allowlist, parse_http_header_allowlist,
+        parse_host_allowlist, parse_http_fetch_credential_bindings, parse_http_header_allowlist,
         parse_journal_db_path, parse_mcp_server_config, parse_memory_retention_vacuum_schedule,
         parse_model_provider_auth_provider_kind, parse_model_provider_registry_entry,
         parse_model_provider_registry_model, parse_openai_base_url, parse_openai_embeddings_dims,
@@ -6025,10 +6085,10 @@ mod tests {
         BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
         DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FileAcpRuntimeBackendConfig,
         FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
-        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig,
-        OrchestratorConfig, ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
-        RetrievalDualPathConfig, RuntimeKernelProfile, SessionQueuePolicyConfig, StorageConfig,
-        ToolCallConfig,
+        HttpFetchConfig, HttpFetchCredentialBindingConfig, IdentityConfig, MemoryConfig,
+        ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig, ProcessRunnerConfig,
+        PruningPolicyMatrixConfig, ReplayCaptureConfig, RetrievalDualPathConfig,
+        RuntimeKernelProfile, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
     use crate::model_provider::{
@@ -6039,9 +6099,9 @@ mod tests {
     use palyra_common::tool_catalog::ToolCatalogExposureMode;
     use palyra_common::{
         daemon_config_schema::{
-            FileMcpCommandValue, FileMcpOAuthGrantConfig, FileMcpSamplingPolicyConfig,
-            FileMcpServerConfig, FileModelProviderRegistryEntry, FileModelProviderRegistryModel,
-            RootFileConfig,
+            FileHttpFetchCredentialBindingConfig, FileMcpCommandValue, FileMcpOAuthGrantConfig,
+            FileMcpSamplingPolicyConfig, FileMcpServerConfig, FileModelProviderRegistryEntry,
+            FileModelProviderRegistryModel, RootFileConfig,
         },
         feature_rollouts::{
             FeatureRolloutSetting, FeatureRolloutSource, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
@@ -7217,8 +7277,8 @@ mod tests {
             "http fetch default request header allowlist should include safe client-version headers"
         );
         assert!(
-            config.http_fetch.allowed_credential_vault_refs.is_empty(),
-            "http fetch credential injection must default to no vault refs until explicitly configured"
+            config.http_fetch.credential_bindings.is_empty(),
+            "http fetch credential injection must default to no recipient capabilities until explicitly configured"
         );
         assert!(
             !config.browser_service.enabled,
@@ -7239,7 +7299,7 @@ mod tests {
         assert!(config.cache_enabled);
         assert_eq!(config.cache_ttl_ms, 30_000);
         assert_eq!(config.max_cache_entries, 256);
-        assert!(config.allowed_credential_vault_refs.is_empty());
+        assert!(config.credential_bindings.is_empty());
     }
 
     #[test]
@@ -7398,8 +7458,12 @@ mod tests {
             max_response_bytes = 12345
             allowed_content_types = ["application/json"]
             allowed_request_headers = ["accept"]
-            allowed_credential_vault_refs = ["global/github_token"]
             cache_enabled = false
+
+            [[tool_call.http_fetch.credential_bindings]]
+            vault_ref = "global/github_token"
+            header_name = "authorization"
+            origin = "https://api.github.com"
 
             [tool_call.browser_service]
             enabled = true
@@ -7419,10 +7483,12 @@ mod tests {
         assert_eq!(http_fetch.max_response_bytes, Some(12_345));
         assert_eq!(http_fetch.allowed_content_types, Some(vec!["application/json".to_owned()]));
         assert_eq!(http_fetch.allowed_request_headers, Some(vec!["accept".to_owned()]));
-        assert_eq!(
-            http_fetch.allowed_credential_vault_refs,
-            Some(vec!["global/github_token".to_owned()])
-        );
+        let credential_bindings =
+            http_fetch.credential_bindings.expect("credential bindings should parse");
+        assert_eq!(credential_bindings.len(), 1);
+        assert_eq!(credential_bindings[0].vault_ref, "global/github_token");
+        assert_eq!(credential_bindings[0].header_name, "authorization");
+        assert_eq!(credential_bindings[0].origin, "https://api.github.com");
         assert_eq!(http_fetch.cache_enabled, Some(false));
 
         let browser_service =
@@ -7932,7 +7998,7 @@ compact_tool_threshold = 9
     }
 
     #[test]
-    fn load_config_accepts_http_fetch_credential_vault_ref_allowlist() {
+    fn load_config_accepts_http_fetch_recipient_bindings() {
         let _guard = env_lock().lock().expect("env lock poisoned");
         let tempdir = tempfile::tempdir().expect("temporary directory should be created");
         let config_path = tempdir.path().join("palyra.toml");
@@ -7944,23 +8010,42 @@ version = 1
 [admin]
 require_auth = false
 
-[tool_call.http_fetch]
-allowed_credential_vault_refs = ["global/github_token", "principal:UserA/api_token"]
+[[tool_call.http_fetch.credential_bindings]]
+vault_ref = "global/github_token"
+header_name = "authorization"
+origin = "https://api.github.com"
+
+[[tool_call.http_fetch.credential_bindings]]
+vault_ref = "principal:UserA/api_token"
+header_name = "x-api-key"
+origin = "https://service.example:8443"
 "#,
         )
-        .expect("http fetch credential allowlist config should be written");
+        .expect("http fetch credential binding config should be written");
 
         let _config = ScopedEnvVar::set(
             "PALYRA_CONFIG",
             config_path.to_str().expect("test path should be UTF-8"),
         );
-        let _allowlist_env = ScopedEnvVar::unset("PALYRA_HTTP_FETCH_ALLOWED_CREDENTIAL_VAULT_REFS");
+        let _binding_env = ScopedEnvVar::unset("PALYRA_HTTP_FETCH_CREDENTIAL_BINDINGS_JSON");
+        let _legacy_env = ScopedEnvVar::unset("PALYRA_HTTP_FETCH_ALLOWED_CREDENTIAL_VAULT_REFS");
 
-        let loaded = super::load_config().expect("http fetch credential allowlist should load");
+        let loaded = super::load_config().expect("http fetch credential bindings should load");
 
         assert_eq!(
-            loaded.tool_call.http_fetch.allowed_credential_vault_refs,
-            vec!["global/github_token".to_owned(), "principal:UserA/api_token".to_owned()]
+            loaded.tool_call.http_fetch.credential_bindings,
+            vec![
+                HttpFetchCredentialBindingConfig {
+                    vault_ref: "global/github_token".to_owned(),
+                    header_name: "authorization".to_owned(),
+                    origin: "https://api.github.com".to_owned(),
+                },
+                HttpFetchCredentialBindingConfig {
+                    vault_ref: "principal:UserA/api_token".to_owned(),
+                    header_name: "x-api-key".to_owned(),
+                    origin: "https://service.example:8443".to_owned(),
+                },
+            ]
         );
     }
 
@@ -8865,16 +8950,39 @@ state_dir = "browserd-state"
     }
 
     #[test]
-    fn parse_exact_vault_ref_allowlist_preserves_scope_case() {
-        let parsed = parse_exact_vault_ref_allowlist(
-            "principal:UserA/api_token,principal:UserA/api_token,global/github_token",
-            "tool_call.http_fetch.allowed_credential_vault_refs",
+    fn parse_http_fetch_credential_bindings_canonicalizes_exact_https_origin() {
+        let parsed = parse_http_fetch_credential_bindings(
+            vec![FileHttpFetchCredentialBindingConfig {
+                vault_ref: "GLOBAL/GitHub_Token".to_owned(),
+                header_name: "Authorization".to_owned(),
+                origin: "https://API.GITHUB.COM:443".to_owned(),
+            }],
+            "tool_call.http_fetch.credential_bindings",
         )
-        .expect("exact vault ref allowlist should parse");
+        .expect("exact HTTPS recipient binding should parse");
+
         assert_eq!(
             parsed,
-            vec!["principal:UserA/api_token".to_owned(), "global/github_token".to_owned()]
+            vec![HttpFetchCredentialBindingConfig {
+                vault_ref: "global/GitHub_Token".to_owned(),
+                header_name: "authorization".to_owned(),
+                origin: "https://api.github.com".to_owned(),
+            }]
         );
+    }
+
+    #[test]
+    fn parse_http_fetch_credential_bindings_rejects_plaintext_origin() {
+        let result = parse_http_fetch_credential_bindings(
+            vec![FileHttpFetchCredentialBindingConfig {
+                vault_ref: "global/github_token".to_owned(),
+                header_name: "authorization".to_owned(),
+                origin: "http://api.github.com".to_owned(),
+            }],
+            "tool_call.http_fetch.credential_bindings",
+        );
+
+        assert!(result.is_err(), "credential recipients must require HTTPS");
     }
 
     #[test]

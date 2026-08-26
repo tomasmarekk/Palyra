@@ -1608,10 +1608,19 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "headers",
                         json!({"type":"object","properties":{},"additionalProperties":{"type":"string"}}),
                     ),
-                    ("allow_redirects", json!({"type":"boolean"})),
-                    ("max_redirects", json!({"type":"integer","minimum":1,"maximum":20})),
+                    (
+                        "allow_redirects",
+                        json!({"type":"boolean","description":"May only disable redirects allowed by operator policy; it cannot enable redirects disabled in config."}),
+                    ),
+                    (
+                        "max_redirects",
+                        json!({"type":"integer","minimum":1,"maximum":20,"description":"May only lower the operator-configured redirect limit."}),
+                    ),
                     ("allow_private_targets", json!({"type":"boolean"})),
-                    ("max_response_bytes", json!({"type":"integer","minimum":1})),
+                    (
+                        "max_response_bytes",
+                        json!({"type":"integer","minimum":1,"description":"May only lower the operator-configured response limit."}),
+                    ),
                     ("cache", json!({"type":"boolean"})),
                     ("cache_ttl_ms", json!({"type":"integer","minimum":1})),
                     (
@@ -1644,7 +1653,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                                             },
                                             "vault_ref":{
                                                 "type":"string",
-                                                "description":"Vault ref that must exactly match tool_call.http_fetch.allowed_credential_vault_refs."
+                                                "description":"Vault ref whose ref, header, and current exact HTTPS origin must match one tool_call.http_fetch.credential_bindings capability."
                                             },
                                             "required":{"type":"boolean"},
                                             "refresh_policy":{"type":"string","enum":["on_startup","on_reload","per_run","per_use"]},

@@ -4954,8 +4954,10 @@ openai_base_url = "https://chatgpt.com/backend-api/codex"
     fn openai_api_key_config_keeps_discovery_pending_and_http_fetch_credentials_explicit() {
         let mut document: toml::Value = toml::from_str(
             r#"
-[tool_call.http_fetch]
-allowed_credential_vault_refs = ["global/github_token"]
+[[tool_call.http_fetch.credential_bindings]]
+vault_ref = "global/github_token"
+header_name = "authorization"
+origin = "https://api.github.com"
 "#,
         )
         .expect("test config should parse");
@@ -4980,13 +4982,24 @@ allowed_credential_vault_refs = ["global/github_token"]
                 .as_deref(),
             Some("global/openai_api_key")
         );
-        let http_fetch_refs =
-            get_value_at_path(&document, "tool_call.http_fetch.allowed_credential_vault_refs")
+        let http_fetch_bindings =
+            get_value_at_path(&document, "tool_call.http_fetch.credential_bindings")
                 .expect("HTTP fetch credential lookup should succeed")
                 .and_then(toml::Value::as_array)
-                .expect("HTTP fetch credential refs should remain an array");
-        assert_eq!(http_fetch_refs.len(), 1);
-        assert_eq!(http_fetch_refs[0].as_str(), Some("global/github_token"));
+                .expect("HTTP fetch credential bindings should remain an array");
+        assert_eq!(http_fetch_bindings.len(), 1);
+        let binding = http_fetch_bindings[0]
+            .as_table()
+            .expect("HTTP fetch credential binding should remain a table");
+        assert_eq!(
+            binding.get("vault_ref").and_then(toml::Value::as_str),
+            Some("global/github_token")
+        );
+        assert_eq!(binding.get("header_name").and_then(toml::Value::as_str), Some("authorization"));
+        assert_eq!(
+            binding.get("origin").and_then(toml::Value::as_str),
+            Some("https://api.github.com")
+        );
         validate_daemon_compatible_document(&document)
             .expect("OpenAI API-key config should remain daemon-compatible");
     }

@@ -1191,9 +1191,17 @@ pub struct WasmRuntimeConfig {
     pub allowed_channels: Vec<String>,
 }
 
+/// One exact HTTPS recipient capability for HTTP-fetch credential injection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HttpFetchCredentialBindingConfig {
+    pub vault_ref: String,
+    pub header_name: String,
+    pub origin: String,
+}
+
 /// HTTP fetch tool policy: private-target blocking (on by default),
 /// timeouts, response/redirect budgets, content-type and header allowlists,
-/// and the vault refs eligible for credential injection.
+/// and recipient-bound vault credential capabilities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpFetchConfig {
     pub allow_private_targets: bool,
@@ -1204,9 +1212,7 @@ pub struct HttpFetchConfig {
     pub max_redirects: u32,
     pub allowed_content_types: Vec<String>,
     pub allowed_request_headers: Vec<String>,
-    /// Exact vault refs (scope case preserved) that fetch requests may bind
-    /// as credentials; empty means credential injection is disabled.
-    pub allowed_credential_vault_refs: Vec<String>,
+    pub credential_bindings: Vec<HttpFetchCredentialBindingConfig>,
     pub cache_enabled: bool,
     pub cache_ttl_ms: u64,
     pub max_cache_entries: u64,
@@ -1511,7 +1517,7 @@ impl Default for HttpFetchConfig {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
-            allowed_credential_vault_refs: Vec::new(),
+            credential_bindings: Vec::new(),
             cache_enabled: DEFAULT_HTTP_FETCH_CACHE_ENABLED,
             cache_ttl_ms: DEFAULT_HTTP_FETCH_CACHE_TTL_MS,
             max_cache_entries: DEFAULT_HTTP_FETCH_MAX_CACHE_ENTRIES,

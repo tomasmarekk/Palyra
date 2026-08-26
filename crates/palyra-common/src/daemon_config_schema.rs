@@ -679,7 +679,7 @@ pub fn known_config_env_vars() -> Vec<&'static str> {
         "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE",
         "PALYRA_HTTP_FETCH_ALLOWED_HOSTS",
         "PALYRA_HTTP_FETCH_ALLOWLIST",
-        "PALYRA_HTTP_FETCH_ALLOWED_CREDENTIAL_VAULT_REFS",
+        "PALYRA_HTTP_FETCH_CREDENTIAL_BINDINGS_JSON",
         "PALYRA_CHANNEL_DELIVERY_PIPELINE_MODE",
         "PALYRA_CHANNEL_ROUTER_GROUP_GUARDRAILS",
         "PALYRA_TOOL_CATALOG_EXPOSURE_MODE",
@@ -1537,10 +1537,19 @@ pub struct FileHttpFetchConfig {
     pub max_redirects: Option<u32>,
     pub allowed_content_types: Option<Vec<String>>,
     pub allowed_request_headers: Option<Vec<String>>,
-    pub allowed_credential_vault_refs: Option<Vec<String>>,
+    pub credential_bindings: Option<Vec<FileHttpFetchCredentialBindingConfig>>,
     pub cache_enabled: Option<bool>,
     pub cache_ttl_ms: Option<u64>,
     pub max_cache_entries: Option<u64>,
+}
+
+/// One exact recipient capability for HTTP-fetch credential injection.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHttpFetchCredentialBindingConfig {
+    pub vault_ref: String,
+    pub header_name: String,
+    pub origin: String,
 }
 
 /// `[tool_call.browser_service]`: browser daemon endpoint, auth, and limits.

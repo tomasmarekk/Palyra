@@ -203,30 +203,32 @@ variable = "PALYRA_OPENAI_API_KEY"
 }
 
 #[test]
-fn config_validate_rejects_empty_http_fetch_credential_vault_ref_allowlist() -> Result<()> {
+fn config_validate_rejects_plaintext_http_fetch_credential_recipient() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
-    let config_path = workdir.path().join("empty-http-fetch-credential-refs.toml");
+    let config_path = workdir.path().join("plaintext-http-fetch-credential-recipient.toml");
     fs::write(
         &config_path,
         r#"
 version = 1
 
-[tool_call.http_fetch]
-allowed_credential_vault_refs = []
+[[tool_call.http_fetch.credential_bindings]]
+vault_ref = "global/github_token"
+header_name = "authorization"
+origin = "http://api.github.com"
 "#,
     )
     .with_context(|| format!("failed to write {}", config_path.display()))?;
 
     let output = run_cli(
         &workdir,
-        &["config", "validate", "--path", "empty-http-fetch-credential-refs.toml"],
+        &["config", "validate", "--path", "plaintext-http-fetch-credential-recipient.toml"],
     )?;
 
-    assert!(!output.status.success(), "empty HTTP fetch credential refs must fail");
+    assert!(!output.status.success(), "plaintext HTTP fetch credential recipient must fail");
     let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
     assert!(
         stderr.contains(
-            "tool_call.http_fetch.allowed_credential_vault_refs must include at least one <scope>/<key> entry"
+            "tool_call.http_fetch.credential_bindings[0].origin must contain only an exact HTTPS scheme, host, and optional port"
         ),
         "validation should match the daemon loader invariant: {stderr}"
     );

@@ -33,7 +33,8 @@ use ulid::Ulid;
 
 use crate::{
     gateway::{
-        current_unix_ms, CachedHttpFetchEntry, GatewayRuntimeState, MAX_HTTP_FETCH_BODY_BYTES,
+        current_unix_ms, CachedHttpFetchEntry, GatewayRuntimeState,
+        HttpFetchCredentialBindingRuntimeConfig, MAX_HTTP_FETCH_BODY_BYTES,
         MAX_HTTP_FETCH_CACHE_KEY_BYTES, MAX_HTTP_FETCH_REDIRECTS, MAX_HTTP_FETCH_TOOL_INPUT_BYTES,
     },
     sandbox_runner::{process_runner_allows_host_access, SandboxProcessRunnerPolicy},
@@ -132,7 +133,7 @@ pub(crate) async fn execute_http_fetch_tool(
         None => String::new(),
     };
 
-    let request_headers = match payload.get("headers") {
+    let mut request_headers = match payload.get("headers") {
         Some(Value::Object(values)) => {
             let mut headers = Vec::new();
             for (name, value) in values {
@@ -189,7 +190,7 @@ pub(crate) async fn execute_http_fetch_tool(
     };
     let credential_bindings = match parse_credential_bindings(
         &payload,
-        runtime_state.config.http_fetch.allowed_credential_vault_refs.as_slice(),
+        runtime_state.config.http_fetch.credential_bindings.as_slice(),
     ) {
         Ok(bindings) => bindings,
         Err(error) => {
@@ -225,22 +226,18 @@ pub(crate) async fn execute_http_fetch_tool(
     let allow_redirects = payload
         .get("allow_redirects")
         .and_then(Value::as_bool)
+        .map(|requested| runtime_state.config.http_fetch.allow_redirects && requested)
         .unwrap_or(runtime_state.config.http_fetch.allow_redirects);
-    // The `as usize` casts below are safe even where they could truncate:
-    // the immediate clamp to the MAX_HTTP_FETCH_* ceilings bounds the result,
-    // so an attacker-supplied huge value can only shrink the limit.
-    let max_redirects = payload
-        .get("max_redirects")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(runtime_state.config.http_fetch.max_redirects)
-        .clamp(1, MAX_HTTP_FETCH_REDIRECTS);
-    let max_response_bytes = payload
-        .get("max_response_bytes")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(runtime_state.config.http_fetch.max_response_bytes)
-        .clamp(1, MAX_HTTP_FETCH_BODY_BYTES);
+    let max_redirects = tighten_http_fetch_limit(
+        payload.get("max_redirects").and_then(Value::as_u64),
+        runtime_state.config.http_fetch.max_redirects,
+        MAX_HTTP_FETCH_REDIRECTS,
+    );
+    let max_response_bytes = tighten_http_fetch_limit(
+        payload.get("max_response_bytes").and_then(Value::as_u64),
+        runtime_state.config.http_fetch.max_response_bytes,
+        MAX_HTTP_FETCH_BODY_BYTES,
+    );
     let url = match Url::parse(url_raw.as_str()) {
         Ok(value) => value,
         Err(error) => {
@@ -269,6 +266,21 @@ pub(crate) async fn execute_http_fetch_tool(
             false,
             b"{}".to_vec(),
             "palyra.http.fetch URL credentials are not allowed".to_owned(),
+        );
+    }
+    if let Err(error) = authorize_credential_bindings_for_url(
+        credential_bindings.as_slice(),
+        runtime_state.config.http_fetch.credential_bindings.as_slice(),
+        &url,
+        runtime_state.config.tool_call.process_runner.allowed_egress_hosts.as_slice(),
+        runtime_state.config.tool_call.process_runner.allowed_dns_suffixes.as_slice(),
+    ) {
+        return http_fetch_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            error,
         );
     }
     let cache_request = payload.get("cache").and_then(Value::as_bool);
@@ -383,19 +395,6 @@ pub(crate) async fn execute_http_fetch_tool(
             );
         }
     };
-    let resolved_credential_headers =
-        match resolve_credential_bindings(runtime_state, credential_bindings.as_slice()) {
-            Ok(value) => value,
-            Err(error) => {
-                return http_fetch_tool_execution_outcome(
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    error,
-                );
-            }
-        };
     let initial_resolved_addrs = initial_egress_verdict.resolved_addresses.clone();
     let mut current_egress_verdict = initial_egress_verdict;
     let mut next_egress_verdict =
@@ -435,6 +434,21 @@ pub(crate) async fn execute_http_fetch_tool(
     let mut current_url = url;
     let mut redirects_followed = 0_usize;
     loop {
+        if let Err(error) = authorize_credential_bindings_for_url(
+            credential_bindings.as_slice(),
+            runtime_state.config.http_fetch.credential_bindings.as_slice(),
+            &current_url,
+            runtime_state.config.tool_call.process_runner.allowed_egress_hosts.as_slice(),
+            runtime_state.config.tool_call.process_runner.allowed_dns_suffixes.as_slice(),
+        ) {
+            return http_fetch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                error,
+            );
+        }
         // The first iteration consumes the verdict already computed above
         // (so a redirect-free fetch evaluates policy exactly once); redirect
         // iterations find `None` here and re-evaluate for the new target.
@@ -471,6 +485,19 @@ pub(crate) async fn execute_http_fetch_tool(
             }
         };
         current_egress_verdict = egress_verdict;
+        let resolved_credential_headers =
+            match resolve_credential_bindings(runtime_state, credential_bindings.as_slice()) {
+                Ok(value) => value,
+                Err(error) => {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
 
         let host = current_url.host_str().unwrap_or_default().to_owned();
         // `Policy::none()` is load-bearing: redirects are followed manually
@@ -577,7 +604,7 @@ pub(crate) async fn execute_http_fetch_tool(
                     );
                 }
             };
-            current_url = match current_url.join(location_str) {
+            let redirect_url = match current_url.join(location_str) {
                 Ok(value) => value,
                 Err(error) => {
                     return http_fetch_tool_execution_outcome(
@@ -589,6 +616,8 @@ pub(crate) async fn execute_http_fetch_tool(
                     );
                 }
             };
+            strip_cross_origin_sensitive_headers(&current_url, &redirect_url, &mut request_headers);
+            current_url = redirect_url;
             redirects_followed = redirects_followed.saturating_add(1);
             // Drop the consumed verdict so the next loop iteration
             // re-evaluates egress policy for the redirect target.
@@ -850,17 +879,17 @@ pub(crate) fn validate_resolved_fetch_addresses(
 
 /// Parses and validates `credential_bindings` from the tool input.
 ///
-/// Bindings fail closed: each must reference a vault-backed secret whose
-/// normalized `scope/key` appears in the operator-configured allowlist, so
-/// the model can only ever attach pre-approved credentials.
+/// Bindings fail closed: each vault ref and header pair must appear in an
+/// operator-configured recipient capability. The current URL is checked
+/// separately before each hop resolves or injects a secret.
 ///
 /// # Errors
-/// Returns a model-facing message when the field is malformed, the allowlist
-/// is empty while bindings are present, a secret ref is invalid or
-/// non-vault, or a vault ref is not allowlisted.
+/// Returns a model-facing message when the field is malformed, no recipient
+/// capabilities are configured, a secret ref is invalid or non-vault, or the
+/// requested vault-ref/header pair is not configured.
 fn parse_credential_bindings(
     payload: &serde_json::Map<String, Value>,
-    allowed_credential_vault_refs: &[String],
+    configured_bindings: &[HttpFetchCredentialBindingRuntimeConfig],
 ) -> Result<Vec<CredentialBindingPlan>, String> {
     match payload.get("credential_bindings") {
         Some(Value::Array(values)) => {
@@ -869,12 +898,13 @@ fn parse_credential_bindings(
                     .map_err(|error| {
                         format!("palyra.http.fetch credential_bindings are invalid: {error}")
                     })?;
-            if !bindings.is_empty() && allowed_credential_vault_refs.is_empty() {
+            if !bindings.is_empty() && configured_bindings.is_empty() {
                 return Err(
-                    "palyra.http.fetch credential_bindings require configured tool_call.http_fetch.allowed_credential_vault_refs"
+                    "palyra.http.fetch credential_bindings require configured tool_call.http_fetch.credential_bindings"
                         .to_owned(),
                 );
             }
+            let mut requested_headers = std::collections::HashSet::with_capacity(bindings.len());
             for binding in &bindings {
                 binding.secret_ref.validate().map_err(|error| {
                     format!(
@@ -889,12 +919,18 @@ fn parse_credential_bindings(
                             binding.header_name
                         )
                     })??;
-                if !allowed_credential_vault_refs
-                    .iter()
-                    .any(|allowed| allowed == &normalized_vault_ref)
-                {
+                let normalized_header = binding.header_name.trim().to_ascii_lowercase();
+                if !requested_headers.insert(normalized_header.clone()) {
                     return Err(format!(
-                        "palyra.http.fetch credential binding '{}' uses vault ref '{}' that is not allowed by tool_call.http_fetch.allowed_credential_vault_refs",
+                        "palyra.http.fetch credential binding duplicates header '{normalized_header}'"
+                    ));
+                }
+                if !configured_bindings.iter().any(|allowed| {
+                    allowed.vault_ref == normalized_vault_ref
+                        && allowed.header_name == normalized_header
+                }) {
+                    return Err(format!(
+                        "palyra.http.fetch credential binding '{}' and vault ref '{}' are not configured together in tool_call.http_fetch.credential_bindings",
                         binding.header_name, normalized_vault_ref
                     ));
                 }
@@ -934,6 +970,93 @@ fn normalize_http_fetch_credential_vault_ref(
         )
     })?;
     Ok(format!("{}/{}", parsed.scope, parsed.key))
+}
+
+fn authorize_credential_bindings_for_url(
+    requested_bindings: &[CredentialBindingPlan],
+    configured_bindings: &[HttpFetchCredentialBindingRuntimeConfig],
+    url: &Url,
+    allowed_hosts: &[String],
+    allowed_dns_suffixes: &[String],
+) -> Result<(), String> {
+    if requested_bindings.is_empty() {
+        return Ok(());
+    }
+    if allowed_hosts.is_empty() && allowed_dns_suffixes.is_empty() {
+        return Err(
+            "palyra.http.fetch credential injection requires a non-empty general egress host allowlist"
+                .to_owned(),
+        );
+    }
+    let origin = http_fetch_network_origin(url).ok_or_else(|| {
+        "palyra.http.fetch credential injection requires an absolute HTTPS origin".to_owned()
+    })?;
+    if url.scheme() != "https" {
+        return Err(
+            "palyra.http.fetch credential injection is forbidden over plaintext HTTP".to_owned()
+        );
+    }
+
+    for binding in requested_bindings {
+        let vault_ref = http_fetch_credential_vault_ref(binding).ok_or_else(|| {
+            format!(
+                "palyra.http.fetch credential binding '{}' must use a vault-backed secret_ref",
+                binding.header_name
+            )
+        })??;
+        let header_name = binding.header_name.trim().to_ascii_lowercase();
+        if !configured_bindings.iter().any(|configured| {
+            configured.vault_ref == vault_ref
+                && configured.header_name == header_name
+                && configured.origin == origin
+        }) {
+            return Err(format!(
+                "palyra.http.fetch credential binding '{header_name}' is not authorized for exact origin '{origin}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn tighten_http_fetch_limit(
+    requested: Option<u64>,
+    configured: usize,
+    hard_ceiling: usize,
+) -> usize {
+    requested
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(configured)
+        .min(configured)
+        .clamp(1, hard_ceiling)
+}
+
+fn http_fetch_network_origin(url: &Url) -> Option<String> {
+    url.host_str()?;
+    url.port_or_known_default()?;
+    Some(url.origin().ascii_serialization())
+}
+
+fn strip_cross_origin_sensitive_headers(
+    current_url: &Url,
+    redirect_url: &Url,
+    headers: &mut Vec<(String, String)>,
+) {
+    if http_fetch_network_origin(current_url) != http_fetch_network_origin(redirect_url) {
+        headers.retain(|(name, _)| !http_fetch_sensitive_header(name));
+    }
+}
+
+fn http_fetch_sensitive_header(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    normalized == "authorization"
+        || normalized == "proxy-authorization"
+        || normalized == "cookie"
+        || normalized == "set-cookie"
+        || normalized.contains("api-key")
+        || normalized.contains("apikey")
+        || normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("credential")
 }
 
 fn evaluate_http_fetch_egress(
@@ -1431,12 +1554,40 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use reqwest::Url;
     use serde_json::json;
 
+    use crate::gateway::HttpFetchCredentialBindingRuntimeConfig;
+
     use super::{
-        decode_basic_html_entities, export_http_fetch_body, http_fetch_model_body_text,
-        parse_credential_bindings, redacted_http_headers,
+        authorize_credential_bindings_for_url, decode_basic_html_entities, export_http_fetch_body,
+        http_fetch_model_body_text, parse_credential_bindings, redacted_http_headers,
+        strip_cross_origin_sensitive_headers, tighten_http_fetch_limit,
     };
+
+    fn configured_credential_binding(
+        vault_ref: &str,
+        header_name: &str,
+        origin: &str,
+    ) -> HttpFetchCredentialBindingRuntimeConfig {
+        HttpFetchCredentialBindingRuntimeConfig {
+            vault_ref: vault_ref.to_owned(),
+            header_name: header_name.to_owned(),
+            origin: origin.to_owned(),
+        }
+    }
+
+    fn credential_binding_payload(vault_ref: &str, header_name: &str) -> serde_json::Value {
+        json!({
+            "credential_bindings": [
+                {
+                    "header_name": header_name,
+                    "secret_ref": {"kind": "vault", "vault_ref": vault_ref},
+                    "required": true
+                }
+            ]
+        })
+    }
 
     #[test]
     fn http_fetch_export_redacts_sensitive_body_text() {
@@ -1537,22 +1688,14 @@ mod tests {
     }
 
     #[test]
-    fn http_fetch_credential_bindings_require_configured_vault_ref_allowlist() {
-        let payload = json!({
-            "credential_bindings": [
-                {
-                    "header_name": "authorization",
-                    "secret_ref": {"kind": "vault", "vault_ref": "global/github_token"},
-                    "required": true
-                }
-            ]
-        });
+    fn http_fetch_credential_bindings_require_configured_recipient() {
+        let payload = credential_binding_payload("global/github_token", "authorization");
         let payload = payload.as_object().expect("payload should be an object");
 
         let error = parse_credential_bindings(payload, &[])
-            .expect_err("credential binding must fail closed without configured vault refs");
+            .expect_err("credential binding must fail closed without configured recipients");
 
-        assert!(error.contains("allowed_credential_vault_refs"));
+        assert!(error.contains("tool_call.http_fetch.credential_bindings"));
     }
 
     #[test]
@@ -1568,7 +1711,12 @@ mod tests {
         });
         let payload = payload.as_object().expect("payload should be an object");
 
-        let error = parse_credential_bindings(payload, &["global/github_token".to_owned()])
+        let configured = [configured_credential_binding(
+            "global/github_token",
+            "authorization",
+            "https://api.github.com",
+        )];
+        let error = parse_credential_bindings(payload, &configured)
             .expect_err("env-backed credential binding must be rejected");
 
         assert!(error.contains("must use a vault-backed secret_ref"));
@@ -1576,40 +1724,126 @@ mod tests {
 
     #[test]
     fn http_fetch_credential_bindings_reject_unlisted_vault_refs() {
-        let payload = json!({
-            "credential_bindings": [
-                {
-                    "header_name": "authorization",
-                    "secret_ref": {"kind": "vault", "vault_ref": "global/unlisted_token"},
-                    "required": true
-                }
-            ]
-        });
+        let payload = credential_binding_payload("global/unlisted_token", "authorization");
         let payload = payload.as_object().expect("payload should be an object");
 
-        let error = parse_credential_bindings(payload, &["global/github_token".to_owned()])
-            .expect_err("unlisted vault ref must be rejected");
+        let configured = [configured_credential_binding(
+            "global/github_token",
+            "authorization",
+            "https://api.github.com",
+        )];
+        let error = parse_credential_bindings(payload, &configured)
+            .expect_err("unconfigured vault-ref/header pair must be rejected");
 
-        assert!(error.contains("is not allowed"));
+        assert!(error.contains("are not configured together"));
     }
 
     #[test]
-    fn http_fetch_credential_bindings_accept_allowed_vault_refs() {
-        let payload = json!({
-            "credential_bindings": [
-                {
-                    "header_name": "authorization",
-                    "secret_ref": {"kind": "vault", "vault_ref": "global/github_token"},
-                    "required": true
-                }
-            ]
-        });
+    fn http_fetch_credential_bindings_accept_configured_vault_ref_and_header() {
+        let payload = credential_binding_payload("global/github_token", "authorization");
         let payload = payload.as_object().expect("payload should be an object");
 
-        let bindings = parse_credential_bindings(payload, &["global/github_token".to_owned()])
-            .expect("allowlisted vault ref should parse");
+        let configured = [configured_credential_binding(
+            "global/github_token",
+            "authorization",
+            "https://api.github.com",
+        )];
+        let bindings = parse_credential_bindings(payload, &configured)
+            .expect("configured vault-ref/header pair should parse");
 
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].header_name, "authorization");
+    }
+
+    #[test]
+    fn http_fetch_credential_recipient_requires_exact_https_origin_and_general_allowlist() {
+        let payload = credential_binding_payload("global/github_token", "authorization");
+        let payload = payload.as_object().expect("payload should be an object");
+        let configured = [configured_credential_binding(
+            "global/github_token",
+            "authorization",
+            "https://api.github.com",
+        )];
+        let bindings =
+            parse_credential_bindings(payload, &configured).expect("binding should parse");
+        let allowed_hosts = ["api.github.com".to_owned()];
+
+        authorize_credential_bindings_for_url(
+            &bindings,
+            &configured,
+            &Url::parse("https://api.github.com:443/repos").expect("URL should parse"),
+            &allowed_hosts,
+            &[],
+        )
+        .expect("canonical exact HTTPS origin should be authorized");
+
+        let plaintext_error = authorize_credential_bindings_for_url(
+            &bindings,
+            &configured,
+            &Url::parse("http://api.github.com/repos").expect("URL should parse"),
+            &allowed_hosts,
+            &[],
+        )
+        .expect_err("plaintext credential transport must fail closed");
+        assert!(plaintext_error.contains("plaintext HTTP"));
+
+        let origin_error = authorize_credential_bindings_for_url(
+            &bindings,
+            &configured,
+            &Url::parse("https://uploads.github.com/repos").expect("URL should parse"),
+            &allowed_hosts,
+            &[],
+        )
+        .expect_err("different HTTPS origin must require an independent recipient binding");
+        assert!(origin_error.contains("not authorized for exact origin"));
+
+        let allowlist_error = authorize_credential_bindings_for_url(
+            &bindings,
+            &configured,
+            &Url::parse("https://api.github.com/repos").expect("URL should parse"),
+            &[],
+            &[],
+        )
+        .expect_err("credential use must not treat empty general host lists as allow-all");
+        assert!(allowlist_error.contains("non-empty general egress host allowlist"));
+    }
+
+    #[test]
+    fn http_fetch_cross_origin_redirect_strips_caller_sensitive_headers() {
+        let current = Url::parse("https://api.example.test/resource").expect("URL should parse");
+        let redirect = Url::parse("https://cdn.example.test/resource").expect("URL should parse");
+        let mut headers = vec![
+            ("authorization".to_owned(), "Bearer secret".to_owned()),
+            ("x-api-key".to_owned(), "secret".to_owned()),
+            ("cookie".to_owned(), "session=secret".to_owned()),
+            ("accept".to_owned(), "application/json".to_owned()),
+        ];
+
+        strip_cross_origin_sensitive_headers(&current, &redirect, &mut headers);
+
+        assert_eq!(headers, vec![("accept".to_owned(), "application/json".to_owned())]);
+    }
+
+    #[test]
+    fn http_fetch_same_origin_redirect_preserves_request_headers() {
+        let current = Url::parse("https://api.example.test/resource").expect("URL should parse");
+        let redirect = Url::parse("https://api.example.test:443/other").expect("URL should parse");
+        let mut headers = vec![
+            ("authorization".to_owned(), "Bearer secret".to_owned()),
+            ("accept".to_owned(), "application/json".to_owned()),
+        ];
+        let expected = headers.clone();
+
+        strip_cross_origin_sensitive_headers(&current, &redirect, &mut headers);
+
+        assert_eq!(headers, expected);
+    }
+
+    #[test]
+    fn http_fetch_request_limits_can_only_tighten_operator_limits() {
+        assert_eq!(tighten_http_fetch_limit(Some(2), 3, 10), 2);
+        assert_eq!(tighten_http_fetch_limit(Some(9), 3, 10), 3);
+        assert_eq!(tighten_http_fetch_limit(None, 3, 10), 3);
+        assert_eq!(tighten_http_fetch_limit(Some(0), 3, 10), 1);
     }
 }

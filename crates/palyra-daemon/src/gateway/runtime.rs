@@ -1025,8 +1025,16 @@ pub struct LearningRuntimeConfig {
     pub procedure_review_min_confidence_bps: u16,
 }
 
+/// Exact recipient capability carried into the HTTP-fetch runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HttpFetchCredentialBindingRuntimeConfig {
+    pub vault_ref: String,
+    pub header_name: String,
+    pub origin: String,
+}
+
 /// Egress policy for the `http_fetch` tool: timeouts, size caps,
-/// redirect/header/content-type allowlists, credential vault-ref allowlist,
+/// redirect/header/content-type allowlists, recipient-bound credentials,
 /// and response caching.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HttpFetchRuntimeConfig {
@@ -1038,7 +1046,7 @@ pub struct HttpFetchRuntimeConfig {
     pub max_redirects: usize,
     pub allowed_content_types: Vec<String>,
     pub allowed_request_headers: Vec<String>,
-    pub allowed_credential_vault_refs: Vec<String>,
+    pub credential_bindings: Vec<HttpFetchCredentialBindingRuntimeConfig>,
     pub cache_enabled: bool,
     pub cache_ttl_ms: u64,
     pub max_cache_entries: usize,
@@ -24874,7 +24882,7 @@ pub(crate) mod tests {
                     "user-agent".to_owned(),
                     "x-client-version".to_owned(),
                 ],
-                allowed_credential_vault_refs: Vec::new(),
+                credential_bindings: Vec::new(),
                 cache_enabled: true,
                 cache_ttl_ms: 30_000,
                 max_cache_entries: 256,

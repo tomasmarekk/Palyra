@@ -1240,7 +1240,7 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
         "expected vault-backed OpenAI auth after configure"
     );
     assert!(
-        !written.contains("allowed_credential_vault_refs"),
+        !written.contains("credential_bindings"),
         "configure auth-model must not authorize provider credentials for HTTP fetch: {written}"
     );
     assert!(

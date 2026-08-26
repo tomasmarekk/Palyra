@@ -1556,7 +1556,7 @@ fn build_test_runtime_state_at_with_options(
                     "user-agent".to_owned(),
                     "x-client-version".to_owned(),
                 ],
-                allowed_credential_vault_refs: Vec::new(),
+                credential_bindings: Vec::new(),
                 cache_enabled: true,
                 cache_ttl_ms: 30_000,
                 max_cache_entries: 256,

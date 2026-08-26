@@ -734,8 +734,7 @@ fn generate_admin_token() -> String {
 
 const DEFAULT_ADMIN_BOUND_PRINCIPAL: &str = "admin:local";
 const LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS: i64 = 10 * 60_000;
-// Local init may enable HTTP fetch, but credential binding must stay an explicit operator opt-in.
-const LOCAL_DESKTOP_DEFAULT_HTTP_FETCH_CREDENTIAL_VAULT_REFS: &[&str] = &[];
+// Local init exposes HTTP fetch but never provisions credential recipients.
 const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.echo",
     "palyra.sleep",
@@ -973,13 +972,6 @@ fn apply_local_desktop_tool_defaults(
         "tool_call.execution_timeout_ms",
         toml::Value::Integer(LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS),
     )?;
-    if !LOCAL_DESKTOP_DEFAULT_HTTP_FETCH_CREDENTIAL_VAULT_REFS.is_empty() {
-        set_value_at_path(
-            document,
-            "tool_call.http_fetch.allowed_credential_vault_refs",
-            string_array_value(LOCAL_DESKTOP_DEFAULT_HTTP_FETCH_CREDENTIAL_VAULT_REFS),
-        )?;
-    }
     set_value_at_path(document, "tool_call.process_runner.enabled", toml::Value::Boolean(true))?;
     set_value_at_path(document, "tool_call.wasm_runtime.enabled", toml::Value::Boolean(true))?;
     set_value_at_path(
@@ -12302,7 +12294,7 @@ fn validate_daemon_compatible_document(document: &toml::Value) -> Result<()> {
     validate_model_provider_registry_domains(&parsed)?;
     validate_browser_service_secret_sources(&parsed)?;
     validate_admin_secret_sources(&parsed)?;
-    validate_http_fetch_credential_allowlist(&parsed)?;
+    validate_http_fetch_credential_bindings(&parsed)?;
     let bind_addr = parsed
         .daemon
         .as_ref()
@@ -12348,28 +12340,68 @@ fn validate_daemon_compatible_document(document: &toml::Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_http_fetch_credential_allowlist(parsed: &RootFileConfig) -> Result<()> {
-    let Some(refs) = parsed
+fn validate_http_fetch_credential_bindings(parsed: &RootFileConfig) -> Result<()> {
+    let Some(bindings) = parsed
         .tool_call
         .as_ref()
         .and_then(|tool_call| tool_call.http_fetch.as_ref())
-        .and_then(|http_fetch| http_fetch.allowed_credential_vault_refs.as_ref())
+        .and_then(|http_fetch| http_fetch.credential_bindings.as_ref())
     else {
         return Ok(());
     };
 
-    if refs.is_empty() {
+    if bindings.len() > 32 {
         anyhow::bail!(
-            "tool_call.http_fetch.allowed_credential_vault_refs must include at least one <scope>/<key> entry"
+            "tool_call.http_fetch.credential_bindings cannot contain more than 32 recipient bindings"
         );
     }
-    for candidate in refs {
-        let trimmed = candidate.trim();
-        VaultRef::parse(trimmed).map_err(|error| {
+    let mut recipients = HashSet::with_capacity(bindings.len());
+    for (index, binding) in bindings.iter().enumerate() {
+        let vault_ref = binding.vault_ref.trim();
+        VaultRef::parse(vault_ref).map_err(|error| {
             anyhow::anyhow!(
-                "tool_call.http_fetch.allowed_credential_vault_refs contains invalid vault ref '{trimmed}': {error}"
+                "tool_call.http_fetch.credential_bindings[{index}].vault_ref contains invalid vault ref '{vault_ref}': {error}"
             )
         })?;
+
+        let header_name = binding.header_name.trim().to_ascii_lowercase();
+        header_name.parse::<reqwest::header::HeaderName>().with_context(|| {
+            format!("tool_call.http_fetch.credential_bindings[{index}].header_name is invalid")
+        })?;
+        if !(header_name.starts_with("authorization")
+            || header_name.starts_with("x-")
+            || header_name.ends_with("-token")
+            || header_name.ends_with("-api-key")
+            || header_name == "cookie")
+        {
+            anyhow::bail!(
+                "tool_call.http_fetch.credential_bindings[{index}].header_name must be a credential-shaped header"
+            );
+        }
+
+        let origin_url = Url::parse(binding.origin.trim()).with_context(|| {
+            format!(
+                "tool_call.http_fetch.credential_bindings[{index}].origin must be an absolute HTTPS origin"
+            )
+        })?;
+        if origin_url.scheme() != "https"
+            || origin_url.host_str().is_none()
+            || !origin_url.username().is_empty()
+            || origin_url.password().is_some()
+            || origin_url.query().is_some()
+            || origin_url.fragment().is_some()
+            || origin_url.path() != "/"
+        {
+            anyhow::bail!(
+                "tool_call.http_fetch.credential_bindings[{index}].origin must contain only an exact HTTPS scheme, host, and optional port"
+            );
+        }
+        let origin = origin_url.origin().ascii_serialization();
+        if !recipients.insert(format!("{origin}\0{header_name}")) {
+            anyhow::bail!(
+                "tool_call.http_fetch.credential_bindings contains duplicate recipient header '{header_name}' for origin '{origin}'"
+            );
+        }
     }
     Ok(())
 }
@@ -15377,8 +15409,8 @@ mod init_command_tests {
             Some(super::LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS)
         );
         assert!(
-            !has_path(&document, "tool_call.http_fetch.allowed_credential_vault_refs"),
-            "local init must not write an explicit empty HTTP credential allowlist"
+            !has_path(&document, "tool_call.http_fetch.credential_bindings"),
+            "local init must not write implicit HTTP credential recipient bindings"
         );
         assert_eq!(
             read_bool(&document, "tool_call.process_runner.allow_interpreters"),
