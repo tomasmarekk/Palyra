@@ -1111,7 +1111,7 @@ impl ControlPlaneClient {
         &self,
         request: &ConfigReloadPlanRequest,
     ) -> Result<ConfigReloadPlanEnvelope, ControlPlaneClientError> {
-        self.request_json(Method::POST, "console/v1/config/reload/plan", Some(request), false).await
+        self.request_json(Method::POST, "console/v1/config/reload/plan", Some(request), true).await
     }
 
     /// Applies a config reload plan via `POST console/v1/config/reload/apply`.
@@ -2842,6 +2842,14 @@ fn build_query_path(path: &str, pairs: Vec<(&str, Option<String>)>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    use crate::{ContractDescriptor, CONTROL_PLANE_CONTRACT_VERSION};
+
     use super::*;
 
     #[test]
@@ -2866,5 +2874,78 @@ mod tests {
             error,
             ControlPlaneClientError::Decode(message) if message == RESPONSE_BODY_LIMIT_ERROR
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_reload_plan_sends_the_authenticated_session_csrf_token() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("loopback listener should bind for client test");
+        let address = listener.local_addr().expect("loopback listener address should resolve");
+        let server = thread::spawn(move || {
+            let (mut stream, _) =
+                listener.accept().expect("control-plane test request should connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("control-plane test request timeout should configure");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read =
+                    stream.read(&mut buffer).expect("control-plane test request should read");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let response = ConfigReloadPlanEnvelope {
+                contract: ContractDescriptor {
+                    contract_version: CONTROL_PLANE_CONTRACT_VERSION.to_owned(),
+                },
+                plan_id: "plan-test".to_owned(),
+                source_path: "palyra.toml".to_owned(),
+                generated_at_unix_ms: 1,
+                active_runs: 0,
+                requires_restart: false,
+                hot_safe_applicable: true,
+                summary: ConfigReloadPlanSummary {
+                    hot_safe: 0,
+                    restart_required: 0,
+                    blocked_while_runs_active: 0,
+                    manual_review: 0,
+                },
+                steps: Vec::new(),
+            };
+            let body =
+                serde_json::to_vec(&response).expect("reload-plan response should serialize");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("control-plane test response headers should write");
+            stream.write_all(&body).expect("control-plane test response body should write");
+            String::from_utf8(request).expect("control-plane test request should be UTF-8")
+        });
+
+        let mut client =
+            ControlPlaneClient::new(ControlPlaneClientConfig::new(format!("http://{address}/")))
+                .expect("control-plane client should initialize");
+        client.set_csrf_token(Some("csrf-plan-token".to_owned()));
+
+        client
+            .plan_config_reload(&ConfigReloadPlanRequest { path: None })
+            .await
+            .expect("reload planning should decode the test response");
+        let request = server.join().expect("control-plane test server should finish");
+        let request = request.to_ascii_lowercase();
+        assert!(request.starts_with("post /console/v1/config/reload/plan "));
+        assert!(
+            request.contains("\r\nx-palyra-csrf-token: csrf-plan-token\r\n"),
+            "reload planning must send the CSRF token issued for the authenticated session: {request}"
+        );
     }
 }
