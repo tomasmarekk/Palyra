@@ -6,6 +6,7 @@
 //! patching, replay bundles, and runtime contracts. Security-sensitive parsers here are
 //! fuzzed from `fuzz/fuzz_targets/` and pinned by golden fixtures.
 
+mod browser_auth;
 mod build;
 mod config;
 pub mod config_system;
@@ -40,6 +41,7 @@ mod webhook;
 pub mod windows_security;
 pub mod workspace_patch;
 
+pub use browser_auth::derive_browser_principal_token;
 pub use build::{build_metadata, BuildMetadata};
 pub use config::{
     default_config_search_paths, default_identity_store_root, default_identity_store_root_from_env,

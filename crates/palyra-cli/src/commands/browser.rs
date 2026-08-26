@@ -17,7 +17,7 @@ use std::{
 use std::os::windows::process::CommandExt;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use palyra_common::config_system::get_value_at_path;
+use palyra_common::{config_system::get_value_at_path, derive_browser_principal_token};
 use palyra_control_plane as control_plane;
 use reqwest::{Client as AsyncClient, Url};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -3339,16 +3339,22 @@ fn browser_request<T>(
     caller_principal: &str,
 ) -> Result<Request<T>> {
     let mut request = Request::new(payload);
-    apply_browser_service_auth(request.metadata_mut(), auth_token)?;
     apply_browser_service_caller_principal(request.metadata_mut(), caller_principal)?;
+    apply_browser_service_auth(request.metadata_mut(), auth_token, caller_principal)?;
     Ok(request)
 }
 
-fn apply_browser_service_auth(metadata: &mut MetadataMap, auth_token: Option<&str>) -> Result<()> {
-    if let Some(token) = auth_token.filter(|value| !value.trim().is_empty()) {
+fn apply_browser_service_auth(
+    metadata: &mut MetadataMap,
+    root_auth_token: Option<&str>,
+    caller_principal: &str,
+) -> Result<()> {
+    if let Some(root_secret) = root_auth_token.map(str::trim).filter(|value| !value.is_empty()) {
+        let credential =
+            derive_browser_principal_token(root_secret.as_bytes(), caller_principal.trim());
         metadata.insert(
             "authorization",
-            format!("Bearer {token}")
+            format!("Bearer {credential}")
                 .parse()
                 .context("invalid browser service authorization metadata")?,
         );
@@ -5450,7 +5456,7 @@ mod tests {
         browser_failure_detail, browser_gateway_handoff_confirmed,
         browser_gateway_handoff_pending_warning, browser_identifier_json_value,
         browser_lifecycle_cleanup_hint, browser_lifecycle_owner, browser_lifecycle_state,
-        browser_open_cleanup_status_text, browser_open_output_value,
+        browser_open_cleanup_status_text, browser_open_output_value, browser_request,
         browser_service_auth_token_command, browser_service_enable_command,
         browser_service_stop_complete, browser_service_stop_pending_reasons,
         browser_session_handle_text, browser_setup_gateway_reload_warning,
@@ -5470,10 +5476,32 @@ mod tests {
     use crate::{args::BrowserCommand, browser_v1, common_v1};
     #[cfg(windows)]
     use base64::Engine as _;
+    use palyra_common::derive_browser_principal_token;
     use palyra_control_plane as control_plane;
     use serde_json::{json, Value};
     use std::{process::Command, time::Duration};
     use tonic::{Code, Status};
+
+    #[test]
+    fn browser_request_derives_principal_bound_authorization() {
+        let request = browser_request((), Some("root-secret"), "user:alpha")
+            .expect("browser request should be valid");
+        let metadata = request.metadata();
+
+        assert_eq!(
+            metadata
+                .get(super::BROWSER_CALLER_PRINCIPAL_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("user:alpha")
+        );
+        let expected = derive_browser_principal_token(b"root-secret", "user:alpha");
+        let expected_header = format!("Bearer {expected}");
+        assert_eq!(
+            metadata.get("authorization").and_then(|value| value.to_str().ok()),
+            Some(expected_header.as_str())
+        );
+        assert_ne!(expected, derive_browser_principal_token(b"root-secret", "user:beta"));
+    }
 
     #[cfg(windows)]
     fn decode_powershell_encoded_cli_command(command: &str) -> String {

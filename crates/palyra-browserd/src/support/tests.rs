@@ -27,6 +27,7 @@ use crate::proto;
 use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
 use crate::security::auth::constant_time_eq_bytes;
 use base64::Engine as _;
+use palyra_common::derive_browser_principal_token;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -47,9 +48,11 @@ const PARITY_REDIRECT_TOKEN_URL: &str =
 const PARITY_TRICKY_DOM_HTML: &str = include_str!("../../../../fixtures/parity/tricky-dom.html");
 const CHROMIUM_ENGINE_SOURCE: &str = include_str!("../engine/chromium.rs");
 
-fn insert_bearer_auth<T>(request: &mut Request<T>, token: &str) {
+fn insert_principal_bearer_auth<T>(request: &mut Request<T>, root_token: &str, principal: &str) {
+    insert_principal(request, principal);
+    let credential = derive_browser_principal_token(root_token.as_bytes(), principal);
     let value =
-        format!("Bearer {token}").parse().expect("authorization header value should be valid");
+        format!("Bearer {credential}").parse().expect("authorization header value should be valid");
     request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
 }
 
@@ -914,6 +917,43 @@ fn build_state_store_uses_configured_state_dir_without_resolving_default() {
         .expect("state key should enable persistence");
 
     assert_eq!(store.root_dir, state_dir);
+}
+
+#[test]
+fn browser_runtime_rejects_persistent_state_without_authentication() {
+    let _env_guard = browserd_env_test_guard();
+    let temp = tempfile::tempdir().expect("tempdir should be available");
+    let encoded_key = base64::engine::general_purpose::STANDARD.encode([7_u8; STATE_KEY_LEN]);
+    let _state_key = EnvVarGuard::set(STATE_KEY_ENV, encoded_key);
+    let _state_dir = EnvVarGuard::set(STATE_DIR_ENV, temp.path().as_os_str());
+    let _auth_token = EnvVarGuard::remove("PALYRA_BROWSERD_AUTH_TOKEN");
+    let args = Args {
+        bind: "127.0.0.1".to_owned(),
+        port: 7143,
+        grpc_bind: "127.0.0.1".to_owned(),
+        grpc_port: 7543,
+        auth_token: None,
+        session_idle_ttl_ms: 60_000,
+        max_sessions: 16,
+        max_navigation_timeout_ms: 10_000,
+        max_session_lifetime_ms: 60_000,
+        max_screenshot_bytes: 128 * 1024,
+        max_response_bytes: 128 * 1024,
+        max_title_bytes: 4 * 1024,
+        engine_mode: BrowserEngineMode::Simulated,
+        chromium_path: None,
+        chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+    };
+
+    let error = match BrowserRuntimeState::new(&args) {
+        Ok(_) => panic!("persistent state without authentication must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.to_string().contains("persistent browser state requires"),
+        "startup error should identify the authentication requirement: {error}"
+    );
 }
 
 #[cfg(windows)]
@@ -6932,7 +6972,7 @@ async fn browser_service_relay_rejects_unsupported_action_kind_with_auth_token()
         private_profile: false,
         channel: String::new(),
     });
-    insert_bearer_auth(&mut create_request, AUTH_TOKEN);
+    insert_principal_bearer_auth(&mut create_request, AUTH_TOKEN, "user:ops");
     let created = service
         .create_session(create_request)
         .await
@@ -6952,7 +6992,7 @@ async fn browser_service_relay_rejects_unsupported_action_kind_with_auth_token()
         payload: None,
         max_payload_bytes: 4_096,
     });
-    insert_bearer_auth(&mut relay_request, AUTH_TOKEN);
+    insert_principal_bearer_auth(&mut relay_request, AUTH_TOKEN, "user:ops");
     let relay = service
         .relay_action(relay_request)
         .await
@@ -7004,7 +7044,7 @@ async fn browser_service_relay_rejects_oversized_payload_budget_with_auth_token(
         private_profile: false,
         channel: String::new(),
     });
-    insert_bearer_auth(&mut create_request, AUTH_TOKEN);
+    insert_principal_bearer_auth(&mut create_request, AUTH_TOKEN, "user:ops");
     let created = service
         .create_session(create_request)
         .await
@@ -7029,7 +7069,7 @@ async fn browser_service_relay_rejects_oversized_payload_budget_with_auth_token(
         )),
         max_payload_bytes: MAX_RELAY_PAYLOAD_BYTES + 1,
     });
-    insert_bearer_auth(&mut relay_request, AUTH_TOKEN);
+    insert_principal_bearer_auth(&mut relay_request, AUTH_TOKEN, "user:ops");
     let status = service
         .relay_action(relay_request)
         .await
@@ -7080,7 +7120,7 @@ async fn browser_service_relay_requires_valid_bearer_token_when_auth_enabled() {
         private_profile: false,
         channel: String::new(),
     });
-    insert_bearer_auth(&mut create_request, AUTH_TOKEN);
+    insert_principal_bearer_auth(&mut create_request, AUTH_TOKEN, "user:ops");
     let created = service
         .create_session(create_request)
         .await
@@ -7125,12 +7165,111 @@ async fn browser_service_relay_requires_valid_bearer_token_when_auth_enabled() {
         )),
         max_payload_bytes: 4_096,
     });
-    insert_bearer_auth(&mut wrong_token_request, "wrong-token");
+    insert_principal_bearer_auth(&mut wrong_token_request, "wrong-token", "user:ops");
     let wrong_token_status = service
         .relay_action(wrong_token_request)
         .await
         .expect_err("relay_action with wrong bearer token must be rejected");
     assert_eq!(wrong_token_status.code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_service_principal_token_rejects_cross_principal_replay() {
+    const ROOT_TOKEN: &str = "test-root-token";
+    let runtime = std::sync::Arc::new(
+        browser_runtime_state_for_tests(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: Some(ROOT_TOKEN.to_owned()),
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 128 * 1024,
+            max_response_bytes: 128 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Simulated,
+            chromium_path: None,
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("runtime should initialize"),
+    );
+    let service = BrowserServiceImpl { runtime };
+
+    let mut create_request = Request::new(browser_v1::CreateSessionRequest {
+        v: 1,
+        principal: "user:alpha".to_owned(),
+        idle_ttl_ms: 10_000,
+        budget: None,
+        allow_private_targets: true,
+        allow_downloads: false,
+        action_allowed_domains: Vec::new(),
+        persistence_enabled: false,
+        persistence_id: String::new(),
+        profile_id: None,
+        private_profile: false,
+        channel: String::new(),
+    });
+    insert_principal_bearer_auth(&mut create_request, ROOT_TOKEN, "user:alpha");
+    let created = service
+        .create_session(create_request)
+        .await
+        .expect("principal alpha should create its own session")
+        .into_inner();
+    let session_id = created.session_id.expect("session id should be present");
+
+    let mut replay_request = Request::new(browser_v1::InspectSessionRequest {
+        v: 1,
+        session_id: Some(session_id.clone()),
+        include_cookies: true,
+        include_storage: true,
+        include_action_log: false,
+        include_network_log: false,
+        max_cookie_bytes: 0,
+        max_storage_bytes: 0,
+        max_action_log_entries: 0,
+        max_network_log_entries: 0,
+        max_network_log_bytes: 0,
+        include_page_snapshot: false,
+        max_dom_snapshot_bytes: 0,
+        max_visible_text_bytes: 0,
+        include_console_log: false,
+        max_console_log_entries: 0,
+        max_console_log_bytes: 0,
+        include_page_diagnostics: false,
+    });
+    insert_principal(&mut replay_request, "user:beta");
+    let alpha_credential = derive_browser_principal_token(ROOT_TOKEN.as_bytes(), "user:alpha");
+    let replay_bearer =
+        format!("Bearer {alpha_credential}").parse().expect("authorization header should parse");
+    replay_request.metadata_mut().insert(AUTHORIZATION_HEADER, replay_bearer);
+    let replay_status = service
+        .inspect_session(replay_request)
+        .await
+        .expect_err("alpha credential must not authenticate a beta principal");
+    assert_eq!(replay_status.code(), tonic::Code::Unauthenticated);
+
+    let mut missing_principal_request =
+        Request::new(browser_v1::GetSessionRequest { v: 1, session_id: Some(session_id) });
+    let root_bearer =
+        format!("Bearer {ROOT_TOKEN}").parse().expect("root authorization header should parse");
+    missing_principal_request.metadata_mut().insert(AUTHORIZATION_HEADER, root_bearer);
+    let missing_principal_status = service
+        .get_session(missing_principal_request)
+        .await
+        .expect_err("root service credential cannot read a session without a principal");
+    assert_eq!(missing_principal_status.code(), tonic::Code::Unauthenticated);
+
+    let mut mismatched_profile_request =
+        Request::new(browser_v1::ListProfilesRequest { v: 1, principal: "user:beta".to_owned() });
+    insert_principal_bearer_auth(&mut mismatched_profile_request, ROOT_TOKEN, "user:alpha");
+    let mismatch_status = service
+        .list_profiles(mismatched_profile_request)
+        .await
+        .expect_err("authenticated principal must match the profile body principal");
+    assert_eq!(mismatch_status.code(), tonic::Code::PermissionDenied);
 }
 
 #[test]
@@ -7182,7 +7321,7 @@ async fn browser_service_relay_open_tab_blocks_private_targets_even_with_auth_to
         private_profile: false,
         channel: String::new(),
     });
-    insert_bearer_auth(&mut create_request, AUTH_TOKEN);
+    insert_principal_bearer_auth(&mut create_request, AUTH_TOKEN, "user:ops");
     let created = service
         .create_session(create_request)
         .await
@@ -7204,7 +7343,7 @@ async fn browser_service_relay_open_tab_blocks_private_targets_even_with_auth_to
         )),
         max_payload_bytes: 4_096,
     });
-    insert_bearer_auth(&mut relay_request, AUTH_TOKEN);
+    insert_principal_bearer_auth(&mut relay_request, AUTH_TOKEN, "user:ops");
     let relay = service
         .relay_action(relay_request)
         .await
@@ -7263,7 +7402,7 @@ async fn browser_service_relay_send_snapshot_succeeds_with_auth_token() {
         private_profile: false,
         channel: String::new(),
     });
-    insert_bearer_auth(&mut create_request, AUTH_TOKEN);
+    insert_principal_bearer_auth(&mut create_request, AUTH_TOKEN, "user:ops");
     let created = service
         .create_session(create_request)
         .await
@@ -7284,7 +7423,7 @@ async fn browser_service_relay_send_snapshot_succeeds_with_auth_token() {
         max_redirects: 3,
         allow_private_targets: true,
     });
-    insert_bearer_auth(&mut navigate_request, AUTH_TOKEN);
+    insert_principal_bearer_auth(&mut navigate_request, AUTH_TOKEN, "user:ops");
     let navigate =
         service.navigate(navigate_request).await.expect("navigate should execute").into_inner();
     assert!(navigate.success, "navigate should succeed before snapshot relay");
@@ -7304,7 +7443,7 @@ async fn browser_service_relay_send_snapshot_succeeds_with_auth_token() {
         )),
         max_payload_bytes: 4_096,
     });
-    insert_bearer_auth(&mut relay_request, AUTH_TOKEN);
+    insert_principal_bearer_auth(&mut relay_request, AUTH_TOKEN, "user:ops");
     let relay = service
         .relay_action(relay_request)
         .await

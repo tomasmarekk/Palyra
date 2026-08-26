@@ -13,6 +13,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use palyra_common::derive_browser_principal_token;
 use palyra_control_plane as control_plane;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1130,9 +1131,12 @@ async fn browser_runtime_auth_probe(endpoint: String, auth_token: String) -> Res
     });
     request.metadata_mut().insert(
         "authorization",
-        format!("Bearer {auth_token}")
-            .parse()
-            .context("invalid browser service authorization metadata")?,
+        format!(
+            "Bearer {}",
+            derive_browser_principal_token(auth_token.as_bytes(), BROWSER_AUTH_PROBE_PRINCIPAL,)
+        )
+        .parse()
+        .context("invalid browser service authorization metadata")?,
     );
     request.metadata_mut().insert(
         "x-palyra-principal",

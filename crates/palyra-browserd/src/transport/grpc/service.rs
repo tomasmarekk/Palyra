@@ -432,11 +432,14 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::CreateSessionRequest>,
     ) -> Result<Response<browser_v1::CreateSessionResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let authenticated_principal =
+            authenticated_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let principal = payload.principal.trim();
         if principal.is_empty() {
             return Err(Status::invalid_argument("principal is required"));
         }
+        enforce_authenticated_body_principal(authenticated_principal.as_deref(), principal)?;
         let channel = normalize_optional_string(payload.channel.as_str());
         let requested_profile_id = parse_optional_profile_id_from_proto(payload.profile_id.take())
             .map_err(Status::invalid_argument)?;
@@ -705,7 +708,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::CloseSessionRequest>,
     ) -> Result<Response<browser_v1::CloseSessionResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
-        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
+        let caller_principal =
+            optional_cleanup_request_principal(request.metadata())?.map(str::to_owned);
         let session_id = parse_session_id_from_proto(request.into_inner().session_id)
             .map_err(Status::invalid_argument)?;
         enforce_session_owner_if_present(
@@ -1127,9 +1131,15 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::ListProfilesRequest>,
     ) -> Result<Response<browser_v1::ListProfilesResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let authenticated_principal =
+            authenticated_request_principal(request.metadata())?.map(str::to_owned);
         let payload = request.into_inner();
         let principal = normalize_profile_principal(payload.principal.as_str())
             .map_err(Status::invalid_argument)?;
+        enforce_authenticated_body_principal(
+            authenticated_principal.as_deref(),
+            principal.as_str(),
+        )?;
         let Some(store) = self.runtime.state_store.as_ref() else {
             return Err(Status::failed_precondition(
                 "browser profiles require PALYRA_BROWSERD_STATE_ENCRYPTION_KEY",
@@ -1171,9 +1181,15 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::CreateProfileRequest>,
     ) -> Result<Response<browser_v1::CreateProfileResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let authenticated_principal =
+            authenticated_request_principal(request.metadata())?.map(str::to_owned);
         let payload = request.into_inner();
         let principal = normalize_profile_principal(payload.principal.as_str())
             .map_err(Status::invalid_argument)?;
+        enforce_authenticated_body_principal(
+            authenticated_principal.as_deref(),
+            principal.as_str(),
+        )?;
         let name =
             normalize_profile_name(payload.name.as_str()).map_err(Status::invalid_argument)?;
         let theme = normalize_profile_theme(payload.theme_color.as_str())
@@ -1230,9 +1246,15 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::RenameProfileRequest>,
     ) -> Result<Response<browser_v1::RenameProfileResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let authenticated_principal =
+            authenticated_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let principal = normalize_profile_principal(payload.principal.as_str())
             .map_err(Status::invalid_argument)?;
+        enforce_authenticated_body_principal(
+            authenticated_principal.as_deref(),
+            principal.as_str(),
+        )?;
         let profile_id = parse_required_profile_id_from_proto(payload.profile_id.take())
             .map_err(Status::invalid_argument)?;
         let name =
@@ -1277,9 +1299,15 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::DeleteProfileRequest>,
     ) -> Result<Response<browser_v1::DeleteProfileResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let authenticated_principal =
+            authenticated_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let principal = normalize_profile_principal(payload.principal.as_str())
             .map_err(Status::invalid_argument)?;
+        enforce_authenticated_body_principal(
+            authenticated_principal.as_deref(),
+            principal.as_str(),
+        )?;
         let profile_id = parse_required_profile_id_from_proto(payload.profile_id.take())
             .map_err(Status::invalid_argument)?;
         let Some(store) = self.runtime.state_store.as_ref() else {
@@ -1339,9 +1367,15 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::SetActiveProfileRequest>,
     ) -> Result<Response<browser_v1::SetActiveProfileResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let authenticated_principal =
+            authenticated_request_principal(request.metadata())?.map(str::to_owned);
         let mut payload = request.into_inner();
         let principal = normalize_profile_principal(payload.principal.as_str())
             .map_err(Status::invalid_argument)?;
+        enforce_authenticated_body_principal(
+            authenticated_principal.as_deref(),
+            principal.as_str(),
+        )?;
         let profile_id = parse_required_profile_id_from_proto(payload.profile_id.take())
             .map_err(Status::invalid_argument)?;
         let Some(store) = self.runtime.state_store.as_ref() else {
@@ -4343,9 +4377,17 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
     ) -> Result<Response<browser_v1::RelayActionResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
         let auth_header = request.metadata().get(AUTHORIZATION_HEADER).cloned();
+        let caller_principal = optional_request_principal(request.metadata())?.map(str::to_owned);
+        let principal_header = request.metadata().get(PRINCIPAL_HEADER).cloned();
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
+        enforce_session_owner_if_present(
+            self.runtime.as_ref(),
+            session_id.as_str(),
+            caller_principal.as_deref(),
+        )
+        .await?;
         let extension_id = payload.extension_id.trim();
         if extension_id.is_empty() {
             return Err(Status::invalid_argument("extension_id is required"));
@@ -4398,6 +4440,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 // caller's authorization metadata must be forwarded verbatim.
                 if let Some(value) = auth_header.clone() {
                     open_request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
+                }
+                if let Some(value) = principal_header.clone() {
+                    open_request.metadata_mut().insert(PRINCIPAL_HEADER, value);
                 }
                 // Marker consumed by open_tab: relay-initiated tabs may never
                 // reach private targets, whatever the session allows.
@@ -4515,6 +4560,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 // caller's authorization metadata must be forwarded verbatim.
                 if let Some(value) = auth_header {
                     observe_request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
+                }
+                if let Some(value) = principal_header {
+                    observe_request.metadata_mut().insert(PRINCIPAL_HEADER, value);
                 }
                 let observe = self.observe(observe_request).await?;
                 let observe = observe.into_inner();
@@ -4678,13 +4726,50 @@ fn request_principal(metadata: &tonic::metadata::MetadataMap) -> Result<&str, St
     Ok(principal)
 }
 
+fn authenticated_request_principal(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<Option<&str>, Status> {
+    if metadata.get(AUTHORIZATION_HEADER).is_none() {
+        return Ok(None);
+    }
+    request_principal(metadata).map(Some)
+}
+
+fn enforce_authenticated_body_principal(
+    caller_principal: Option<&str>,
+    body_principal: &str,
+) -> Result<(), Status> {
+    let Some(caller_principal) = caller_principal else {
+        return Ok(());
+    };
+    if caller_principal != body_principal {
+        return Err(Status::permission_denied("principal mismatch"));
+    }
+    Ok(())
+}
+
 /// Reads an optional caller binding for session operations.
 ///
-/// Daemon and console clients always attach this header. Its absence is kept
-/// only for service-authenticated internal cleanup and legacy administrative
-/// callers; when present, ownership is mandatory and foreign IDs are hidden
-/// behind the same not-found response as unknown sessions.
+/// Authenticated requests must carry a principal-bound credential and cannot
+/// use the legacy missing-principal path. Unauthenticated loopback operation
+/// remains available only when browserd has no root auth token and no
+/// persistent state.
 fn optional_request_principal(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<Option<&str>, Status> {
+    if metadata.get(PRINCIPAL_HEADER).is_none() {
+        if metadata.get(AUTHORIZATION_HEADER).is_some() {
+            return Err(Status::unauthenticated("missing caller principal"));
+        }
+        return Ok(None);
+    }
+    request_principal(metadata).map(Some)
+}
+
+/// Allows the root service credential to perform terminal cleanup without an
+/// end-user principal. CloseSession is the only principal-owned RPC with this
+/// administrative path; it can release a session but cannot observe its state.
+fn optional_cleanup_request_principal(
     metadata: &tonic::metadata::MetadataMap,
 ) -> Result<Option<&str>, Status> {
     if metadata.get(PRINCIPAL_HEADER).is_none() {

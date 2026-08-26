@@ -496,7 +496,24 @@ impl BrowserRuntimeState {
                 "session_idle_ttl_ms, max_sessions, and chromium_startup_timeout_ms must be greater than zero"
             );
         }
+        let auth_token = args
+            .auth_token
+            .clone()
+            .or_else(|| std::env::var("PALYRA_BROWSERD_AUTH_TOKEN").ok())
+            .and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            });
         let state_store = build_state_store_from_env()?;
+        if state_store.is_some() && auth_token.is_none() {
+            anyhow::bail!(
+                "persistent browser state requires PALYRA_BROWSERD_AUTH_TOKEN or --auth-token"
+            );
+        }
         let resilience_profile = BrowserResilienceProfile::from_env()?;
         let engine_mode = BrowserEngineMode::from_env_or_default(args.engine_mode);
         let chromium_path = args
@@ -510,18 +527,7 @@ impl BrowserRuntimeState {
             .unwrap_or(args.chromium_startup_timeout_ms);
         Ok(Self {
             started_at: Instant::now(),
-            auth_token: args
-                .auth_token
-                .clone()
-                .or_else(|| std::env::var("PALYRA_BROWSERD_AUTH_TOKEN").ok())
-                .and_then(|value| {
-                    let trimmed = value.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_owned())
-                    }
-                }),
+            auth_token,
             engine_mode,
             chromium: ChromiumEngineConfig {
                 executable_path: chromium_path,

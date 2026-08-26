@@ -11,6 +11,7 @@
 //! constant time.
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use palyra_common::derive_browser_principal_token;
 
 use crate::*;
 
@@ -47,7 +48,7 @@ pub(crate) async fn console_browser_profiles_list_handler(
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
         principal: principal.clone(),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(&state, principal.as_str(), request.metadata_mut())?;
     let response =
         client.list_profiles(request).await.map_err(runtime_status_response)?.into_inner();
     let profiles =
@@ -93,7 +94,7 @@ pub(crate) async fn console_browser_profile_create_handler(
         persistence_enabled: payload.persistence_enabled.unwrap_or(false),
         private_profile: payload.private_profile.unwrap_or(false),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(&state, principal.as_str(), request.metadata_mut())?;
     let response =
         client.create_profile(request).await.map_err(runtime_status_response)?.into_inner();
     let profile = response.profile.ok_or_else(|| {
@@ -153,7 +154,7 @@ pub(crate) async fn console_browser_profile_rename_handler(
         profile_id: Some(common_v1::CanonicalId { ulid: profile_id.clone() }),
         name: name.to_owned(),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(&state, principal.as_str(), request.metadata_mut())?;
     let response =
         client.rename_profile(request).await.map_err(runtime_status_response)?.into_inner();
     let profile = response.profile.ok_or_else(|| {
@@ -203,7 +204,7 @@ pub(crate) async fn console_browser_profile_delete_handler(
         principal: principal.clone(),
         profile_id: Some(common_v1::CanonicalId { ulid: profile_id.clone() }),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(&state, principal.as_str(), request.metadata_mut())?;
     let response =
         client.delete_profile(request).await.map_err(runtime_status_response)?.into_inner();
     let envelope = control_plane::BrowserProfileDeleteEnvelope {
@@ -255,7 +256,7 @@ pub(crate) async fn console_browser_profile_activate_handler(
         principal: principal.clone(),
         profile_id: Some(common_v1::CanonicalId { ulid: profile_id.clone() }),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(&state, principal.as_str(), request.metadata_mut())?;
     let response =
         client.set_active_profile(request).await.map_err(runtime_status_response)?.into_inner();
     let profile = response.profile.ok_or_else(|| {
@@ -2069,7 +2070,7 @@ pub(crate) async fn console_browser_relay_action_handler(
             .unwrap_or(CONSOLE_MAX_RELAY_ACTION_PAYLOAD_BYTES)
             .clamp(1, CONSOLE_MAX_RELAY_ACTION_PAYLOAD_BYTES),
     });
-    apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_service_session_auth(&state, record.principal.as_str(), request.metadata_mut())?;
     let response =
         client.relay_action(request).await.map_err(runtime_status_response)?.into_inner();
 
@@ -2949,8 +2950,33 @@ fn apply_browser_service_session_auth(
     principal: &str,
     metadata: &mut tonic::metadata::MetadataMap,
 ) -> Result<(), Response> {
-    apply_browser_service_auth(state, metadata)?;
-    apply_browser_caller_principal_metadata(principal, metadata)
+    let browser_service_config = state.runtime.browser_service_config_snapshot();
+    apply_browser_principal_auth_metadata(
+        browser_service_config.auth_token.as_deref(),
+        principal,
+        metadata,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_browser_principal_auth_metadata(
+    root_auth_token: Option<&str>,
+    principal: &str,
+    metadata: &mut tonic::metadata::MetadataMap,
+) -> Result<(), Response> {
+    apply_browser_caller_principal_metadata(principal, metadata)?;
+    if let Some(root_secret) = root_auth_token.map(str::trim).filter(|value| !value.is_empty()) {
+        let principal = principal.trim();
+        let credential = derive_browser_principal_token(root_secret.as_bytes(), principal);
+        let bearer =
+            MetadataValue::try_from(format!("Bearer {credential}").as_str()).map_err(|_| {
+                runtime_status_response(tonic::Status::internal(
+                    "failed to encode browser principal authorization metadata",
+                ))
+            })?;
+        metadata.insert("authorization", bearer);
+    }
+    Ok(())
 }
 
 /// Forwards the console caller's principal to browserd via
@@ -3013,6 +3039,31 @@ mod tests {
         apply_browser_caller_principal_metadata(" user:local ", &mut metadata)
             .expect("principal metadata should attach");
 
+        assert_eq!(
+            metadata.get(BROWSER_CALLER_PRINCIPAL_HEADER).and_then(|value| value.to_str().ok()),
+            Some("user:local")
+        );
+    }
+
+    #[test]
+    fn browser_session_auth_derives_principal_bound_bearer() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+
+        apply_browser_principal_auth_metadata(
+            Some("root-browser-secret"),
+            " user:local ",
+            &mut metadata,
+        )
+        .expect("principal-bound auth metadata should attach");
+
+        let expected = format!(
+            "Bearer {}",
+            derive_browser_principal_token(b"root-browser-secret", "user:local")
+        );
+        assert_eq!(
+            metadata.get("authorization").and_then(|value| value.to_str().ok()),
+            Some(expected.as_str())
+        );
         assert_eq!(
             metadata.get(BROWSER_CALLER_PRINCIPAL_HEADER).and_then(|value| value.to_str().ok()),
             Some("user:local")

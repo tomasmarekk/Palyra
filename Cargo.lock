@@ -3181,6 +3181,7 @@ dependencies = [
  "anyhow",
  "hex",
  "proptest",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.11.0",

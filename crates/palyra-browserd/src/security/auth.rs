@@ -1,16 +1,22 @@
-//! Shared-token authorization for the browserd gRPC surface.
+//! Service and principal-bound authorization for the browserd gRPC surface.
 //!
-//! Verifies the request authorization metadata against the daemon's optional
-//! auth token using a constant-time comparison. When no token is configured,
-//! bootstrap restricts the listeners to loopback instead.
+//! Health checks use the root service credential. Principal-owned RPCs derive
+//! a separate bearer from that root and the caller principal, preventing a
+//! credential captured for one principal from being replayed as another.
 
 use crate::*;
+use palyra_common::derive_browser_principal_token;
 
 impl BrowserRuntimeState {
-    /// Authorizes a gRPC request against the daemon's optional shared auth token.
+    /// Authorizes a gRPC request against the daemon's optional root secret.
     ///
     /// When no token is configured every request is accepted; that mode is only
-    /// reachable on loopback binds (enforced at startup).
+    /// reachable on loopback binds without persistent state.
+    ///
+    /// Requests carrying `x-palyra-principal` must use the principal-bound
+    /// derived bearer. Requests without a principal may use the root credential
+    /// only for service-level methods such as health; principal-owned handlers
+    /// independently require the principal metadata.
     ///
     /// # Errors
     /// Returns `Status::unauthenticated` when a token is configured and the
@@ -26,7 +32,20 @@ impl BrowserRuntimeState {
             .get(AUTHORIZATION_HEADER)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        let expected = format!("Bearer {expected_token}");
+        let expected_credential = match metadata.get(PRINCIPAL_HEADER) {
+            Some(value) => {
+                let principal = value
+                    .to_str()
+                    .map_err(|_| Status::unauthenticated("invalid caller principal"))?
+                    .trim();
+                if principal.is_empty() {
+                    return Err(Status::unauthenticated("missing caller principal"));
+                }
+                derive_browser_principal_token(expected_token.as_bytes(), principal)
+            }
+            None => expected_token.clone(),
+        };
+        let expected = format!("Bearer {expected_credential}");
         if !constant_time_eq_bytes(supplied.trim().as_bytes(), expected.as_bytes()) {
             return Err(Status::unauthenticated("missing or invalid browser service token"));
         }

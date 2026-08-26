@@ -23,6 +23,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use palyra_common::{
+    derive_browser_principal_token,
     redaction::{redact_header, redact_url},
     validate_canonical_id, CANONICAL_PROTOCOL_MAJOR,
 };
@@ -1512,7 +1513,10 @@ pub(crate) async fn execute_browser_tool(
             "browserd automatic reconnect requires feature_rollouts.browser_resilience".to_owned(),
         );
     }
-    let caller_principal_interceptor = match browser_caller_principal_interceptor(principal) {
+    let caller_principal_interceptor = match browser_caller_principal_interceptor(
+        principal,
+        browser_service_config.auth_token.as_deref(),
+    ) {
         Ok(interceptor) => interceptor,
         Err(error) => {
             return browser_tool_execution_outcome(
@@ -5098,10 +5102,27 @@ fn browser_caller_principal_metadata_value(
 
 fn browser_caller_principal_interceptor(
     caller_principal: &str,
+    root_auth_token: Option<&str>,
 ) -> Result<impl tonic::service::Interceptor + Clone, String> {
     let metadata_value = browser_caller_principal_metadata_value(caller_principal)?;
+    let caller_principal = metadata_value
+        .to_str()
+        .map_err(|error| format!("invalid browser caller principal metadata: {error}"))?;
+    let authorization_value = root_auth_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|root_secret| {
+            let credential =
+                derive_browser_principal_token(root_secret.as_bytes(), caller_principal);
+            tonic::metadata::MetadataValue::try_from(format!("Bearer {credential}"))
+                .map_err(|error| format!("invalid browser service auth token metadata: {error}"))
+        })
+        .transpose()?;
     Ok(move |mut request: Request<()>| {
         request.metadata_mut().insert(BROWSER_CALLER_PRINCIPAL_HEADER, metadata_value.clone());
+        if let Some(value) = authorization_value.as_ref() {
+            request.metadata_mut().insert("authorization", value.clone());
+        }
         Ok(request)
     })
 }
@@ -6015,7 +6036,7 @@ mod tests {
         IMAGE_OBSERVE_TOOL_NAME,
     };
     use crate::transport::grpc::proto::palyra::browser::v1 as browser_v1;
-    use palyra_common::CANONICAL_PROTOCOL_MAJOR;
+    use palyra_common::{derive_browser_principal_token, CANONICAL_PROTOCOL_MAJOR};
     use serde_json::json;
     use tonic::Request;
 
@@ -7216,8 +7237,9 @@ mod tests {
 
     #[test]
     fn browser_client_interceptor_includes_caller_principal_on_every_request() {
-        let mut interceptor = browser_caller_principal_interceptor(" user:local ")
-            .expect("principal interceptor should construct");
+        let mut interceptor =
+            browser_caller_principal_interceptor(" user:local ", Some("root-browser-secret"))
+                .expect("principal interceptor should construct");
 
         for _ in 0..2 {
             let request = tonic::service::Interceptor::call(&mut interceptor, Request::new(()))
@@ -7228,6 +7250,14 @@ mod tests {
                     .get(BROWSER_CALLER_PRINCIPAL_HEADER)
                     .and_then(|value| value.to_str().ok()),
                 Some("user:local")
+            );
+            let expected = format!(
+                "Bearer {}",
+                derive_browser_principal_token(b"root-browser-secret", "user:local")
+            );
+            assert_eq!(
+                request.metadata().get("authorization").and_then(|value| value.to_str().ok()),
+                Some(expected.as_str())
             );
         }
     }
