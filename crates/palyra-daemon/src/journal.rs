@@ -16079,13 +16079,14 @@ impl JournalStore {
             .ok_or_else(|| JournalError::ToolJobNotFound { job_id: request.job_id.clone() })
     }
 
-    /// Expires terminal jobs past their retention deadline (legal holds exempt);
-    /// returns the affected records.
+    /// Expires one principal's terminal jobs past their retention deadline
+    /// (legal holds exempt); returns the affected records.
     ///
     /// # Errors
     /// Returns [`JournalError`] if the storage write fails.
     pub fn sweep_expired_tool_jobs(
         &self,
+        owner_principal: &str,
         now_unix_ms: i64,
         limit: usize,
     ) -> Result<Vec<ToolJobRecord>, JournalError> {
@@ -16095,17 +16096,20 @@ impl JournalStore {
             format!(
                 "SELECT {TOOL_JOB_SELECT_COLUMNS} FROM tool_jobs \
                  WHERE expires_at_unix_ms IS NOT NULL \
-                   AND expires_at_unix_ms <= ?1 \
+                   AND owner_principal = ?1 \
+                   AND expires_at_unix_ms <= ?2 \
                    AND legal_hold = 0 \
                    AND active_ref_count = 0 \
                    AND state != 'expired' \
                  ORDER BY expires_at_unix_ms ASC, job_ulid ASC \
-                 LIMIT ?2"
+                 LIMIT ?3"
             )
             .as_str(),
         )?;
-        let rows =
-            statement.query_map(params![now_unix_ms, limit as i64], hydrate_tool_job_record)?;
+        let rows = statement.query_map(
+            params![owner_principal, now_unix_ms, limit as i64],
+            hydrate_tool_job_record,
+        )?;
         let mut records = Vec::new();
         for row in rows {
             records.push(row?);
@@ -16117,11 +16121,12 @@ impl JournalStore {
                     UPDATE tool_jobs
                     SET state = 'expired',
                         state_reason = 'ttl_sweeper',
-                        updated_at_unix_ms = ?2,
-                        completed_at_unix_ms = COALESCE(completed_at_unix_ms, ?2)
+                        updated_at_unix_ms = ?3,
+                        completed_at_unix_ms = COALESCE(completed_at_unix_ms, ?3)
                     WHERE job_ulid = ?1
+                      AND owner_principal = ?2
                 "#,
-                params![record.job_id, now_unix_ms],
+                params![record.job_id, owner_principal, now_unix_ms],
             )?;
         }
         let mut expired = Vec::new();
@@ -16133,13 +16138,14 @@ impl JournalStore {
         Ok(expired)
     }
 
-    /// Marks active jobs without a recent heartbeat as orphaned; returns the
-    /// affected records.
+    /// Marks one principal's active jobs without a recent heartbeat as
+    /// orphaned; returns the affected records.
     ///
     /// # Errors
     /// Returns [`JournalError`] if the storage write fails.
     pub fn recover_stale_tool_jobs(
         &self,
+        owner_principal: &str,
         now_unix_ms: i64,
         stale_after_ms: i64,
         limit: usize,
@@ -16151,15 +16157,18 @@ impl JournalStore {
             format!(
                 "SELECT {TOOL_JOB_SELECT_COLUMNS} FROM tool_jobs \
                  WHERE state IN ('starting', 'running', 'draining', 'cancelling') \
-                   AND (COALESCE(heartbeat_at_unix_ms, updated_at_unix_ms) <= ?1 \
-                        OR (lease_expires_at_unix_ms IS NOT NULL AND lease_expires_at_unix_ms <= ?2)) \
+                   AND owner_principal = ?1 \
+                   AND (COALESCE(heartbeat_at_unix_ms, updated_at_unix_ms) <= ?2 \
+                        OR (lease_expires_at_unix_ms IS NOT NULL AND lease_expires_at_unix_ms <= ?3)) \
                  ORDER BY updated_at_unix_ms ASC, job_ulid ASC \
-                 LIMIT ?3"
+                 LIMIT ?4"
             )
             .as_str(),
         )?;
-        let rows = statement
-            .query_map(params![stale_before, now_unix_ms, limit as i64], hydrate_tool_job_record)?;
+        let rows = statement.query_map(
+            params![owner_principal, stale_before, now_unix_ms, limit as i64],
+            hydrate_tool_job_record,
+        )?;
         let mut stale = Vec::new();
         for row in rows {
             stale.push(row?);
@@ -16171,11 +16180,12 @@ impl JournalStore {
                     UPDATE tool_jobs
                     SET state = 'orphaned',
                         state_reason = 'startup_recovery_stale_heartbeat',
-                        updated_at_unix_ms = ?2,
+                        updated_at_unix_ms = ?3,
                         completed_at_unix_ms = NULL
                     WHERE job_ulid = ?1
+                      AND owner_principal = ?2
                 "#,
-                params![record.job_id, now_unix_ms],
+                params![record.job_id, owner_principal, now_unix_ms],
             )?;
         }
         let mut recovered = Vec::new();
@@ -51047,40 +51057,72 @@ mod tests {
         let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
 
-        let job = store
-            .create_tool_job(&ToolJobCreateRequest {
-                job_id: "01JOB000000000000000000002".to_owned(),
-                owner_principal: "user:ops".to_owned(),
-                device_id: "device:local".to_owned(),
-                channel: None,
-                session_id: "01SESSION00000000000000002".to_owned(),
-                run_id: "01RUN00000000000000000002".to_owned(),
-                tool_call_id: "01CALL000000000000000002".to_owned(),
-                tool_name: "palyra.http.fetch".to_owned(),
-                backend: "networked_worker".to_owned(),
-                backend_reason_code: Some("strict_egress".to_owned()),
-                command_sha256: sha256_hex(b"fetch"),
-                program_sha256: Some(sha256_hex(br#"{"dag":[]}"#)),
-                state: ToolJobState::Running,
-                retry_policy: ToolJobRetryPolicy {
-                    max_attempts: 2,
-                    idempotency_key: Some("idem:fetch".to_owned()),
-                },
-                cancellation_handle: None,
-                retention: ToolJobRetentionPolicy {
-                    expires_at_unix_ms: Some(1_000),
-                    legal_hold: false,
-                },
-                artifact_refs_json: None,
-                lease_expires_at_unix_ms: Some(2_000),
-            })
-            .expect("tool job should be created");
+        let job_request = ToolJobCreateRequest {
+            job_id: "01JOB000000000000000000002".to_owned(),
+            owner_principal: "user:ops".to_owned(),
+            device_id: "device:local".to_owned(),
+            channel: None,
+            session_id: "01SESSION00000000000000002".to_owned(),
+            run_id: "01RUN00000000000000000002".to_owned(),
+            tool_call_id: "01CALL000000000000000002".to_owned(),
+            tool_name: "palyra.http.fetch".to_owned(),
+            backend: "networked_worker".to_owned(),
+            backend_reason_code: Some("strict_egress".to_owned()),
+            command_sha256: sha256_hex(b"fetch"),
+            program_sha256: Some(sha256_hex(br#"{"dag":[]}"#)),
+            state: ToolJobState::Running,
+            retry_policy: ToolJobRetryPolicy {
+                max_attempts: 2,
+                idempotency_key: Some("idem:fetch".to_owned()),
+            },
+            cancellation_handle: None,
+            retention: ToolJobRetentionPolicy {
+                expires_at_unix_ms: Some(1_000),
+                legal_hold: false,
+            },
+            artifact_refs_json: None,
+            lease_expires_at_unix_ms: Some(2_000),
+        };
+        let job = store.create_tool_job(&job_request).expect("tool job should be created");
+
+        let mut foreign_running_request = job_request.clone();
+        foreign_running_request.job_id = "01JOB000000000000000000003".to_owned();
+        foreign_running_request.owner_principal = "user:other".to_owned();
+        foreign_running_request.session_id = "01SESSION00000000000000003".to_owned();
+        foreign_running_request.run_id = "01RUN00000000000000000003".to_owned();
+        foreign_running_request.tool_call_id = "01CALL000000000000000003".to_owned();
+        foreign_running_request.retry_policy = ToolJobRetryPolicy::default();
+        let foreign_running = store
+            .create_tool_job(&foreign_running_request)
+            .expect("foreign running job should be created");
+
+        let mut foreign_terminal_request = job_request.clone();
+        foreign_terminal_request.job_id = "01JOB000000000000000000004".to_owned();
+        foreign_terminal_request.owner_principal = "user:other".to_owned();
+        foreign_terminal_request.session_id = "01SESSION00000000000000004".to_owned();
+        foreign_terminal_request.run_id = "01RUN00000000000000000004".to_owned();
+        foreign_terminal_request.tool_call_id = "01CALL000000000000000004".to_owned();
+        foreign_terminal_request.state = ToolJobState::Failed;
+        foreign_terminal_request.retry_policy = ToolJobRetryPolicy::default();
+        foreign_terminal_request.lease_expires_at_unix_ms = None;
+        let foreign_terminal = store
+            .create_tool_job(&foreign_terminal_request)
+            .expect("foreign terminal job should be created");
 
         let recovered = store
-            .recover_stale_tool_jobs(10_000, 1_000, 10)
+            .recover_stale_tool_jobs("user:ops", 10_000, 1_000, 10)
             .expect("stale heartbeat recovery should run");
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].state, ToolJobState::Orphaned);
+        assert_eq!(
+            store
+                .get_tool_job(foreign_running.job_id.as_str())
+                .expect("foreign running job should load")
+                .expect("foreign running job should exist")
+                .state,
+            ToolJobState::Running,
+            "principal-scoped recovery must not orphan another principal's job"
+        );
 
         let retry = store
             .retry_tool_job(&ToolJobRetryRequest {
@@ -51110,9 +51152,19 @@ mod tests {
             })
             .expect("owner should attach");
         assert_eq!(attached.active_ref_count, 1);
-        let not_expired =
-            store.sweep_expired_tool_jobs(10_000, 10).expect("sweeper should respect active refs");
+        let not_expired = store
+            .sweep_expired_tool_jobs("user:ops", 10_000, 10)
+            .expect("sweeper should respect active refs");
         assert!(not_expired.is_empty());
+        assert_eq!(
+            store
+                .get_tool_job(foreign_terminal.job_id.as_str())
+                .expect("foreign terminal job should load")
+                .expect("foreign terminal job should exist")
+                .state,
+            ToolJobState::Failed,
+            "principal-scoped sweep must not expire another principal's job"
+        );
 
         store.release_tool_job_attachment(job.job_id.as_str()).expect("attachment should release");
         store
@@ -51126,8 +51178,9 @@ mod tests {
                 lease_expires_at_unix_ms: None,
             })
             .expect("queued retry may fail");
-        let expired =
-            store.sweep_expired_tool_jobs(10_000, 10).expect("expired terminal job should sweep");
+        let expired = store
+            .sweep_expired_tool_jobs("user:ops", 10_000, 10)
+            .expect("expired terminal job should sweep");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].state, ToolJobState::Expired);
         assert!(!expired[0].last_error.as_deref().unwrap_or_default().contains("secret-token"));

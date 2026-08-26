@@ -51,20 +51,17 @@ pub(crate) struct ConsoleJobActionRequest {
     pub(crate) idempotency_key: Option<String>,
 }
 
-/// Body for `POST /console/v1/jobs/sweep-expired`; `now_unix_ms` exists so
-/// tests can sweep against a fixed clock.
+/// Body for `POST /console/v1/jobs/sweep-expired`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleJobSweepRequest {
-    pub(crate) now_unix_ms: Option<i64>,
     pub(crate) limit: Option<usize>,
 }
 
-/// Body for `POST /console/v1/jobs/recover-stale`; staleness defaults to five
-/// minutes without a heartbeat.
+/// Body for `POST /console/v1/jobs/recover-stale`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleJobRecoverRequest {
-    pub(crate) now_unix_ms: Option<i64>,
-    pub(crate) stale_after_ms: Option<i64>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -299,11 +296,12 @@ pub(crate) async fn console_jobs_sweep_expired_handler(
     headers: HeaderMap,
     Json(payload): Json<ConsoleJobSweepRequest>,
 ) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_job_mutation(&state, &headers)?;
+    let session = authorize_console_job_mutation(&state, &headers)?;
     let jobs = state
         .runtime
         .sweep_expired_tool_jobs(
-            payload.now_unix_ms.unwrap_or_else(current_unix_ms),
+            session.context.principal,
+            current_unix_ms(),
             payload.limit.unwrap_or(100),
         )
         .await
@@ -324,12 +322,13 @@ pub(crate) async fn console_jobs_recover_stale_handler(
     headers: HeaderMap,
     Json(payload): Json<ConsoleJobRecoverRequest>,
 ) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_job_mutation(&state, &headers)?;
+    let session = authorize_console_job_mutation(&state, &headers)?;
     let jobs = state
         .runtime
         .recover_stale_tool_jobs(
-            payload.now_unix_ms.unwrap_or_else(current_unix_ms),
-            payload.stale_after_ms.unwrap_or(5 * 60 * 1_000),
+            session.context.principal,
+            current_unix_ms(),
+            5 * 60 * 1_000,
             payload.limit.unwrap_or(100),
         )
         .await
@@ -410,7 +409,8 @@ fn job_envelope(job: ToolJobRecord) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::REQUIRE_CSRF_FOR_JOB_MUTATION;
+    use super::{ConsoleJobRecoverRequest, ConsoleJobSweepRequest, REQUIRE_CSRF_FOR_JOB_MUTATION};
+    use serde_json::json;
 
     #[test]
     fn job_lifecycle_mutations_require_csrf() {
@@ -420,5 +420,20 @@ mod tests {
                 "job reference and lifecycle mutations must require the console CSRF token",
             );
         }
+    }
+
+    #[test]
+    fn job_maintenance_requests_reject_caller_controlled_clocks() {
+        serde_json::from_value::<ConsoleJobSweepRequest>(json!({
+            "now_unix_ms": i64::MAX,
+            "limit": 1
+        }))
+        .expect_err("sweep clock must be server-owned");
+        serde_json::from_value::<ConsoleJobRecoverRequest>(json!({
+            "now_unix_ms": i64::MAX,
+            "stale_after_ms": 1,
+            "limit": 1
+        }))
+        .expect_err("recovery clock and threshold must be server-owned");
     }
 }

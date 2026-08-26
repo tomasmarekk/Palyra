@@ -13819,27 +13819,29 @@ impl GatewayRuntimeState {
     #[allow(clippy::result_large_err)]
     fn sweep_expired_tool_jobs_blocking(
         &self,
+        owner_principal: &str,
         now_unix_ms: i64,
         limit: usize,
     ) -> Result<Vec<ToolJobRecord>, Status> {
         self.journal_store
-            .sweep_expired_tool_jobs(now_unix_ms, limit)
+            .sweep_expired_tool_jobs(owner_principal, now_unix_ms, limit)
             .map_err(|error| map_orchestrator_store_error("sweep expired tool jobs", error))
     }
 
-    /// Expires tool jobs past their deadline, bounded by `limit`.
+    /// Expires one principal's tool jobs past their deadline, bounded by `limit`.
     ///
     /// # Errors
     /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn sweep_expired_tool_jobs(
         self: &Arc<Self>,
+        owner_principal: String,
         now_unix_ms: i64,
         limit: usize,
     ) -> Result<Vec<ToolJobRecord>, Status> {
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            state.sweep_expired_tool_jobs_blocking(now_unix_ms, limit)
+            state.sweep_expired_tool_jobs_blocking(owner_principal.as_str(), now_unix_ms, limit)
         })
         .await
         .map_err(|_| Status::internal("tool job sweep worker panicked"))?
@@ -13848,29 +13850,36 @@ impl GatewayRuntimeState {
     #[allow(clippy::result_large_err)]
     fn recover_stale_tool_jobs_blocking(
         &self,
+        owner_principal: &str,
         now_unix_ms: i64,
         stale_after_ms: i64,
         limit: usize,
     ) -> Result<Vec<ToolJobRecord>, Status> {
         self.journal_store
-            .recover_stale_tool_jobs(now_unix_ms, stale_after_ms, limit)
+            .recover_stale_tool_jobs(owner_principal, now_unix_ms, stale_after_ms, limit)
             .map_err(|error| map_orchestrator_store_error("recover stale tool jobs", error))
     }
 
-    /// Recovers jobs whose owner stopped heartbeating for `stale_after_ms`.
+    /// Recovers one principal's jobs whose owner stopped heartbeating for `stale_after_ms`.
     ///
     /// # Errors
     /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn recover_stale_tool_jobs(
         self: &Arc<Self>,
+        owner_principal: String,
         now_unix_ms: i64,
         stale_after_ms: i64,
         limit: usize,
     ) -> Result<Vec<ToolJobRecord>, Status> {
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            state.recover_stale_tool_jobs_blocking(now_unix_ms, stale_after_ms, limit)
+            state.recover_stale_tool_jobs_blocking(
+                owner_principal.as_str(),
+                now_unix_ms,
+                stale_after_ms,
+                limit,
+            )
         })
         .await
         .map_err(|_| Status::internal("tool job recovery worker panicked"))?
