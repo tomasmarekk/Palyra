@@ -14025,6 +14025,11 @@ fn apply_isolated_daemon_test_env<'a>(
 ) -> &'a mut Command {
     command
         .env("PALYRA_CONFIG", config_path.to_string_lossy().to_string())
+        // Most gateway integration fixtures script canonical tool calls
+        // directly. Pin that fixture contract so production's compact default
+        // cannot divert them through catalog-intake tools before the behavior
+        // under test; compact-specific tests override this value explicitly.
+        .env("PALYRA_TOOL_CATALOG_EXPOSURE_MODE", "direct")
         .env_remove("PALYRA_MODEL_PROVIDER_KIND")
         .env_remove("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL")
         .env_remove("PALYRA_MODEL_PROVIDER_OPENAI_MODEL")
