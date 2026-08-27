@@ -71,6 +71,7 @@ use crate::{
             tool_catalog_tape_payload, ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest,
             ToolExposureSurface,
         },
+        tool_security::effective_tool_postures_for_catalog,
     },
     channel_router::{
         InboundMessage as ChannelInboundMessage, RetryDisposition, RoutePlan as ChannelRoutePlan,
@@ -294,9 +295,12 @@ async fn build_and_record_route_tool_catalog_snapshot(
     _remaining_tool_budget: u32,
     tape_seq: &mut i64,
 ) -> Result<ModelVisibleToolCatalogSnapshot, Status> {
+    let mut catalog_policy = runtime_state.config.tool_catalog_policy.clone();
+    catalog_policy.effective_tool_postures =
+        effective_tool_postures_for_catalog(runtime_state, request_context, session_id).await;
     let request = ToolCatalogBuildRequest {
         config: &runtime_state.config.tool_call,
-        catalog_policy: &runtime_state.config.tool_catalog_policy,
+        catalog_policy: &catalog_policy,
         browser_service_enabled: runtime_state.config.browser_service.enabled,
         browser_service_configured: runtime_state.config.browser_service.enabled,
         request_context: &ToolRequestContext {

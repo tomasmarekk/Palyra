@@ -6,6 +6,8 @@
 //! The `as_str` labels and serde shapes here feed catalog hashing and tape
 //! payloads; changing any of them changes hashes and replay output.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -13,6 +15,7 @@ use palyra_common::tool_catalog::{
     expand_toolset_profiles, ToolCatalogExposureMode, ToolsetProfileExpansionReport,
 };
 
+use crate::tool_posture::ToolPostureState;
 use crate::tool_protocol::{ToolCallConfig, ToolRequestContext};
 
 /// Schema version stamped into every catalog snapshot; bump on breaking payload changes.
@@ -181,6 +184,7 @@ impl ToolResultProjectionPolicy {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolCatalogFilterReasonCode {
     NotAllowlisted,
+    PostureDisabled,
     UnknownTool,
     RuntimeUnavailable,
     ProviderSchemaIncompatible,
@@ -194,6 +198,7 @@ impl ToolCatalogFilterReasonCode {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::NotAllowlisted => "not_allowlisted",
+            Self::PostureDisabled => "posture_disabled",
             Self::UnknownTool => "unknown_tool",
             Self::RuntimeUnavailable => "runtime_unavailable",
             Self::ProviderSchemaIncompatible => "provider_schema_incompatible",
@@ -372,6 +377,8 @@ pub(crate) struct ToolCatalogPolicySnapshot {
     pub(crate) profile_expansion: ToolsetProfileExpansionReport,
     pub(crate) exposure_mode: ToolCatalogExposureMode,
     pub(crate) compact_tool_threshold: usize,
+    #[serde(skip)]
+    pub(crate) effective_tool_postures: BTreeMap<String, ToolPostureState>,
 }
 
 impl ToolCatalogPolicySnapshot {
@@ -396,6 +403,7 @@ impl ToolCatalogPolicySnapshot {
             profile_expansion,
             exposure_mode: config.catalog_exposure_mode,
             compact_tool_threshold: config.compact_tool_threshold,
+            effective_tool_postures: BTreeMap::new(),
         }
     }
 
@@ -416,6 +424,7 @@ impl ToolCatalogPolicySnapshot {
             profile_expansion,
             exposure_mode: ToolCatalogExposureMode::Direct,
             compact_tool_threshold: 16,
+            effective_tool_postures: BTreeMap::new(),
         }
     }
 }

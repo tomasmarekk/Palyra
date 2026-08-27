@@ -637,6 +637,11 @@ fn rejection_for_missing_snapshot_tool(
             "tool_call.not_exposed.not_allowlisted",
             "tool was not exposed to the model because it is not allowlisted",
         ),
+        Some(ToolCatalogFilterReasonCode::PostureDisabled) => (
+            ToolCallRejectionKind::PolicyInvisible,
+            "tool_call.not_exposed.posture_disabled",
+            "tool was not exposed to the model because its effective posture is disabled",
+        ),
         Some(ToolCatalogFilterReasonCode::RuntimeUnavailable) => (
             ToolCallRejectionKind::UnavailableTool,
             "tool_call.not_exposed.runtime_unavailable",

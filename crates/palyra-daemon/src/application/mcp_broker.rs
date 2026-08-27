@@ -4812,6 +4812,7 @@ mod tests {
                     .expect("profile expansion should succeed"),
                     exposure_mode: ToolCatalogExposureMode::Direct,
                     compact_tool_threshold: 16,
+                    effective_tool_postures: Default::default(),
                 },
                 browser_service_enabled: false,
                 browser_service_configured: false,

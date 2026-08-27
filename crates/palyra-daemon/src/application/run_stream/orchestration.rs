@@ -123,6 +123,7 @@ use crate::{
         ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest, ToolCatalogPolicySnapshot,
         ToolExposureSurface,
     },
+    application::tool_security::effective_tool_postures_for_catalog,
     commitments::{
         build_commitment_create_plan, select_post_turn_commitment_extraction,
         CommitmentExtractionInput, PostTurnCommitmentExtractionProjection,
@@ -1878,17 +1879,18 @@ async fn build_run_stream_tool_catalog_snapshot(
     maybe_delay_run_stream_phase_for_tests(RunLoopPhase::ToolCatalogSnapshot, allow_test_delay)
         .await;
     let routine_allowlist = routine_tool_allowlist(runtime_state, run_id).await?;
-    let narrowed_policy = routine_allowlist
+    let mut catalog_policy = routine_allowlist
         .as_ref()
         .map(|allowed| {
             narrow_routine_tool_catalog_policy(&runtime_state.config.tool_catalog_policy, allowed)
         })
-        .transpose()?;
-    let catalog_policy =
-        narrowed_policy.as_ref().unwrap_or(&runtime_state.config.tool_catalog_policy);
+        .transpose()?
+        .unwrap_or_else(|| runtime_state.config.tool_catalog_policy.clone());
+    catalog_policy.effective_tool_postures =
+        effective_tool_postures_for_catalog(runtime_state, request_context, session_id).await;
     let request = ToolCatalogBuildRequest {
         config: &runtime_state.config.tool_call,
-        catalog_policy,
+        catalog_policy: &catalog_policy,
         browser_service_enabled: runtime_state.config.browser_service.enabled,
         browser_service_configured: runtime_state.config.browser_service.enabled,
         request_context: &ToolRequestContext {

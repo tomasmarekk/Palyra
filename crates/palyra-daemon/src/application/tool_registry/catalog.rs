@@ -14,6 +14,7 @@ use palyra_common::tool_catalog::ToolCatalogExposureMode;
 use serde_json::{json, Value};
 
 use crate::sandbox_runner::EgressEnforcementMode;
+use crate::tool_posture::ToolPostureState;
 use crate::tool_protocol::ToolCallConfig;
 
 use super::builtin::{registry_entries, registry_entry};
@@ -95,7 +96,7 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot_with_external_records(
     registered_names.extend(external_registered_names.iter().cloned());
 
     for entry in registry {
-        let entry = runtime_adjusted_registry_entry(entry, request.config);
+        let mut entry = runtime_adjusted_registry_entry(entry, request.config);
         if is_catalog_bridge_tool(entry.name.as_str()) {
             continue;
         }
@@ -106,6 +107,23 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot_with_external_records(
                 "add the tool to tool_call.allowed_tools for this runtime",
             ));
             continue;
+        }
+        match request.catalog_policy.effective_tool_postures.get(entry.name.as_str()).copied() {
+            Some(ToolPostureState::Disabled) => {
+                filtered_tools.push(filtered(
+                    entry.name.as_str(),
+                    ToolCatalogFilterReasonCode::PostureDisabled,
+                    "enable the tool posture for the current session, agent, workspace, or global scope",
+                ));
+                continue;
+            }
+            Some(ToolPostureState::AskEachTime) => {
+                entry.approval_posture = super::types::ToolApprovalPosture::ApprovalRequired;
+            }
+            Some(ToolPostureState::AlwaysAllow) => {
+                entry.approval_posture = super::types::ToolApprovalPosture::Safe;
+            }
+            None => {}
         }
         if !entry.target_surfaces.contains(&request.surface) {
             filtered_tools.push(filtered(
@@ -591,6 +609,7 @@ fn surface_status_for_filter(reason_code: ToolCatalogFilterReasonCode) -> &'stat
         ToolCatalogFilterReasonCode::RuntimeUnavailable
         | ToolCatalogFilterReasonCode::ProviderSchemaIncompatible => "unavailable",
         ToolCatalogFilterReasonCode::NotAllowlisted
+        | ToolCatalogFilterReasonCode::PostureDisabled
         | ToolCatalogFilterReasonCode::UnknownTool
         | ToolCatalogFilterReasonCode::BudgetExhausted => "denied",
         ToolCatalogFilterReasonCode::SurfaceUnsupported

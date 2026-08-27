@@ -7,7 +7,7 @@
 //! reason strings are asserted by tests and consumed by operators; keep them
 //! byte-stable.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use palyra_policy::{
     evaluate_with_context, PolicyDecision, PolicyEvaluationConfig, PolicyRequest,
@@ -19,7 +19,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
-    agents::AgentBindingQuery,
+    agents::{AgentBindingQuery, SessionAgentBinding},
     application::approvals::{
         apply_tool_approval_outcome, build_tool_approval_subject_id, ApprovalExecutionContext,
     },
@@ -40,8 +40,8 @@ use crate::{
     },
     journal::{JournalAppendRequest, SkillExecutionStatus},
     tool_posture::{
-        derive_scope_chain, evaluate_effective_tool_posture, ToolPostureScopeKind,
-        ToolPostureScopeRef, ToolPostureState,
+        derive_scope_chain, evaluate_effective_tool_posture, ToolPostureOverrideRecord,
+        ToolPostureScopeKind, ToolPostureScopeRef, ToolPostureState,
     },
     tool_protocol::{
         decide_tool_call, tool_metadata, ToolCapability, ToolDecision, ToolRequestContext,
@@ -78,6 +78,78 @@ pub(crate) struct ToolProposalBackendSelection {
     pub(crate) agent_id: Option<String>,
     pub(crate) requested_preference: ExecutionBackendPreference,
     pub(crate) resolution: ExecutionBackendResolution,
+}
+
+struct ToolPostureResolutionContext {
+    overrides: Vec<ToolPostureOverrideRecord>,
+    scope_chain: Vec<ToolPostureScopeRef>,
+    agent_binding: Option<SessionAgentBinding>,
+}
+
+async fn resolve_tool_posture_context(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
+) -> ToolPostureResolutionContext {
+    let overrides = runtime_state.list_tool_posture_overrides().unwrap_or_default();
+    let agent_binding = runtime_state
+        .list_agent_bindings(AgentBindingQuery {
+            agent_id: None,
+            principal: Some(request_context.principal.clone()),
+            channel: request_context.channel.clone(),
+            session_id: Some(session_id.to_owned()),
+            limit: Some(1),
+        })
+        .await
+        .ok()
+        .and_then(|bindings| bindings.into_iter().next());
+    let agent_scope = agent_binding.as_ref().map(|binding| ToolPostureScopeRef {
+        kind: ToolPostureScopeKind::Agent,
+        scope_id: binding.agent_id.clone(),
+        label: "Agent default".to_owned(),
+    });
+    let workspace_scope =
+        request_context.principal.strip_prefix("workspace:").map(|workspace_id| {
+            ToolPostureScopeRef {
+                kind: ToolPostureScopeKind::Workspace,
+                scope_id: workspace_id.to_owned(),
+                label: format!("Workspace {workspace_id}"),
+            }
+        });
+    let scope_chain = derive_scope_chain(
+        ToolPostureScopeRef {
+            kind: ToolPostureScopeKind::Session,
+            scope_id: session_id.to_owned(),
+            label: "Current session".to_owned(),
+        },
+        workspace_scope,
+        agent_scope,
+    );
+    ToolPostureResolutionContext { overrides, scope_chain, agent_binding }
+}
+
+/// Resolves the effective per-tool posture projected into one provider-turn catalog.
+pub(crate) async fn effective_tool_postures_for_catalog(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
+) -> BTreeMap<String, ToolPostureState> {
+    let context = resolve_tool_posture_context(runtime_state, request_context, session_id).await;
+    runtime_state
+        .config
+        .tool_call
+        .allowed_tools
+        .iter()
+        .map(|tool_name| {
+            let posture = evaluate_effective_tool_posture(
+                &runtime_state.config,
+                context.overrides.as_slice(),
+                context.scope_chain.as_slice(),
+                tool_name,
+            );
+            (tool_name.clone(), posture.effective_state)
+        })
+        .collect()
 }
 
 /// Extracts the skill identity from `palyra.plugin.run` arguments.
@@ -533,48 +605,17 @@ pub(crate) async fn evaluate_tool_proposal_security(
                 };
         }
     }
-    let overrides = runtime_state.list_tool_posture_overrides().unwrap_or_default();
-    let agent_binding = runtime_state
-        .list_agent_bindings(AgentBindingQuery {
-            agent_id: None,
-            principal: Some(request_context.principal.clone()),
-            channel: request_context.channel.clone(),
-            session_id: Some(session_id.to_owned()),
-            limit: Some(1),
-        })
-        .await
-        .ok()
-        .and_then(|bindings| bindings.into_iter().next());
-    let agent_scope = agent_binding.as_ref().map(|binding| ToolPostureScopeRef {
-        kind: ToolPostureScopeKind::Agent,
-        scope_id: binding.agent_id.clone(),
-        label: "Agent default".to_owned(),
-    });
-    let workspace_scope =
-        request_context.principal.strip_prefix("workspace:").map(|workspace_id| {
-            ToolPostureScopeRef {
-                kind: ToolPostureScopeKind::Workspace,
-                scope_id: workspace_id.to_owned(),
-                label: format!("Workspace {workspace_id}"),
-            }
-        });
+    let posture_context =
+        resolve_tool_posture_context(runtime_state, request_context, session_id).await;
     let backend_selection = derive_tool_proposal_backend_selection(
         runtime_state,
-        agent_binding.as_ref().map(|binding| binding.agent_id.as_str()),
+        posture_context.agent_binding.as_ref().map(|binding| binding.agent_id.as_str()),
     )
     .await;
     let effective_posture = evaluate_effective_tool_posture(
         &runtime_state.config,
-        overrides.as_slice(),
-        &derive_scope_chain(
-            ToolPostureScopeRef {
-                kind: ToolPostureScopeKind::Session,
-                scope_id: session_id.to_owned(),
-                label: "Current session".to_owned(),
-            },
-            workspace_scope,
-            agent_scope,
-        ),
+        posture_context.overrides.as_slice(),
+        posture_context.scope_chain.as_slice(),
         tool_name,
     );
     if skill_gate_decision.is_none()

@@ -22,6 +22,7 @@ use super::{
 };
 use crate::{
     sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier},
+    tool_posture::ToolPostureState,
     tool_protocol::{ToolCallConfig, ToolRequestContext},
     wasm_plugin_runner::WasmPluginRunnerPolicy,
 };
@@ -829,6 +830,83 @@ fn catalog_bridge_search_describe_and_invoke_use_current_index_digest() {
     .expect("invoke target should resolve");
     assert_eq!(invoke.tool_name, "palyra.echo");
     assert_eq!(invoke.schema_digest, schema_digest);
+}
+
+#[test]
+fn compact_catalog_projects_effective_runtime_approval_posture() {
+    let file_config = config(&["palyra.fs.read_file"]);
+    let mut policy = catalog_policy(&file_config);
+    policy.exposure_mode = ToolCatalogExposureMode::Compact;
+    policy
+        .effective_tool_postures
+        .insert("palyra.fs.read_file".to_owned(), ToolPostureState::AlwaysAllow);
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &file_config,
+        catalog_policy: &policy,
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+
+    let search = search_tool_catalog_index(&snapshot, br#"{"query":"read file","limit":1}"#)
+        .expect("search should return the file reader");
+    assert_eq!(search["results"][0]["risk_tier"], "safe");
+    assert_eq!(search["results"][0]["approval_summary"], "no approval required");
+    let schema_digest =
+        search["results"][0]["schema_digest"].as_str().expect("schema digest should be present");
+    let describe = describe_catalog_tool(
+        &snapshot,
+        format!(r#"{{"tool_id":"palyra.fs.read_file","schema_digest":"{schema_digest}"}}"#)
+            .as_bytes(),
+    )
+    .expect("describe should return the effective file-reader posture");
+    assert_eq!(describe["approval_required"], false);
+
+    let echo_config = config(&["palyra.echo"]);
+    let mut policy = catalog_policy(&echo_config);
+    policy.exposure_mode = ToolCatalogExposureMode::Compact;
+    policy.effective_tool_postures.insert("palyra.echo".to_owned(), ToolPostureState::AskEachTime);
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &echo_config,
+        catalog_policy: &policy,
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+    let search = search_tool_catalog_index(&snapshot, br#"{"query":"echo","limit":1}"#)
+        .expect("search should return echo");
+    assert_eq!(search["results"][0]["risk_tier"], "approval_required");
+    assert_eq!(search["results"][0]["approval_summary"], "approval required before execution");
+
+    let mut policy = catalog_policy(&echo_config);
+    policy.effective_tool_postures.insert("palyra.echo".to_owned(), ToolPostureState::Disabled);
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &echo_config,
+        catalog_policy: &policy,
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+    assert!(snapshot.index.entries.is_empty());
+    assert!(snapshot.filtered_tools.iter().any(|tool| {
+        tool.name == "palyra.echo"
+            && tool.reason_code == ToolCatalogFilterReasonCode::PostureDisabled
+    }));
 }
 
 #[test]
