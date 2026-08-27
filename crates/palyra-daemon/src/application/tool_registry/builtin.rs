@@ -242,7 +242,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.memory.session_search",
-            "Search, browse, and navigate prior session transcripts through ACL-revalidated opaque anchors. Results group helpers under root sessions and expose stable labels instead of raw internal ids.",
+            "Search previous conversation history and browse prior session transcripts through ACL-revalidated opaque anchors. Results group helpers under root sessions and expose stable labels instead of raw internal ids.",
             object_schema(
                 &[],
                 vec![
@@ -256,7 +256,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "anchor",
-                        json!({"oneOf":[{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},{"type":"object","required":["cursor_sha256"],"properties":{"cursor_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},"created_at_unix_ms":{"type":"integer"}},"additionalProperties":false}],"description":"Opaque cursor from a previous bookend. Possession does not grant access; scope is revalidated on every use."}),
+                        json!({"type":"object","required":["cursor_sha256"],"properties":{"cursor_sha256":{"type":"string","minLength":64,"maxLength":64},"created_at_unix_ms":{"type":"integer"}},"additionalProperties":false,"description":"Opaque cursor object from a previous bookend. Possession does not grant access; scope and hexadecimal syntax are revalidated on every use."}),
                     ),
                     (
                         "channel",
@@ -285,7 +285,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.session_search",
-            "Compatibility alias for palyra.memory.session_search; search, browse, and navigate prior transcripts through ACL-revalidated opaque anchors.",
+            "Compatibility alias for palyra.memory.session_search; search previous conversation history and browse prior transcripts through ACL-revalidated opaque anchors.",
             object_schema(
                 &[],
                 vec![
@@ -299,7 +299,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "anchor",
-                        json!({"oneOf":[{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},{"type":"object","required":["cursor_sha256"],"properties":{"cursor_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},"created_at_unix_ms":{"type":"integer"}},"additionalProperties":false}]}),
+                        json!({"type":"object","required":["cursor_sha256"],"properties":{"cursor_sha256":{"type":"string","minLength":64,"maxLength":64},"created_at_unix_ms":{"type":"integer"}},"additionalProperties":false}),
                     ),
                     ("channel", json!({"type":"string"})),
                     ("top_k", json!({"type":"integer","minimum":1,"maximum":24})),

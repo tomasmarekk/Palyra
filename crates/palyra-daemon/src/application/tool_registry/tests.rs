@@ -782,6 +782,62 @@ fn compact_catalog_exposes_bridge_tools_and_indexes_authorized_targets() {
 }
 
 #[test]
+fn compact_catalog_finds_transcript_recall_for_previous_conversation_query() {
+    let config = config(&[
+        "palyra.browser.session.create",
+        "palyra.routines.control",
+        "palyra.fs.search",
+        "palyra.fs.read_file",
+        "palyra.fs.os_file",
+        "palyra.memory.retain",
+        "palyra.memory.search",
+        "palyra.fs.apply_patch",
+        "palyra.memory.session_search",
+    ]);
+    let mut policy = catalog_policy(&config);
+    policy.exposure_mode = ToolCatalogExposureMode::Compact;
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &policy,
+        browser_service_enabled: true,
+        browser_service_configured: true,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+    let filtered_session_search =
+        snapshot.filtered_tools.iter().find(|entry| entry.name == "palyra.memory.session_search");
+    assert!(
+        snapshot.index.entries.iter().any(|entry| entry.name == "palyra.memory.session_search"),
+        "transcript recall must be present in the authorized compact index; filtered={filtered_session_search:?}"
+    );
+
+    let search = search_tool_catalog_index(
+        &snapshot,
+        br#"{
+            "query":"Find a temporary feature flag name discussed in a previous session, and create or edit a new test file using it.",
+            "capability_hints":["conversation history","memory search","file search"],
+            "limit":8
+        }"#,
+    )
+    .expect("catalog search should succeed");
+    let result_ids = search["results"]
+        .as_array()
+        .expect("catalog search results")
+        .iter()
+        .filter_map(|result| result["id"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        result_ids.contains(&"palyra.memory.session_search"),
+        "previous-conversation search must expose transcript recall; results={result_ids:?}"
+    );
+}
+
+#[test]
 fn catalog_bridge_search_describe_and_invoke_use_current_index_digest() {
     let config = config(&["palyra.echo"]);
     let mut policy = catalog_policy(&config);
