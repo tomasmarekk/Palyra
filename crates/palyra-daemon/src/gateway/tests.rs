@@ -18101,7 +18101,7 @@ async fn project_memory_recall_survives_a_new_session_with_a_generic_query() {
         &state,
         retain_context,
         "01ARZ3NDEKTSV4RRFFQ69G5FGA",
-        br#"{"content_text":"Use TypeScript, Vitest, and brief Czech reports.","scope":"project","workspace_prefix":"scenarios/S033","category":"preference","source":"manual","confidence":0.95}"#,
+        br#"{"content_text":"Use TypeScript, Vitest, and brief localized reports.","scope":"project","workspace_prefix":"scenarios/S033","category":"preference","source":"manual","confidence":0.95}"#,
     )
     .await;
     assert!(retain.success, "project retain should succeed: {}", retain.error);
