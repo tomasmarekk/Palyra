@@ -1947,6 +1947,9 @@ fn compat_responses_stream_maps_tool_call_and_approval_events() -> Result<()> {
         &[
             ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
             ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED".to_owned(), "true".to_owned()),
+            // This fixture scripts a canonical tool call to exercise the compat
+            // proposal/approval/result grammar, not compact catalog discovery.
+            ("PALYRA_TOOL_CATALOG_EXPOSURE_MODE".to_owned(), "direct".to_owned()),
             (
                 "PALYRA_TOOL_CALL_ALLOWED_TOOLS".to_owned(),
                 "palyra.fs.apply_patch,palyra.fs.read_file".to_owned(),
