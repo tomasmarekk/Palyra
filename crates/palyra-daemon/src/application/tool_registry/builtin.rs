@@ -1133,13 +1133,13 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.fs.os_file",
-            "Perform an audited file operation on an absolute user-owned OS path. Use this for requested files outside the workspace, such as Downloads, user config files, configured local test harness OS roots, or user-cache cleanup. Protected system paths are denied, and paths are limited to workspace roots plus the runtime-approved OS roots. For small edits to files inside a workspace, prefer palyra.fs.apply_patch; os_file write is a full-file replacement surface.",
+            "Perform an audited file or permission operation on an absolute user-owned OS path. Inspect POSIX mode or Windows ACL evidence with permissions_get (also included by stat), and apply the cross-platform chmod 600/700 equivalent with permissions_set_owner_only. Use this for requested files outside the workspace, such as Downloads, user config files, configured local test harness OS roots, or user-cache cleanup. Protected system paths are denied, and paths are limited to workspace roots plus the runtime-approved OS roots. For small edits to files inside a workspace, prefer palyra.fs.apply_patch; os_file write is a full-file replacement surface.",
             object_schema(
                 &["operation", "path"],
                 vec![
                     (
                         "operation",
-                        json!({"type":"string","enum":["stat","read","write","copy","move","delete_file","delete_empty_dir","mkdir","list_dir","search"],"description":"Operation to perform. Prefer list_dir/search/read/write for ordinary OS-level files; use copy/move/delete_file/delete_empty_dir/mkdir only when explicitly requested. Use delete_empty_dir for cleanup of an existing empty directory instead of shell builtins such as rmdir. For privacy cleanup, use search to find exact matching cache files before delete_file."}),
+                        json!({"type":"string","enum":["stat","read","write","copy","move","delete_file","delete_empty_dir","mkdir","list_dir","search","permissions_get","permissions_set_owner_only"],"description":"Operation to perform. Use permissions_get to inspect POSIX mode or Windows owner/inheritance/access-rule evidence, and permissions_set_owner_only for an audited mode 600 file, mode 700 directory, or protected current-user-plus-SYSTEM Windows DACL equivalent; set dry_run=true to preview. Prefer list_dir/search/read/write for ordinary OS-level files; use copy/move/delete_file/delete_empty_dir/mkdir only when explicitly requested. Use delete_empty_dir for cleanup of an existing empty directory instead of shell builtins such as rmdir. For privacy cleanup, use search to find exact matching cache files before delete_file."}),
                     ),
                     (
                         "path",
@@ -3048,6 +3048,10 @@ mod tests {
         assert!(operation_values.iter().any(|value| value.as_str() == Some("list_dir")));
         assert!(operation_values.iter().any(|value| value.as_str() == Some("search")));
         assert!(operation_values.iter().any(|value| value.as_str() == Some("delete_empty_dir")));
+        assert!(operation_values.iter().any(|value| value.as_str() == Some("permissions_get")));
+        assert!(operation_values
+            .iter()
+            .any(|value| value.as_str() == Some("permissions_set_owner_only")));
         let operation_description = entry
             .input_schema
             .pointer("/properties/operation/description")
@@ -3055,6 +3059,8 @@ mod tests {
             .expect("os_file operation description should be visible to models");
         assert!(operation_description.contains("delete_empty_dir"));
         assert!(operation_description.contains("rmdir"));
+        assert!(operation_description.contains("mode 600"));
+        assert!(operation_description.contains("Windows DACL"));
 
         let path_description = entry
             .input_schema

@@ -32,6 +32,10 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+#[cfg(windows)]
+use palyra_common::windows_security::{
+    harden_windows_file_permissions, inspect_windows_file_permissions,
+};
 use palyra_safety::{
     redact_text_for_export, SafetyContentKind, SafetyFindingCategory, SafetySourceKind, TrustLabel,
 };
@@ -120,6 +124,8 @@ enum OsFileOperation {
     Mkdir,
     ListDir,
     Search,
+    PermissionsGet,
+    PermissionsSetOwnerOnly,
 }
 
 /// Per-call access policy: the canonicalized roots a path may resolve into,
@@ -248,23 +254,108 @@ fn execute_os_file_operation(policy: &OsFilePolicy, input: &OsFileInput) -> Resu
         OsFileOperation::Mkdir => mkdir_path(policy, input),
         OsFileOperation::ListDir => list_dir_path(policy, input),
         OsFileOperation::Search => search_path(policy, input),
+        OsFileOperation::PermissionsGet => permissions_get_path(policy, input),
+        OsFileOperation::PermissionsSetOwnerOnly => permissions_set_owner_only_path(policy, input),
     }
 }
 
 fn stat_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
     let path = resolve_existing_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
-    let metadata = fs::metadata(path.resolved_path.as_path()).map_err(|error| {
-        format!("{OS_FILE_TOOL_NAME} failed to inspect {}: {error}", input.path.trim())
-    })?;
+    let (file, opened_path, metadata) = open_os_path_for_permissions(
+        policy,
+        path.resolved_path.as_path(),
+        input.path.trim(),
+        false,
+    )?;
+    let permissions = inspect_os_path_permissions(&file, &metadata, input.path.trim())?;
     Ok(json!({
         "operation": "stat",
         "path": display_path(path.requested_path.as_path()),
-        "resolved_path": display_path(path.resolved_path.as_path()),
+        "resolved_path": display_path(opened_path.as_path()),
         "kind": metadata_kind(&metadata),
         "size_bytes": metadata.len(),
         "readonly": metadata.permissions().readonly(),
         "modified_unix_ms": metadata_modified_unix_ms(&metadata),
+        "permissions": permissions,
+        "dry_run": false,
+    }))
+}
+
+fn permissions_get_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
+    let path = resolve_existing_os_path(policy, input.path.as_str())?;
+    ensure_os_path_allowed(policy, &path)?;
+    let (file, opened_path, metadata) = open_os_path_for_permissions(
+        policy,
+        path.resolved_path.as_path(),
+        input.path.trim(),
+        false,
+    )?;
+    let permissions = inspect_os_path_permissions(&file, &metadata, input.path.trim())?;
+    Ok(json!({
+        "operation": "permissions_get",
+        "path": display_path(path.requested_path.as_path()),
+        "resolved_path": display_path(opened_path.as_path()),
+        "kind": metadata_kind(&metadata),
+        "permissions": permissions,
+        "dry_run": false,
+    }))
+}
+
+fn permissions_set_owner_only_path(
+    policy: &OsFilePolicy,
+    input: &OsFileInput,
+) -> Result<Value, String> {
+    let path = resolve_existing_os_path(policy, input.path.as_str())?;
+    ensure_os_path_allowed(policy, &path)?;
+    let dry_run = input.dry_run.unwrap_or(false);
+    let (file, opened_path, metadata) = open_os_path_for_permissions(
+        policy,
+        path.resolved_path.as_path(),
+        input.path.trim(),
+        !dry_run,
+    )?;
+    let before = inspect_os_path_permissions(&file, &metadata, input.path.trim())?;
+    if dry_run {
+        let would_change = !before.get("owner_only").and_then(Value::as_bool).unwrap_or(false);
+        return Ok(json!({
+            "operation": "permissions_set_owner_only",
+            "path": display_path(path.requested_path.as_path()),
+            "resolved_path": display_path(opened_path.as_path()),
+            "kind": metadata_kind(&metadata),
+            "requested_policy": "owner_only",
+            "before": before.clone(),
+            "after": before,
+            "would_change": would_change,
+            "verified": false,
+            "dry_run": true,
+        }));
+    }
+
+    harden_os_path_permissions(&file, &metadata, input.path.trim())?;
+    let after_metadata = file.metadata().map_err(|error| {
+        format!(
+            "{OS_FILE_TOOL_NAME} changed permissions but failed to inspect {} afterward: {error}",
+            input.path.trim()
+        )
+    })?;
+    let after = inspect_os_path_permissions(&file, &after_metadata, input.path.trim())?;
+    if after.get("owner_only").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "{OS_FILE_TOOL_NAME} changed permissions for {} but owner-only verification failed",
+            input.path.trim()
+        ));
+    }
+    Ok(json!({
+        "operation": "permissions_set_owner_only",
+        "path": display_path(path.requested_path.as_path()),
+        "resolved_path": display_path(opened_path.as_path()),
+        "kind": metadata_kind(&after_metadata),
+        "requested_policy": "owner_only",
+        "changed": before != after,
+        "before": before,
+        "after": after,
+        "verified": true,
         "dry_run": false,
     }))
 }
@@ -1382,6 +1473,210 @@ fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, PathBuf), String> 
     Ok((cursor, suffix.to_path_buf()))
 }
 
+fn open_os_path_for_permissions(
+    policy: &OsFilePolicy,
+    path: &Path,
+    input_path: &str,
+    write_permissions: bool,
+) -> Result<(File, PathBuf, fs::Metadata), String> {
+    let mut options = OpenOptions::new();
+    configure_os_permission_open(&mut options, write_permissions);
+    let file = options.open(path).map_err(|error| {
+        let access = if write_permissions { "modify permissions on" } else { "inspect" };
+        format!("{OS_FILE_TOOL_NAME} failed to {access} {input_path}: {error}")
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} failed to inspect opened path {input_path}: {error}")
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{OS_FILE_TOOL_NAME} refused symlink target {input_path}"));
+    }
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(format!(
+            "{OS_FILE_TOOL_NAME} permissions require a regular file or directory: {input_path}"
+        ));
+    }
+    let opened_path = canonicalize_open_file_path(OS_FILE_TOOL_NAME, &file, input_path)?;
+    ensure_os_path_allowed(
+        policy,
+        &ResolvedOsPath {
+            requested_path: PathBuf::from(input_path),
+            resolved_path: opened_path.clone(),
+            existed: true,
+        },
+    )?;
+    Ok((file, opened_path, metadata))
+}
+
+#[cfg(unix)]
+fn configure_os_permission_open(options: &mut OpenOptions, _write_permissions: bool) {
+    options.read(true);
+    configure_os_file_no_follow(options);
+}
+
+#[cfg(windows)]
+fn configure_os_permission_open(options: &mut OpenOptions, write_permissions: bool) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_DAC,
+    };
+
+    let access_mode = READ_CONTROL | if write_permissions { WRITE_DAC } else { 0 };
+    options
+        .read(true)
+        .access_mode(access_mode)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_os_permission_open(options: &mut OpenOptions, _write_permissions: bool) {
+    options.read(true);
+}
+
+#[cfg(unix)]
+fn inspect_os_path_permissions(
+    _file: &File,
+    metadata: &fs::Metadata,
+    _input_path: &str,
+) -> Result<Value, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mode = metadata.permissions().mode() & 0o7777;
+    let owner_uid = metadata.uid();
+    // SAFETY: `geteuid` has no pointers or preconditions and only reads process identity.
+    let current_uid = unsafe { libc::geteuid() };
+    let recommended_mode = if metadata.is_dir() { "0700" } else { "0600" };
+    Ok(json!({
+        "platform": "unix",
+        "policy": "owner_only",
+        "platform_equivalent": "posix_mode",
+        "owner_only": owner_uid == current_uid && mode & 0o077 == 0,
+        "recommended_mode": recommended_mode,
+        "mode_octal": format!("{mode:04o}"),
+        "owner": {
+            "principal": if owner_uid == current_uid { "current_user" } else { "other" },
+            "uid": owner_uid,
+        },
+        "inheritance_protected": Value::Null,
+        "access_rules": [
+            {"principal":"owner","mode_bits":posix_mode_bits((mode >> 6) & 0o7)},
+            {"principal":"group","mode_bits":posix_mode_bits((mode >> 3) & 0o7)},
+            {"principal":"other","mode_bits":posix_mode_bits(mode & 0o7)},
+        ],
+    }))
+}
+
+#[cfg(unix)]
+fn posix_mode_bits(bits: u32) -> String {
+    [
+        if bits & 0o4 != 0 { 'r' } else { '-' },
+        if bits & 0o2 != 0 { 'w' } else { '-' },
+        if bits & 0o1 != 0 { 'x' } else { '-' },
+    ]
+    .into_iter()
+    .collect()
+}
+
+#[cfg(windows)]
+fn inspect_os_path_permissions(
+    file: &File,
+    _metadata: &fs::Metadata,
+    input_path: &str,
+) -> Result<Value, String> {
+    let summary = inspect_windows_file_permissions(file).map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} failed to inspect Windows ACL for {input_path}: {error}")
+    })?;
+    let owner_principal = if summary.owner_is_current_user {
+        "current_user"
+    } else if summary.owner_sid.eq_ignore_ascii_case("S-1-5-18") {
+        "system"
+    } else {
+        "other"
+    };
+    let access_rules = summary
+        .access_rules
+        .iter()
+        .map(|rule| {
+            json!({
+                "principal": rule.principal_kind,
+                "principal_sid_sha256": rule.principal_sid.as_deref().map(sid_sha256),
+                "access_type": rule.access_type,
+                "access_mask": rule.access_mask.map(|mask| format!("0x{mask:08X}")),
+                "inherited": rule.inherited,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "platform": "windows",
+        "policy": "owner_only",
+        "platform_equivalent": "protected_dacl",
+        "owner_only": summary.current_user_and_system_only,
+        "recommended_mode": "current_user_and_system_only",
+        "mode_octal": Value::Null,
+        "owner": {
+            "principal": owner_principal,
+            "principal_sid_sha256": sid_sha256(summary.owner_sid.as_str()),
+        },
+        "inheritance_protected": summary.inheritance_protected,
+        "dacl_present": summary.dacl_present,
+        "access_rule_count": summary.access_rule_count,
+        "access_rules_truncated": summary.access_rules_truncated,
+        "access_rules": access_rules,
+    }))
+}
+
+#[cfg(windows)]
+fn sid_sha256(sid: &str) -> String {
+    hex::encode(Sha256::digest(sid.as_bytes()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inspect_os_path_permissions(
+    _file: &File,
+    _metadata: &fs::Metadata,
+    input_path: &str,
+) -> Result<Value, String> {
+    Err(format!(
+        "{OS_FILE_TOOL_NAME} permission inspection is unsupported on this platform for {input_path}"
+    ))
+}
+
+#[cfg(unix)]
+fn harden_os_path_permissions(
+    file: &File,
+    metadata: &fs::Metadata,
+    input_path: &str,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+    file.set_permissions(fs::Permissions::from_mode(mode)).map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} failed to set owner-only mode on {input_path}: {error}")
+    })
+}
+
+#[cfg(windows)]
+fn harden_os_path_permissions(
+    file: &File,
+    metadata: &fs::Metadata,
+    input_path: &str,
+) -> Result<(), String> {
+    harden_windows_file_permissions(file, metadata.is_dir()).map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} failed to set owner-only ACL on {input_path}: {error}")
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn harden_os_path_permissions(
+    _file: &File,
+    _metadata: &fs::Metadata,
+    input_path: &str,
+) -> Result<(), String> {
+    Err(format!(
+        "{OS_FILE_TOOL_NAME} permission mutation is unsupported on this platform for {input_path}"
+    ))
+}
+
 fn open_os_file_for_read(
     policy: &OsFilePolicy,
     path: &Path,
@@ -2186,6 +2481,226 @@ mod tests {
 
         assert_eq!(read.get("text").and_then(Value::as_str), Some("palyra-os-level-ok\n"));
         assert!(read.get("resolved_path").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn os_file_permissions_are_previewed_hardened_and_verified() {
+        let tempdir = os_file_tempdir();
+        let policy = test_policy(tempdir.path());
+        let target = tempdir.path().join("sensitive-config");
+        fs::write(target.as_path(), "Host example\n").expect("permission fixture should exist");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(target.as_path(), fs::Permissions::from_mode(0o644))
+                .expect("fixture should start with a non-owner-only mode");
+        }
+
+        let inspect_input = OsFileInput {
+            operation: OsFileOperation::PermissionsGet,
+            path: target.to_string_lossy().into_owned(),
+            target_path: None,
+            content_text: None,
+            bytes_base64: None,
+            create_parent_dirs: None,
+            overwrite: None,
+            full_replace: None,
+            dry_run: None,
+            offset_bytes: None,
+            max_bytes: None,
+            query: None,
+            case_sensitive: None,
+            max_entries: None,
+            max_matches: None,
+        };
+        let before = execute_os_file_operation(&policy, &inspect_input)
+            .expect("permission inspection should succeed");
+        assert_eq!(before.get("operation").and_then(Value::as_str), Some("permissions_get"));
+        assert_eq!(
+            before
+                .get("permissions")
+                .and_then(|value| value.get("platform"))
+                .and_then(Value::as_str),
+            Some(if cfg!(windows) { "windows" } else { "unix" })
+        );
+
+        let preview = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::PermissionsSetOwnerOnly,
+                path: target.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: Some(true),
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("permission hardening preview should succeed");
+        assert_eq!(preview.get("dry_run").and_then(Value::as_bool), Some(true));
+        assert_eq!(preview.get("verified").and_then(Value::as_bool), Some(false));
+        assert_eq!(preview.get("before"), before.get("permissions"));
+        assert_eq!(preview.get("after"), before.get("permissions"));
+
+        let hardened = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::PermissionsSetOwnerOnly,
+                path: target.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: Some(false),
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("permission hardening should succeed");
+        assert_eq!(hardened.get("verified").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            hardened
+                .get("after")
+                .and_then(|value| value.get("owner_only"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let after = execute_os_file_operation(&policy, &inspect_input)
+            .expect("post-mutation permission inspection should succeed");
+        assert_eq!(
+            after
+                .get("permissions")
+                .and_then(|value| value.get("owner_only"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let stat = execute_os_file_operation(
+            &policy,
+            &OsFileInput { operation: OsFileOperation::Stat, ..inspect_input },
+        )
+        .expect("stat should include permission evidence");
+        assert_eq!(
+            stat.get("permissions")
+                .and_then(|value| value.get("owner_only"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        #[cfg(unix)]
+        assert_eq!(
+            stat.get("permissions")
+                .and_then(|value| value.get("mode_octal"))
+                .and_then(Value::as_str),
+            Some("0600")
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                stat.get("permissions")
+                    .and_then(|value| value.get("inheritance_protected"))
+                    .and_then(Value::as_bool),
+                Some(true)
+            );
+            let output = serde_json::to_string(&stat).expect("stat should serialize");
+            assert!(!output.contains("S-1-"), "raw Windows SIDs must not be model-visible");
+        }
+    }
+
+    #[test]
+    fn os_file_directory_permissions_use_platform_owner_only_equivalent() {
+        let tempdir = os_file_tempdir();
+        let policy = test_policy(tempdir.path());
+        let target = tempdir.path().join("sensitive-directory");
+        fs::create_dir(target.as_path()).expect("permission directory should exist");
+
+        let hardened = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::PermissionsSetOwnerOnly,
+                path: target.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: Some(false),
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("directory permission hardening should succeed");
+
+        assert_eq!(hardened.get("kind").and_then(Value::as_str), Some("directory"));
+        assert_eq!(hardened.get("verified").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            hardened
+                .get("after")
+                .and_then(|value| value.get("owner_only"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            hardened.get("after").and_then(|value| value.get("mode_octal")).and_then(Value::as_str),
+            Some("0700")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            hardened
+                .get("after")
+                .and_then(|value| value.get("inheritance_protected"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn os_file_permission_operations_refuse_symlink_handles() {
+        let tempdir = os_file_tempdir();
+        let policy = test_policy(tempdir.path());
+        let target = tempdir.path().join("sensitive-config");
+        let link = tempdir.path().join("sensitive-config-link");
+        fs::write(target.as_path(), "Host example\n").expect("permission fixture should exist");
+        if let Err(error) = create_file_symlink(target.as_path(), link.as_path()) {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("permission fixture symlink should be created: {error}");
+        }
+
+        let error =
+            open_os_path_for_permissions(&policy, link.as_path(), "sensitive-config-link", true)
+                .expect_err("permission mutation must refuse a symlink handle");
+
+        assert!(
+            error.contains("symlink")
+                || error.contains("reparse")
+                || error.contains("failed to modify permissions"),
+            "{error}"
+        );
     }
 
     #[test]

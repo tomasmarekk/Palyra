@@ -1935,7 +1935,7 @@ fn collect_satisfied_file_evidence(
 
 fn collect_os_file_satisfied_paths(output: &Value, satisfied_file_paths: &mut BTreeSet<String>) {
     match output.get("operation").and_then(Value::as_str).unwrap_or_default() {
-        "read" | "stat" => {
+        "read" | "stat" | "permissions_get" | "permissions_set_owner_only" => {
             collect_output_path(output, "path", satisfied_file_paths);
             collect_output_path(output, "resolved_path", satisfied_file_paths);
         }

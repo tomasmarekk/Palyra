@@ -4620,7 +4620,13 @@ fn cron_os_file_mutation_operation(input_json: &[u8]) -> Option<String> {
         .filter(|operation| {
             matches!(
                 operation.as_str(),
-                "write" | "copy" | "move" | "delete_file" | "delete_empty_dir" | "mkdir"
+                "write"
+                    | "copy"
+                    | "move"
+                    | "delete_file"
+                    | "delete_empty_dir"
+                    | "mkdir"
+                    | "permissions_set_owner_only"
             )
         })
 }
@@ -4650,6 +4656,8 @@ fn cron_os_file_output_confirms_mutation(
     serde_json::from_slice::<Value>(output_json).ok().is_some_and(|value| {
         value.get("operation").and_then(Value::as_str) == Some(expected_operation)
             && value.get("dry_run").and_then(Value::as_bool) == Some(false)
+            && (expected_operation != "permissions_set_owner_only"
+                || value.get("verified").and_then(Value::as_bool) == Some(true))
             && ["path", "resolved_path"].iter().any(|field| {
                 value
                     .get(field)
@@ -5976,6 +5984,30 @@ mod tests {
         )
         .is_confirmed_by_output(
             br#"{"operation":"read","path":"reports/feed.md","dry_run":false}"#,
+            target_hints.as_slice()
+        ));
+        assert!(cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.os_file",
+            br#"{"operation":"permissions_set_owner_only","path":"reports/feed.md"}"#
+        )
+        .is_confirmed_by_output(
+            br#"{"operation":"permissions_set_owner_only","path":"reports/feed.md","verified":true,"dry_run":false}"#,
+            target_hints.as_slice()
+        ));
+        assert!(!cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.os_file",
+            br#"{"operation":"permissions_set_owner_only","path":"reports/feed.md"}"#
+        )
+        .is_confirmed_by_output(
+            br#"{"operation":"permissions_set_owner_only","path":"reports/feed.md","verified":false,"dry_run":false}"#,
+            target_hints.as_slice()
+        ));
+        assert!(!cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.os_file",
+            br#"{"operation":"permissions_set_owner_only","path":"reports/feed.md","dry_run":true}"#
+        )
+        .is_confirmed_by_output(
+            br#"{"operation":"permissions_set_owner_only","path":"reports/feed.md","verified":false,"dry_run":true}"#,
             target_hints.as_slice()
         ));
         assert!(!cron_completion_candidate_for_tool_proposal("palyra.memory.retain", b"{}")
