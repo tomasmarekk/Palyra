@@ -7,13 +7,13 @@
 //! delta) and the session's project focus (the directory the operator is
 //! currently working in, resolved from stored focus paths).
 //!
-//! Every dynamic root is canonicalized and validated before use: `launch_cwd`
-//! must be an existing absolute directory outside the OS deny-list in
-//! `protected_launch_workspace_root`, explicit extra launch roots must remain
-//! inside configured agent roots, and focus directories must resolve (symlinks
-//! included) to a strict descendant of a configured root. A scheduled child
-//! run may instead use the exact workdir bound to its durable, same-owner cron
-//! job. The containment decisions made here feed the security checks in
+//! Every dynamic root is canonicalized and validated before use: launch roots
+//! must be existing absolute directories outside the OS deny-list in
+//! `protected_launch_workspace_root` and normally remain inside configured
+//! agent roots. A scheduled child run may instead use the exact workdir bound
+//! to its durable, same-owner cron job. Focus directories must resolve
+//! (symlinks included) to a strict descendant of a configured root. The
+//! containment decisions made here feed the security checks in
 //! `workspace_file` and `workspace_patch`; treat any semantic change as a
 //! security change.
 
@@ -163,6 +163,11 @@ pub(crate) async fn run_launch_context_read_file_grants(
 
 /// Returns the launch-context root that represents generic `/workspace`
 /// process execution for this run, if the run supplied one.
+///
+/// Unlike workspace file and patch roots, an authenticated CLI process run may
+/// execute from its launch directory even when the agent retains a different
+/// long-lived workspace root. Callers must not use this exception to widen
+/// non-process workspace tools.
 pub(crate) async fn run_launch_context_primary_workspace_root(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -172,8 +177,10 @@ pub(crate) async fn run_launch_context_primary_workspace_root(
         return Some(root);
     }
     let launch_roots = run_launch_context_workspace_roots(runtime_state, run_id).await;
-    let launch_roots = filter_launch_workspace_roots(launch_roots, workspace_roots);
-    launch_roots.launch_cwd.or_else(|| launch_roots.extra_roots.into_iter().next())
+    if launch_roots.routine_workdir_authoritative || launch_roots.launch_cwd.is_some() {
+        return launch_roots.launch_cwd;
+    }
+    filter_launch_workspace_roots(launch_roots, workspace_roots).extra_roots.into_iter().next()
 }
 
 async fn run_launch_context_workspace_roots(
@@ -411,22 +418,18 @@ fn filter_launch_workspace_roots(
         return launch_roots;
     }
     let canonical_workspace_roots = canonicalize_workspace_roots(workspace_roots);
+    if canonical_workspace_roots.is_empty() {
+        return RunLaunchWorkspaceRoots::default();
+    }
     RunLaunchWorkspaceRoots {
-        // The authenticated CLI supplies its actual cwd, making it the
-        // operator's per-run workspace choice even when the registered agent
-        // has a separate long-lived default root.
-        launch_cwd: launch_roots.launch_cwd,
-        extra_roots: if canonical_workspace_roots.is_empty() {
-            Vec::new()
-        } else {
-            launch_roots
-                .extra_roots
-                .into_iter()
-                .filter(|root| {
-                    launch_path_is_within_workspace_roots(root, &canonical_workspace_roots)
-                })
-                .collect()
-        },
+        launch_cwd: launch_roots
+            .launch_cwd
+            .filter(|root| launch_path_is_within_workspace_roots(root, &canonical_workspace_roots)),
+        extra_roots: launch_roots
+            .extra_roots
+            .into_iter()
+            .filter(|root| launch_path_is_within_workspace_roots(root, &canonical_workspace_roots))
+            .collect(),
         routine_workdir_authoritative: false,
     }
 }
@@ -989,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_cwd_may_extend_roots_but_extra_roots_stay_inside_agent_roots() {
+    fn launch_roots_outside_agent_workspace_roots_are_ignored() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let agent_root = tempdir.path().join("agent");
         let launch_cwd = tempdir.path().join("scenario");
@@ -1010,7 +1013,7 @@ mod tests {
         });
         let roots = merge_launch_workspace_roots(std::slice::from_ref(&agent_root), launch_roots);
 
-        assert_eq!(roots, vec![launch_cwd, agent_root]);
+        assert_eq!(roots, vec![agent_root]);
     }
 
     #[test]

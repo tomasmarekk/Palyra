@@ -753,6 +753,19 @@ async fn process_runner_workspace_alias_subpaths_keep_configured_root() {
         .await
         .expect("orchestrator run should start with launch workspace metadata");
 
+    let launch_config = process_runner_tool_config_for_session(
+        &state,
+        context,
+        br#"{"command":"npm","args":["test"],"cwd":"/workspace"}"#,
+    )
+    .await;
+    assert_eq!(
+        fs::canonicalize(launch_config.process_runner.workspace_root.as_path())
+            .expect("selected launch workspace should canonicalize"),
+        launch_workspace,
+        "generic /workspace process cwd must honor the CLI launch directory"
+    );
+
     let config = process_runner_tool_config_for_session(
         &state,
         context,
