@@ -2967,7 +2967,9 @@ fn extract_explicit_action_item(line: &str) -> Option<String> {
         if !lower.starts_with(prefix) {
             continue;
         }
-        let rest = line.get(prefix.len()..)?;
+        let Some(rest) = explicit_action_item_suffix(line, prefix.len()) else {
+            continue;
+        };
         let rest = strip_optional_item_number(rest);
         let rest = rest
             .trim_start_matches(|ch: char| {
@@ -2975,6 +2977,22 @@ fn extract_explicit_action_item(line: &str) -> Option<String> {
             })
             .trim();
         return normalize_open_action_item(rest);
+    }
+    None
+}
+
+fn explicit_action_item_suffix(line: &str, prefix_len: usize) -> Option<&str> {
+    let rest = line.get(prefix_len..)?;
+    let boundary = rest.chars().next()?;
+    if boundary.is_whitespace() || matches!(boundary, ':' | '\u{2013}' | '\u{2014}') {
+        return Some(rest);
+    }
+    // A joined ASCII hyphen is commonly part of a filename such as
+    // `todo-app`; accept it as punctuation only when it is followed by space.
+    if boundary == '-'
+        && rest[boundary.len_utf8()..].chars().next().is_some_and(char::is_whitespace)
+    {
+        return Some(rest);
     }
     None
 }
@@ -5799,6 +5817,66 @@ TASK-103: Casey confirms the support rotation handoff.
                 .pointer("/active_task_summary/open_action_items/0")
                 .and_then(serde_json::Value::as_str),
             plan.active_task_summary.open_action_items.first().map(String::as_str)
+        );
+    }
+
+    #[test]
+    fn active_task_summary_does_not_promote_todo_prefixed_paths_from_tool_output() {
+        let directory_payload = serde_json::json!({
+            "proposal_id": "proposal-directory-list",
+            "success": true,
+            "output_json": {
+                "path": "todo-app",
+                "workspace_root_index": 0,
+                "entries": [{
+                    "name": "src",
+                    "path": "todo-app/src",
+                    "kind": "directory",
+                }],
+                "truncated": false,
+            },
+            "error": "",
+        })
+        .to_string();
+        let mut transcript = vec![
+            transcript_record(
+                0,
+                "message.received",
+                r#"{"text":"Load the action items from tasks/meeting-notes.md, but do not invent any if the file is unavailable."}"#,
+            ),
+            transcript_record(1, "tool_result", directory_payload.as_str()),
+        ];
+        transcript.extend((2..14).map(|seq| {
+            let payload = format!(r#"{{"text":"Filler context {seq} for compaction."}}"#);
+            transcript_record(seq, "message.received", payload.as_str())
+        }));
+
+        let plan = build_session_compaction_plan(
+            &session_record(),
+            transcript.as_slice(),
+            &[],
+            &[],
+            Some("test_compaction"),
+            Some("test_policy"),
+        );
+        let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
+            .expect("summary JSON should decode");
+
+        assert!(plan.eligible);
+        assert!(
+            plan.active_task_summary.open_action_items.is_empty(),
+            "directory paths with a todo prefix are identifiers, not action items: {:?}",
+            plan.active_task_summary.open_action_items
+        );
+        assert_eq!(
+            summary
+                .pointer("/retry_safety_report/current_task/open_action_item_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            summary.pointer("/retry_safety_report/next_action").and_then(serde_json::Value::as_str),
+            Some("none")
         );
     }
 
