@@ -687,7 +687,7 @@ async fn process_runner_uses_session_bound_agent_workspace_outside_configured_ro
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn process_runner_workspace_alias_subpaths_keep_configured_root() {
+async fn process_runner_workspace_alias_subpaths_use_launch_root() {
     let tempdir = gateway_tempdir("gateway-");
     let configured = tempdir.path().join("state").join("workspace");
     let launch_workspace = tempdir.path().join("scenario-runs").join("S050").join("workspace");
@@ -776,8 +776,8 @@ async fn process_runner_workspace_alias_subpaths_keep_configured_root() {
     assert_eq!(
         fs::canonicalize(config.process_runner.workspace_root.as_path())
             .expect("selected workspace should canonicalize"),
-        configured,
-        "/workspace subpaths must not replace the configured process root with {launch_workspace:?}"
+        launch_workspace,
+        "/workspace subpaths must stay with the operator launch root instead of {configured:?}"
     );
 }
 
