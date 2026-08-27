@@ -2511,7 +2511,11 @@ async fn collect_compat_run_verification_summary(
     };
     let (projections, diagnostics) =
         compat_verification_summary_inputs_from_journal(&journal.events);
-    let finalizer = collect_compat_run_verification_finalizer(state, snapshot).await;
+    let tape_evidence = crate::run_verification_evidence::collect_run_verification_tape_evidence(
+        &state.runtime,
+        snapshot,
+    )
+    .await;
     let summary = crate::application::verification::verification_summary_for_public_artifact(
         crate::application::verification::VerificationSummaryRequest {
             rollout_enabled: state.runtime.config.feature_rollouts.verification_runtime.enabled,
@@ -2519,7 +2523,8 @@ async fn collect_compat_run_verification_summary(
             journal_window_events: u64::try_from(journal.events.len()).unwrap_or(u64::MAX),
             projections: projections.as_slice(),
             diagnostics: diagnostics.as_slice(),
-            finalizer: finalizer.as_ref(),
+            finalizer: tape_evidence.finalizer.as_ref(),
+            observed_tool_activity: Some(&tape_evidence.observed_tool_activity),
         },
     );
     serde_json::to_value(summary).unwrap_or_else(|error| {
@@ -2556,29 +2561,6 @@ fn compat_verification_summary_inputs_from_journal(
         }
     }
     (projections, diagnostics)
-}
-
-async fn collect_compat_run_verification_finalizer(
-    state: &AppState,
-    snapshot: &journal::OrchestratorRunStatusSnapshot,
-) -> Option<Value> {
-    let after_seq = compat_tail_tape_after_seq(snapshot.tape_events, 256);
-    let tape = state
-        .runtime
-        .orchestrator_tape_snapshot(snapshot.run_id.clone(), after_seq, Some(256))
-        .await
-        .ok()?;
-    tape.events.iter().rev().find_map(|event| {
-        let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
-        payload.pointer("/finalization/verification_finalizer").cloned()
-    })
-}
-
-fn compat_tail_tape_after_seq(tape_events: u64, limit: usize) -> Option<i64> {
-    let limit = u64::try_from(limit).unwrap_or(u64::MAX);
-    (tape_events > limit).then(|| {
-        i64::try_from(tape_events.saturating_sub(limit).saturating_sub(1)).unwrap_or(i64::MAX)
-    })
 }
 
 fn compat_run_verification_summary(

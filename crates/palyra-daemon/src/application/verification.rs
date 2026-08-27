@@ -41,6 +41,18 @@ pub(crate) const VERIFICATION_STATUS_RECENT_FRESH_EVIDENCE: &str =
     "verification.status.recent_fresh_evidence";
 pub(crate) const VERIFICATION_STATUS_JOURNAL_UNAVAILABLE: &str =
     "verification.status.journal_unavailable";
+pub(crate) const VERIFICATION_OBSERVED_TOOL_ACTIVITY: &str = "verification.observed_tool_activity";
+pub(crate) const VERIFICATION_OBSERVED_TOOL_ACTIVITY_INCOMPLETE: &str =
+    "verification.observed_tool_activity_incomplete";
+pub(crate) const VERIFICATION_OBSERVED_PATCH_MUTATION: &str =
+    "verification.observed_patch_mutation";
+pub(crate) const VERIFICATION_OBSERVED_PROCESS_ATTEMPT: &str =
+    "verification.observed_process_attempt";
+const VERIFICATION_FINALIZER_NO_CODE_MUTATION: &str = "verification.finalizer.no_code_mutation";
+const VERIFICATION_FINALIZER_OBSERVED_MUTATION_REQUIRES_VERIFICATION: &str =
+    "verification.finalizer.observed_mutation_requires_verification";
+const VERIFICATION_FINALIZER_ROLLOUT_DISABLED_WITH_OBSERVED_MUTATION: &str =
+    "verification.finalizer.rollout_disabled_with_observed_mutation";
 
 /// Verification work family. Classifiers may map several commands into one kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -279,6 +291,18 @@ pub(crate) struct VerificationSummaryFinalAnswer {
     pub(crate) unverified_reason: Option<String>,
 }
 
+/// Redacted tool activity recovered from the durable run tape when the
+/// experimental verification journal has no projection for ordinary tool use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct VerificationObservedToolActivity {
+    pub(crate) changed_files: Vec<String>,
+    pub(crate) commands_executed: Vec<VerificationSummaryCommand>,
+    pub(crate) command_classification: Vec<VerificationSummaryCommandClassification>,
+    pub(crate) evidence_refs: Vec<String>,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) complete: bool,
+}
+
 /// Inputs for building a public verification summary without coupling to transport types.
 pub(crate) struct VerificationSummaryRequest<'a> {
     pub(crate) rollout_enabled: bool,
@@ -287,6 +311,7 @@ pub(crate) struct VerificationSummaryRequest<'a> {
     pub(crate) projections: &'a [VerificationJournalProjection],
     pub(crate) diagnostics: &'a [VerificationSummaryDiagnostic],
     pub(crate) finalizer: Option<&'a Value>,
+    pub(crate) observed_tool_activity: Option<&'a VerificationObservedToolActivity>,
 }
 
 /// Stable reason codes used by verification journal payloads.
@@ -842,7 +867,38 @@ pub(crate) fn verification_summary_for_public_artifact(
         }
     }
 
-    let final_answer = final_answer_summary_from_finalizer(request.finalizer);
+    if let Some(activity) = request.observed_tool_activity {
+        changed_files.extend(activity.changed_files.iter().map(|path| public_changed_path(path)));
+        for observed in &activity.commands_executed {
+            let already_projected = commands_executed.iter().any(|existing| {
+                existing.command == observed.command
+                    && existing.status == observed.status
+                    && existing
+                        .evidence_refs
+                        .iter()
+                        .any(|reference| observed.evidence_refs.contains(reference))
+            });
+            if !already_projected {
+                commands_executed.push(observed.clone());
+            }
+        }
+        for observed in &activity.command_classification {
+            if !command_classification.contains(observed) {
+                command_classification.push(observed.clone());
+            }
+        }
+        evidence_refs.extend(activity.evidence_refs.clone());
+        reason_codes.extend(activity.reason_codes.clone());
+        if !activity.complete {
+            stale_evidence_reasons.push(VERIFICATION_OBSERVED_TOOL_ACTIVITY_INCOMPLETE.to_owned());
+        }
+    }
+
+    let final_answer = reconcile_final_answer_with_observed_tool_activity(
+        final_answer_summary_from_finalizer(request.finalizer),
+        request.rollout_enabled,
+        request.observed_tool_activity,
+    );
     evidence_refs.extend(final_answer.evidence_refs.clone());
     if let Some(reason_code) = final_answer.reason_code.as_ref() {
         reason_codes.push(reason_code.clone());
@@ -1001,6 +1057,51 @@ fn final_answer_summary_from_finalizer(
         nudge,
         unverified_reason,
     }
+}
+
+fn reconcile_final_answer_with_observed_tool_activity(
+    mut final_answer: VerificationSummaryFinalAnswer,
+    rollout_enabled: bool,
+    observed_tool_activity: Option<&VerificationObservedToolActivity>,
+) -> VerificationSummaryFinalAnswer {
+    let Some(activity) = observed_tool_activity else {
+        return final_answer;
+    };
+    if activity.changed_files.is_empty()
+        || final_answer.reason_code.as_deref() != Some(VERIFICATION_FINALIZER_NO_CODE_MUTATION)
+    {
+        return final_answer;
+    }
+
+    let reason_code = if rollout_enabled {
+        VERIFICATION_FINALIZER_OBSERVED_MUTATION_REQUIRES_VERIFICATION
+    } else {
+        VERIFICATION_FINALIZER_ROLLOUT_DISABLED_WITH_OBSERVED_MUTATION
+    };
+    final_answer.observed = true;
+    final_answer.status =
+        Some(if rollout_enabled { "nudge_required" } else { "unverified_allowed" }.to_owned());
+    final_answer.reason_code = Some(reason_code.to_owned());
+    final_answer.allowed = !rollout_enabled;
+    final_answer.allowed_because = reason_code.to_owned();
+    final_answer.evidence_refs = normalize_string_set(
+        final_answer
+            .evidence_refs
+            .into_iter()
+            .chain(activity.evidence_refs.iter().cloned())
+            .collect(),
+    );
+    if rollout_enabled {
+        final_answer.nudge = Some(
+            "Run verification after the observed code mutation before relying on the final answer."
+                .to_owned(),
+        );
+        final_answer.unverified_reason = None;
+    } else {
+        final_answer.nudge = None;
+        final_answer.unverified_reason = Some(VERIFICATION_STATUS_ROLLOUT_DISABLED.to_owned());
+    }
+    final_answer
 }
 
 fn projection_status(projection: &VerificationJournalProjection) -> Option<String> {
@@ -2087,6 +2188,7 @@ mod tests {
             projections: &[projection],
             diagnostics: &[],
             finalizer: None,
+            observed_tool_activity: None,
         });
 
         assert_eq!(summary.latest_verification_status.classified_commands, 1);
@@ -2116,6 +2218,7 @@ mod tests {
             projections: &[projection],
             diagnostics: &[],
             finalizer: None,
+            observed_tool_activity: None,
         });
 
         assert_eq!(summary.changed_files, vec!["<redacted:path>"]);
@@ -2160,6 +2263,7 @@ mod tests {
             projections: &[projection],
             diagnostics: &[diagnostic],
             finalizer: Some(&finalizer),
+            observed_tool_activity: None,
         });
 
         assert_eq!(summary.state, "available");

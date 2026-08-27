@@ -101,6 +101,7 @@ mod realtime;
 mod replay_capture;
 mod retrieval;
 mod routines;
+mod run_verification_evidence;
 mod runtime_diagnostics;
 mod runtime_preview_controls;
 mod sandbox_runner;
