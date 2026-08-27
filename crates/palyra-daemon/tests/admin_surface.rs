@@ -2819,6 +2819,7 @@ fn console_routine_approval_decision_rejects_non_owner_principal() -> Result<()>
             "every_interval_ms": 1000,
             "enabled": true,
             "channel": "web",
+            "approval_mode": "before_enable",
         }))
         .send()
         .context("failed to create owner-boundary approval routine")?
