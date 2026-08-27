@@ -278,9 +278,14 @@ fn projected_tool_result_output(result_payload: &Value) -> Option<Value> {
         return Some(output.clone());
     };
     match summary {
-        Value::String(encoded) => {
-            serde_json::from_str::<Value>(encoded).ok().or_else(|| Some(output.clone()))
-        }
+        Value::String(encoded) => serde_json::from_str::<Value>(encoded)
+            .ok()
+            // Model-visible summaries may end at the projection byte cap in
+            // the middle of JSON. The runtime emits bounded structured
+            // progress evidence specifically so observability can recover
+            // mutation metadata without parsing that truncated preview.
+            .or_else(|| output.get("progress_evidence").filter(|value| value.is_object()).cloned())
+            .or_else(|| Some(output.clone())),
         Value::Object(_) => Some(summary.clone()),
         _ => Some(output.clone()),
     }
@@ -454,5 +459,88 @@ mod tests {
             Some("verification.finalizer.rollout_disabled_with_observed_mutation")
         );
         assert!(summary.final_answer_allowed);
+    }
+
+    #[test]
+    fn tape_fallback_uses_patch_progress_evidence_when_summary_is_truncated() {
+        let records = vec![
+            OrchestratorTapeRecord {
+                seq: 1,
+                event_type: "tool_proposal".to_owned(),
+                payload_json: json!({
+                    "proposal_id": "patch-truncated-summary",
+                    "tool_name": "palyra.fs.apply_patch",
+                    "input_json": {"patch": "<redacted>"},
+                    "approval_required": false,
+                })
+                .to_string(),
+            },
+            OrchestratorTapeRecord {
+                seq: 2,
+                event_type: "tool_result".to_owned(),
+                payload_json: json!({
+                    "proposal_id": "patch-truncated-summary",
+                    "success": true,
+                    "output_json": {
+                        "summary": "{\"files_touched\":[{\"path\":\"reports/installed-blackbox.txt\"",
+                        "progress_evidence": {
+                            "schema_version": 1,
+                            "kind": "workspace_patch",
+                            "dry_run": false,
+                            "rollback_performed": false,
+                            "files_touched": [{
+                                "workspace_root_index": 0,
+                                "path": "reports/installed-blackbox.txt",
+                                "operation": "create",
+                                "after_sha256": "0cd761f71d5e8148abe75fbf9a8ecd66ca18eb1c4e4984323ddf2348d8f18c05",
+                                "after_size_bytes": 29
+                            }],
+                            "files_touched_truncated": false
+                        }
+                    },
+                    "error": null,
+                })
+                .to_string(),
+            },
+            OrchestratorTapeRecord {
+                seq: 3,
+                event_type: "status".to_owned(),
+                payload_json: json!({
+                    "finalization": {
+                        "verification_finalizer": {
+                            "status": "not_required",
+                            "reason_code": "verification.finalizer.no_code_mutation",
+                            "pending_requirement_count": 0,
+                            "satisfied_requirement_count": 0,
+                            "evidence_refs": []
+                        }
+                    }
+                })
+                .to_string(),
+            },
+        ];
+
+        let evidence = run_verification_tape_evidence_from_records(records.as_slice(), true);
+        assert_eq!(
+            evidence.observed_tool_activity.changed_files,
+            vec!["reports/installed-blackbox.txt"]
+        );
+
+        let summary = crate::application::verification::verification_summary_for_public_artifact(
+            crate::application::verification::VerificationSummaryRequest {
+                rollout_enabled: false,
+                journal_total_events: 0,
+                journal_window_events: 0,
+                projections: &[],
+                diagnostics: &[],
+                finalizer: evidence.finalizer.as_ref(),
+                observed_tool_activity: Some(&evidence.observed_tool_activity),
+            },
+        );
+        assert_eq!(summary.changed_files, vec!["reports/installed-blackbox.txt"]);
+        assert_eq!(
+            summary.final_answer.reason_code.as_deref(),
+            Some("verification.finalizer.rollout_disabled_with_observed_mutation")
+        );
     }
 }
