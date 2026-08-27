@@ -670,7 +670,7 @@ pub fn config_schema_entry(path: &str) -> Option<&'static ConfigSchemaEntry> {
     CONFIG_SCHEMA_ENTRIES.iter().find(|entry| entry.path == normalized)
 }
 
-/// Returns PALYRA_* environment variables known to the config schema catalog.
+/// Returns PALYRA_* environment variables known to typed config or runtime contracts.
 #[must_use]
 pub fn known_config_env_vars() -> Vec<&'static str> {
     let mut env_vars = CONFIG_SCHEMA_ENTRIES
@@ -693,6 +693,9 @@ pub fn known_config_env_vars() -> Vec<&'static str> {
         "PALYRA_HTTP_FETCH_CREDENTIAL_BINDINGS_JSON",
         "PALYRA_CHANNEL_DELIVERY_PIPELINE_MODE",
         "PALYRA_CHANNEL_ROUTER_GROUP_GUARDRAILS",
+        "PALYRA_E2E_HOME",
+        "PALYRA_E2E_OS_ROOT",
+        "PALYRA_OS_FILE_ROOTS",
         "PALYRA_TOOL_CATALOG_COMPACT_THRESHOLD",
         "PALYRA_TOOL_CALL_DENIED_TOOLS",
         "PALYRA_MINIMAX_API_KEY",
@@ -1773,6 +1776,15 @@ mod tests {
                 && entry.env_vars.contains(&"PALYRA_CONNECTOR_ALLOWED_CHANNELS")
         }));
         assert!(known_config_env_vars().contains(&"PALYRA_CONNECTOR_ALLOWED_CHANNELS"));
+    }
+
+    #[test]
+    fn runtime_env_catalog_includes_installer_managed_os_file_roots() {
+        let env_vars = known_config_env_vars();
+
+        for expected in ["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT", "PALYRA_OS_FILE_ROOTS"] {
+            assert!(env_vars.contains(&expected), "{expected} should be recognized");
+        }
     }
 
     #[test]

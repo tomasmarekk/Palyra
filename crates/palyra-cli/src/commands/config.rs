@@ -1034,6 +1034,9 @@ mod tests {
             ("PALYRA_UNKNOWN_FLAG".to_owned(), "1".to_owned()),
             ("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN".to_owned(), "8".to_owned()),
             ("PALYRA_MODEL_PROVIDER_KIND".to_owned(), "deterministic".to_owned()),
+            ("PALYRA_E2E_HOME".to_owned(), "C:\\fixture-home".to_owned()),
+            ("PALYRA_E2E_OS_ROOT".to_owned(), "C:\\fixture-os-root".to_owned()),
+            ("PALYRA_OS_FILE_ROOTS".to_owned(), "C:\\fixture-home;C:\\fixture-os-root".to_owned()),
         ];
 
         let report =
