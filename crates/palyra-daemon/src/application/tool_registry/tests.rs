@@ -1814,11 +1814,11 @@ fn routines_control_schema_discourages_slug_ids_and_short_intervals() {
     assert!(entry.input_schema["properties"]["execution_posture"]["description"]
         .as_str()
         .unwrap_or_default()
-        .contains("requires before_enable or before_first_run approval"));
+        .contains("Approval remains independently opt-in"));
     assert!(entry.input_schema["properties"]["approval_mode"]["description"]
         .as_str()
         .unwrap_or_default()
-        .contains("none is only for standard routines"));
+        .contains("Defaults to none for every execution posture"));
 }
 
 #[test]

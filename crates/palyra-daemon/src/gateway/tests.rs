@@ -20830,7 +20830,7 @@ async fn archived_objective_bound_dispatch_is_denied_before_orchestrator() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn routines_tool_defers_sensitive_schedule_approval_until_first_run() {
+async fn routines_tool_defaults_sensitive_schedule_to_approval_free_execution() {
     let state = build_test_runtime_state(false);
     let _registry = configure_test_routines_runtime(&state, "http://127.0.0.1:9".to_owned());
     let context = routines_tool_test_context();
@@ -20857,7 +20857,7 @@ async fn routines_tool_defers_sensitive_schedule_approval_until_first_run() {
 
     assert!(
         outcome.success,
-        "explicit sensitive routine posture should be accepted with a default approval gate: {}",
+        "sensitive routine posture should be accepted without a default approval gate: {}",
         outcome.error
     );
     let output = parse_tool_output_json(&outcome);
@@ -20868,63 +20868,18 @@ async fn routines_tool_defers_sensitive_schedule_approval_until_first_run() {
     assert_eq!(routine.get("execution_posture").and_then(Value::as_str), Some("sensitive_tools"));
     assert_eq!(
         routine.get("approval_mode").and_then(Value::as_str),
-        Some("before_first_run"),
-        "sensitive routine posture must not persist without an approval gate"
+        Some("none"),
+        "sensitive routine posture should preserve the approval-free default"
     );
-    let routine_id = routine
-        .get("routine_id")
-        .and_then(Value::as_str)
-        .expect("upsert should return routine id")
-        .to_owned();
+    assert_eq!(
+        routine.get("allow_sensitive_tools").and_then(Value::as_bool),
+        Some(true),
+        "sensitive posture should expose its configured capabilities without an approval"
+    );
     assert_eq!(
         output.get("approval"),
         Some(&Value::Null),
-        "an accepted control upsert must not stand in for an operator approval"
-    );
-
-    let run_now_input = serde_json::to_vec(&json!({
-        "operation": "run_now",
-        "routine_id": routine_id,
-    }))
-    .expect("run-now payload should serialize");
-    let run_now_outcome = execute_routines_tool(
-        &state,
-        context,
-        super::ROUTINES_CONTROL_TOOL_NAME,
-        "01ARZ3NDEKTSV4RRFFQ69G5FBL",
-        run_now_input.as_slice(),
-    )
-    .await;
-    assert!(run_now_outcome.success, "approval gate should return a routine outcome");
-    let run_now_json = parse_tool_output_json(&run_now_outcome);
-    assert_eq!(run_now_json.get("status").and_then(Value::as_str), Some("denied"));
-    let approval = run_now_json
-        .get("approval")
-        .and_then(Value::as_object)
-        .expect("first dispatch should return its pending approval");
-    assert!(
-        approval.get("approval_id").and_then(Value::as_str).is_some(),
-        "pending approval should expose its durable id"
-    );
-    assert_ne!(
-        approval.get("decision").and_then(Value::as_str),
-        Some("allow"),
-        "first dispatch must not inherit an Allow decision from upsert"
-    );
-    let run_id = run_now_json
-        .get("run_id")
-        .and_then(Value::as_str)
-        .expect("approval-gated dispatch should record a cron run")
-        .to_owned();
-    let run = state
-        .cron_run(run_id)
-        .await
-        .expect("cron run lookup should succeed")
-        .expect("dispatch should persist a run record");
-    assert_eq!(
-        run.error_kind.as_deref(),
-        Some("approval_required"),
-        "first routine run must stop at the explicit operator approval gate"
+        "approval-free creation should not create a pending approval"
     );
 }
 

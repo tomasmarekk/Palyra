@@ -56,13 +56,9 @@ const ROUTINES_REGISTRY_FILE: &str = "definitions.json";
 const ROUTINE_RUNS_FILE: &str = "run_metadata.json";
 const MAX_ROUTINE_COUNT: usize = 2_048;
 const MAX_ROUTINE_RUN_METADATA_COUNT: usize = 8_192;
-// Hard parse floor for "every ..." phrases. Same value as the auto-enable guard below, but kept
-// as a separate constant on purpose: loosening the parser floor must not silently loosen the
-// approval guard, and vice versa.
+// Hard parse floor for "every ..." phrases. This is a resource-use boundary,
+// independent of the operator's optional approval posture.
 const MIN_EVERY_INTERVAL_MS: u64 = 30 * 1_000;
-/// Recurring routine schedules below this interval require review before they
-/// can be enabled, even when the caller omits an approval policy.
-pub const MIN_AUTO_ENABLE_EVERY_INTERVAL_MS: u64 = 60_000;
 /// Far-future timestamp used as a never-firing `at` schedule placeholder for routines that are
 /// triggered manually or by hooks instead of by the cron clock.
 pub const SHADOW_AT_TIMESTAMP_RFC3339: &str = "2100-01-01T00:00:00Z";
@@ -854,8 +850,10 @@ pub struct RoutineQuietHours {
     pub timezone: Option<String>,
 }
 
-/// Approval policy wrapper; high-frequency schedules may force the mode up to `BeforeEnable`
-/// via [`routine_approval_policy_with_auto_enable_guard`].
+/// Optional approval policy for routine activation or first execution.
+///
+/// The default is approval-free. Operators can explicitly select a guarded
+/// mode without changing the routine's configured execution capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineApprovalPolicy {
@@ -868,14 +866,14 @@ impl Default for RoutineApprovalPolicy {
     }
 }
 
-/// Returns whether routine execution may auto-approve sensitive tool proposals.
+/// Returns whether routine execution exposes sensitive tool capabilities.
+///
+/// Approval policy gates routine activation or first execution separately. It
+/// must not silently disable capabilities when an operator selects the
+/// approval-free default.
 #[must_use]
-pub fn routine_allows_sensitive_tools(
-    execution: &RoutineExecutionConfig,
-    approval_policy: &RoutineApprovalPolicy,
-) -> bool {
+pub fn routine_allows_sensitive_tools(execution: &RoutineExecutionConfig) -> bool {
     execution.execution_posture == RoutineExecutionPosture::SensitiveTools
-        && approval_policy.mode != RoutineApprovalMode::None
 }
 
 /// Routine capability posture projected for unattended run review.
@@ -897,6 +895,7 @@ pub enum RoutineCapabilityProfileReasonCode {
     FreshSessionUnattended,
     #[serde(rename = "routine_capability_profile.sensitive_tools_approval_gated")]
     SensitiveToolsApprovalGated,
+    /// Retained so historical observe-only projections remain deserializable.
     #[serde(rename = "routine_capability_profile.sensitive_tools_missing_approval")]
     SensitiveToolsMissingApproval,
     #[serde(rename = "routine_capability_profile.same_session_unattended_review")]
@@ -940,7 +939,7 @@ pub fn routine_capability_profile_projection(
     approval_policy: &RoutineApprovalPolicy,
 ) -> RoutineCapabilityProfileProjection {
     let unattended_trigger = routine_trigger_is_unattended(trigger_kind);
-    let allow_sensitive_tools = routine_allows_sensitive_tools(execution, approval_policy);
+    let allow_sensitive_tools = routine_allows_sensitive_tools(execution);
     let (decision, reason_code) = routine_capability_profile_decision(
         unattended_trigger,
         execution.run_mode,
@@ -981,13 +980,9 @@ fn routine_capability_profile_decision(
     execution_posture: RoutineExecutionPosture,
     approval_mode: RoutineApprovalMode,
 ) -> (RoutineCapabilityProfileDecision, RoutineCapabilityProfileReasonCode) {
-    if execution_posture == RoutineExecutionPosture::SensitiveTools {
-        if approval_mode == RoutineApprovalMode::None {
-            return (
-                RoutineCapabilityProfileDecision::ReviewRequired,
-                RoutineCapabilityProfileReasonCode::SensitiveToolsMissingApproval,
-            );
-        }
+    if execution_posture == RoutineExecutionPosture::SensitiveTools
+        && approval_mode != RoutineApprovalMode::None
+    {
         return (
             RoutineCapabilityProfileDecision::ApprovalGated,
             RoutineCapabilityProfileReasonCode::SensitiveToolsApprovalGated,
@@ -1201,46 +1196,6 @@ fn json_object_keys(raw: Option<&str>) -> Vec<String> {
     let mut keys = object.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     keys
-}
-
-/// Applies the routine schedule auto-enable guard to an approval policy.
-///
-/// Inputs are the normalized schedule type and payload produced by the cron
-/// normalization layer. The returned policy preserves normal schedules and
-/// fail-closes high-frequency recurring schedules to `before_enable`; malformed
-/// `every` payloads are treated as high-frequency for this guard.
-#[must_use]
-pub fn routine_approval_policy_with_auto_enable_guard(
-    schedule_type: CronScheduleType,
-    schedule_payload_json: &str,
-    approval_policy: RoutineApprovalPolicy,
-) -> RoutineApprovalPolicy {
-    if schedule_requires_auto_enable_guard(schedule_type, schedule_payload_json)
-        && approval_policy.mode != RoutineApprovalMode::BeforeEnable
-    {
-        return RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeEnable };
-    }
-    approval_policy
-}
-
-/// Returns true when a normalized schedule is too frequent to auto-enable.
-#[must_use]
-pub fn schedule_requires_auto_enable_guard(
-    schedule_type: CronScheduleType,
-    schedule_payload_json: &str,
-) -> bool {
-    if schedule_type != CronScheduleType::Every {
-        return false;
-    }
-    every_interval_ms_from_schedule_payload(schedule_payload_json)
-        .is_none_or(|interval_ms| interval_ms < MIN_AUTO_ENABLE_EVERY_INTERVAL_MS)
-}
-
-fn every_interval_ms_from_schedule_payload(schedule_payload_json: &str) -> Option<u64> {
-    let payload = serde_json::from_str::<Value>(schedule_payload_json).ok()?;
-    payload.get("interval_ms").and_then(|value| {
-        value.as_u64().or_else(|| value.as_i64().and_then(|signed| u64::try_from(signed).ok()))
-    })
 }
 
 /// Persisted routine definition; the routine id matches the backing cron job id for
@@ -3723,28 +3678,27 @@ mod tests {
         default_outcome_from_cron_status, heartbeat_delivery_journal_projection, join_run_metadata,
         natural_language_schedule_preview, normalize_file_watch_trigger_payload,
         resolve_routines_root, routine_allows_sensitive_tools,
-        routine_approval_policy_with_auto_enable_guard, routine_capability_profile_projection,
-        routine_delivery_contract, routine_delivery_preview, routine_retention_dry_run,
-        routine_run_lifecycle_snapshot, routine_runtime_backfill_plan,
-        schedule_requires_auto_enable_guard, shadow_manual_schedule_payload_json,
-        validate_routine_export_bundle, validate_routine_prompt_self_contained,
-        CronRoutinePreviewAuditDecision, CronRoutinePreviewAuditInput,
-        CronRoutinePreviewAuditProjection, CronRoutinePreviewAuditReasonCode,
-        HeartbeatDeliveryDecision, HeartbeatDeliveryJournalProjection, HeartbeatDeliveryReasonCode,
-        RoutineApprovalGateState, RoutineApprovalMode, RoutineApprovalPolicy,
-        RoutineCapabilityProfileDecision, RoutineCapabilityProfileProjection,
-        RoutineCapabilityProfileReasonCode, RoutineDeliveryConfig, RoutineDeliveryContractKind,
-        RoutineDeliveryMode, RoutineExecutionConfig, RoutineExecutionPosture,
-        RoutineMetadataRecord, RoutineRegistry, RoutineRetentionPolicy, RoutineRunLeaseState,
-        RoutineRunMetadataRecord, RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind,
-        RoutineSilentPolicy, RoutineTriggerKind, CRON_ROUTINE_PREVIEW_AUDIT_EVENT_COMPLETED,
+        routine_capability_profile_projection, routine_delivery_contract, routine_delivery_preview,
+        routine_retention_dry_run, routine_run_lifecycle_snapshot, routine_runtime_backfill_plan,
+        shadow_manual_schedule_payload_json, validate_routine_export_bundle,
+        validate_routine_prompt_self_contained, CronRoutinePreviewAuditDecision,
+        CronRoutinePreviewAuditInput, CronRoutinePreviewAuditProjection,
+        CronRoutinePreviewAuditReasonCode, HeartbeatDeliveryDecision,
+        HeartbeatDeliveryJournalProjection, HeartbeatDeliveryReasonCode, RoutineApprovalGateState,
+        RoutineApprovalMode, RoutineApprovalPolicy, RoutineCapabilityProfileDecision,
+        RoutineCapabilityProfileProjection, RoutineCapabilityProfileReasonCode,
+        RoutineDeliveryConfig, RoutineDeliveryContractKind, RoutineDeliveryMode,
+        RoutineExecutionConfig, RoutineExecutionPosture, RoutineMetadataRecord, RoutineRegistry,
+        RoutineRetentionPolicy, RoutineRunLeaseState, RoutineRunMetadataRecord,
+        RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind, RoutineSilentPolicy,
+        RoutineTriggerKind, CRON_ROUTINE_PREVIEW_AUDIT_EVENT_COMPLETED,
         CRON_ROUTINE_PREVIEW_AUDIT_EVENT_STARTED, CRON_ROUTINE_PREVIEW_AUDIT_REDACTION_LEVEL,
         CRON_ROUTINE_PREVIEW_AUDIT_SCHEMA_VERSION, HEARTBEAT_DELIVERY_EVENT_COMPLETED,
         HEARTBEAT_DELIVERY_EVENT_STARTED, HEARTBEAT_DELIVERY_REDACTION_LEVEL,
-        HEARTBEAT_DELIVERY_SCHEMA_VERSION, MIN_AUTO_ENABLE_EVERY_INTERVAL_MS,
-        ROUTINE_CAPABILITY_PROFILE_EVENT_COMPLETED, ROUTINE_CAPABILITY_PROFILE_EVENT_STARTED,
-        ROUTINE_CAPABILITY_PROFILE_REDACTION_LEVEL, ROUTINE_CAPABILITY_PROFILE_SCHEMA_VERSION,
-        ROUTINE_EXPORT_SCHEMA_ID, ROUTINE_RUN_LEASE_TTL_MS,
+        HEARTBEAT_DELIVERY_SCHEMA_VERSION, ROUTINE_CAPABILITY_PROFILE_EVENT_COMPLETED,
+        ROUTINE_CAPABILITY_PROFILE_EVENT_STARTED, ROUTINE_CAPABILITY_PROFILE_REDACTION_LEVEL,
+        ROUTINE_CAPABILITY_PROFILE_SCHEMA_VERSION, ROUTINE_EXPORT_SCHEMA_ID,
+        ROUTINE_RUN_LEASE_TTL_MS,
     };
     use crate::{
         cron::CronTimezoneMode,
@@ -4226,84 +4180,6 @@ mod tests {
     }
 
     #[test]
-    fn schedule_auto_enable_guard_requires_before_enable_for_fast_every_schedules() {
-        let payload = json!({ "interval_ms": MIN_AUTO_ENABLE_EVERY_INTERVAL_MS - 1 }).to_string();
-
-        assert!(schedule_requires_auto_enable_guard(CronScheduleType::Every, payload.as_str()));
-
-        let guarded = routine_approval_policy_with_auto_enable_guard(
-            CronScheduleType::Every,
-            payload.as_str(),
-            RoutineApprovalPolicy::default(),
-        );
-        assert_eq!(guarded.mode, RoutineApprovalMode::BeforeEnable);
-    }
-
-    #[test]
-    fn schedule_auto_enable_guard_covers_scheduler_minimum_interval() {
-        let payload = json!({ "interval_ms": 30_000_u64 }).to_string();
-
-        assert!(schedule_requires_auto_enable_guard(CronScheduleType::Every, payload.as_str()));
-        let guarded = routine_approval_policy_with_auto_enable_guard(
-            CronScheduleType::Every,
-            payload.as_str(),
-            RoutineApprovalPolicy::default(),
-        );
-        assert_eq!(guarded.mode, RoutineApprovalMode::BeforeEnable);
-    }
-
-    #[test]
-    fn schedule_auto_enable_guard_tightens_explicit_fast_every_approval() {
-        let payload = json!({ "interval_ms": MIN_AUTO_ENABLE_EVERY_INTERVAL_MS - 1 }).to_string();
-
-        let guarded = routine_approval_policy_with_auto_enable_guard(
-            CronScheduleType::Every,
-            payload.as_str(),
-            RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun },
-        );
-        assert_eq!(guarded.mode, RoutineApprovalMode::BeforeEnable);
-    }
-
-    #[test]
-    fn schedule_auto_enable_guard_preserves_one_minute_every_schedules() {
-        let payload = json!({ "interval_ms": 60_000_u64 }).to_string();
-
-        assert!(!schedule_requires_auto_enable_guard(CronScheduleType::Every, payload.as_str()));
-
-        let guarded = routine_approval_policy_with_auto_enable_guard(
-            CronScheduleType::Every,
-            payload.as_str(),
-            RoutineApprovalPolicy::default(),
-        );
-        assert_eq!(guarded.mode, RoutineApprovalMode::None);
-    }
-
-    #[test]
-    fn schedule_auto_enable_guard_preserves_normal_every_schedules() {
-        let payload = json!({ "interval_ms": MIN_AUTO_ENABLE_EVERY_INTERVAL_MS }).to_string();
-
-        assert!(!schedule_requires_auto_enable_guard(CronScheduleType::Every, payload.as_str()));
-
-        let guarded = routine_approval_policy_with_auto_enable_guard(
-            CronScheduleType::Every,
-            payload.as_str(),
-            RoutineApprovalPolicy::default(),
-        );
-        assert_eq!(guarded.mode, RoutineApprovalMode::None);
-    }
-
-    #[test]
-    fn schedule_auto_enable_guard_fail_closes_malformed_every_payloads() {
-        let guarded = routine_approval_policy_with_auto_enable_guard(
-            CronScheduleType::Every,
-            "{}",
-            RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun },
-        );
-
-        assert_eq!(guarded.mode, RoutineApprovalMode::BeforeEnable);
-    }
-
-    #[test]
     fn cron_routine_preview_audit_round_trips_without_payload_values() {
         let delivery = RoutineDeliveryConfig {
             mode: RoutineDeliveryMode::SameChannel,
@@ -4389,8 +4265,9 @@ mod tests {
     }
 
     #[test]
-    fn routine_capability_profile_requires_review_for_missing_sensitive_approval() {
+    fn routine_capability_profile_allows_approval_free_sensitive_posture() {
         let execution = RoutineExecutionConfig {
+            run_mode: RoutineRunMode::FreshSession,
             execution_posture: RoutineExecutionPosture::SensitiveTools,
             ..RoutineExecutionConfig::default()
         };
@@ -4401,12 +4278,9 @@ mod tests {
             &RoutineApprovalPolicy::default(),
         );
 
-        assert_eq!(profile.decision, RoutineCapabilityProfileDecision::ReviewRequired);
-        assert_eq!(
-            profile.reason_code,
-            RoutineCapabilityProfileReasonCode::SensitiveToolsMissingApproval
-        );
-        assert!(!profile.allow_sensitive_tools);
+        assert_eq!(profile.decision, RoutineCapabilityProfileDecision::UnattendedReady);
+        assert_eq!(profile.reason_code, RoutineCapabilityProfileReasonCode::FreshSessionUnattended);
+        assert!(profile.allow_sensitive_tools);
     }
 
     #[test]
@@ -4438,25 +4312,15 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_tool_auto_approval_requires_routine_approval_policy() {
+    fn sensitive_tool_capability_depends_only_on_execution_posture() {
         let standard_execution = RoutineExecutionConfig::default();
         let sensitive_execution = RoutineExecutionConfig {
             execution_posture: RoutineExecutionPosture::SensitiveTools,
             ..RoutineExecutionConfig::default()
         };
 
-        assert!(!routine_allows_sensitive_tools(
-            &standard_execution,
-            &RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun },
-        ));
-        assert!(!routine_allows_sensitive_tools(
-            &sensitive_execution,
-            &RoutineApprovalPolicy::default(),
-        ));
-        assert!(routine_allows_sensitive_tools(
-            &sensitive_execution,
-            &RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun },
-        ));
+        assert!(!routine_allows_sensitive_tools(&standard_execution));
+        assert!(routine_allows_sensitive_tools(&sensitive_execution));
     }
 
     #[test]

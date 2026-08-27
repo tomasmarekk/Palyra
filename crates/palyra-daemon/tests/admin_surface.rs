@@ -2598,6 +2598,78 @@ fn console_routine_import_rejects_existing_job_owned_by_another_principal() -> R
 }
 
 #[test]
+fn console_routine_sensitive_posture_defaults_to_no_approval() -> Result<()> {
+    let (child, admin_port) =
+        spawn_palyrad_with_dynamic_ports_with_env(&[("PALYRA_ADMIN_REQUIRE_AUTH", "false")])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/access/features/routines_automation"
+        ))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&serde_json::json!({
+            "enabled": true,
+            "stage": "test",
+        }))
+        .send()
+        .context("failed to enable routines automation for default approval test")?
+        .error_for_status()
+        .context("routines automation feature enable returned non-success status")?;
+
+    let created = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/routines"))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&serde_json::json!({
+            "name": "approval-free-sensitive-routine",
+            "prompt": "inspect project diagnostics and summarize findings",
+            "trigger_kind": "schedule",
+            "schedule_type": "every",
+            "every_interval_ms": 60_000,
+            "execution_posture": "sensitive_tools",
+            "enabled": true,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to create approval-free sensitive routine")?
+        .error_for_status()
+        .context("approval-free sensitive routine create returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse approval-free sensitive routine response json")?;
+
+    assert_eq!(
+        created.pointer("/routine/enabled").and_then(Value::as_bool),
+        Some(true),
+        "approval-free routine should remain enabled"
+    );
+    assert_eq!(
+        created.pointer("/routine/approval_mode").and_then(Value::as_str),
+        Some("none"),
+        "omitted approval mode should stay none"
+    );
+    assert_eq!(
+        created.pointer("/routine/allow_sensitive_tools").and_then(Value::as_bool),
+        Some(true),
+        "sensitive posture should retain its configured capabilities"
+    );
+    assert_eq!(
+        created.get("approval"),
+        Some(&Value::Null),
+        "approval-free routine creation should not queue an approval"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_routine_approval_allow_enables_pending_routine() -> Result<()> {
     let (child, admin_port) =
         spawn_palyrad_with_dynamic_ports_with_env(&[("PALYRA_ADMIN_REQUIRE_AUTH", "false")])?;
@@ -2636,6 +2708,7 @@ fn console_routine_approval_allow_enables_pending_routine() -> Result<()> {
             "every_interval_ms": 1000,
             "enabled": true,
             "channel": "web",
+            "approval_mode": "before_enable",
         }))
         .send()
         .context("failed to create approval-gated routine")?
@@ -2650,7 +2723,7 @@ fn console_routine_approval_allow_enables_pending_routine() -> Result<()> {
     assert_eq!(
         created.pointer("/routine/enabled").and_then(Value::as_bool),
         Some(false),
-        "auto-enable guard should keep high-frequency routine disabled until approval"
+        "explicit before-enable safe mode should keep the routine disabled until approval"
     );
     let approval_id = created
         .pointer("/approval/approval_id")

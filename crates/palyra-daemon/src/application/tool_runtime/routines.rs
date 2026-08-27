@@ -45,14 +45,13 @@ use crate::{
         apply_routine_execution_governance, default_outcome_from_cron_status, join_run_metadata,
         natural_language_schedule_preview, normalize_file_watch_trigger_payload,
         preserve_routine_execution_governance, routine_allows_sensitive_tools,
-        routine_approval_policy_with_auto_enable_guard, routine_delivery_preview,
-        routine_execution_governance_projection, shadow_manual_schedule_payload_json,
-        validate_routine_prompt_self_contained, RoutineApprovalMode, RoutineApprovalPolicy,
-        RoutineDeliveryConfig, RoutineDeliveryMode, RoutineDispatchMode, RoutineExecutionConfig,
-        RoutineExecutionGovernanceOverrides, RoutineExecutionPosture, RoutineMetadataRecord,
-        RoutineMetadataUpsert, RoutineQuietHours, RoutineRegistry, RoutineRegistryError,
-        RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind, RoutineSilentPolicy,
-        RoutineTriggerKind,
+        routine_delivery_preview, routine_execution_governance_projection,
+        shadow_manual_schedule_payload_json, validate_routine_prompt_self_contained,
+        RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode,
+        RoutineDispatchMode, RoutineExecutionConfig, RoutineExecutionGovernanceOverrides,
+        RoutineExecutionPosture, RoutineMetadataRecord, RoutineMetadataUpsert, RoutineQuietHours,
+        RoutineRegistry, RoutineRegistryError, RoutineRunMetadataUpsert, RoutineRunMode,
+        RoutineRunOutcomeKind, RoutineSilentPolicy, RoutineTriggerKind,
     },
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
     transport::grpc::proto::palyra::cron::v1 as cron_v1,
@@ -936,7 +935,6 @@ async fn upsert_routine(
         .or_else(|| existing_job.as_ref().map(|job| job.prompt.clone()))
         .ok_or_else(|| "prompt is required and must be a non-empty string".to_owned())?;
     let requested_execution_posture = optional_string_field(payload, "execution_posture");
-    let execution_posture_was_requested = requested_execution_posture.is_some();
     let execution_fields_requested = payload_has_any(
         payload,
         &[
@@ -1008,28 +1006,7 @@ async fn upsert_routine(
             optional_string_field(payload, "quiet_hours_timezone"),
         )?
     };
-    let approval_mode_was_requested = payload.contains_key("approval_mode");
-    let approval_policy = match (
-        !approval_mode_was_requested && !execution_posture_was_requested,
-        existing_metadata.as_ref(),
-    ) {
-        (true, Some(metadata)) => metadata.approval_policy.clone(),
-        _ => {
-            let requested_approval_policy =
-                parse_approval_policy(optional_string_field(payload, "approval_mode").as_deref())?;
-            let approval_policy = default_approval_policy_for_execution(
-                &execution,
-                requested_approval_policy,
-                approval_mode_was_requested,
-                execution_posture_was_requested,
-            );
-            routine_approval_policy_with_auto_enable_guard(
-                schedule.schedule_type,
-                schedule.schedule_payload_json.as_str(),
-                approval_policy,
-            )
-        }
-    };
+    let approval_policy = resolve_upsert_approval_policy(payload, existing_metadata.as_ref())?;
     let concurrency_policy =
         parse_concurrency_policy(optional_string_field(payload, "concurrency_policy").as_deref())?;
     let retry_policy = parse_retry_policy(
@@ -1148,13 +1125,8 @@ async fn set_routine_enabled(
         context.principal.as_str(),
     )
     .await?;
-    let guarded_approval_policy = routine_approval_policy_with_auto_enable_guard(
-        routine.job.schedule_type,
-        routine.job.schedule_payload_json.as_str(),
-        routine.metadata.approval_policy.clone(),
-    );
     let approval_required = enabled
-        && guarded_approval_policy.mode == RoutineApprovalMode::BeforeEnable
+        && routine.metadata.approval_policy.mode == RoutineApprovalMode::BeforeEnable
         && !routine_approval_granted(
             runtime_state,
             routine_approval_subject_id(
@@ -1631,7 +1603,6 @@ async fn dispatch_single_routine(
         Arc::clone(&runtime.scheduler_wake),
         build_cron_trigger_options(
             &execution,
-            &routine.metadata.approval_policy,
             request.dispatch_mode,
             request.source_run_id.as_deref(),
             request.safety_note.as_deref(),
@@ -2093,6 +2064,7 @@ fn routine_view_from_parts(job: &CronJobRecord, metadata: &RoutineMetadataRecord
         "trigger_payload": serde_json::from_str::<Value>(metadata.trigger_payload_json.as_str()).unwrap_or_else(|_| json!({ "raw": metadata.trigger_payload_json })),
         "run_mode": metadata.execution.run_mode.as_str(),
         "execution_posture": metadata.execution.execution_posture.as_str(),
+        "allow_sensitive_tools": routine_allows_sensitive_tools(&metadata.execution),
         "execution_governance": routine_execution_governance_projection(&metadata.execution),
         "procedure_profile_id": metadata.execution.procedure_profile_id,
         "skill_profile_id": metadata.execution.skill_profile_id,
@@ -2213,7 +2185,7 @@ fn routine_approval_details_json(
         "workdir": job.workdir.as_deref(),
         "run_mode": metadata.execution.run_mode.as_str(),
         "execution_posture": metadata.execution.execution_posture.as_str(),
-        "allow_sensitive_tools": routine_allows_sensitive_tools(&metadata.execution, &metadata.approval_policy),
+        "allow_sensitive_tools": routine_allows_sensitive_tools(&metadata.execution),
         "procedure_profile_id": metadata.execution.procedure_profile_id.as_deref(),
         "skill_profile_id": metadata.execution.skill_profile_id.as_deref(),
         "provider_profile_id": metadata.execution.provider_profile_id.as_deref(),
@@ -2543,14 +2515,13 @@ fn build_safe_test_delivery() -> RoutineDeliveryConfig {
 
 fn build_cron_trigger_options(
     execution: &RoutineExecutionConfig,
-    approval_policy: &RoutineApprovalPolicy,
     dispatch_mode: RoutineDispatchMode,
     source_run_id: Option<&str>,
     safety_note: Option<&str>,
 ) -> cron::TriggerJobOptions {
     cron::TriggerJobOptions {
         force_run_mode: Some(execution.run_mode),
-        allow_sensitive_tools: Some(routine_allows_sensitive_tools(execution, approval_policy)),
+        allow_sensitive_tools: Some(routine_allows_sensitive_tools(execution)),
         model_profile_override: execution.provider_profile_id.clone(),
         parameter_delta_json: Some(
             json!({
@@ -2853,18 +2824,16 @@ fn parse_approval_policy(value: Option<&str>) -> Result<RoutineApprovalPolicy, S
     Ok(RoutineApprovalPolicy { mode })
 }
 
-fn default_approval_policy_for_execution(
-    execution: &RoutineExecutionConfig,
-    approval_policy: RoutineApprovalPolicy,
-    _approval_mode_was_requested: bool,
-    _execution_posture_was_requested: bool,
-) -> RoutineApprovalPolicy {
-    if approval_policy.mode == RoutineApprovalMode::None
-        && execution.execution_posture == RoutineExecutionPosture::SensitiveTools
-    {
-        return RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun };
+fn resolve_upsert_approval_policy(
+    payload: &Map<String, Value>,
+    existing_metadata: Option<&RoutineMetadataRecord>,
+) -> Result<RoutineApprovalPolicy, String> {
+    if !payload.contains_key("approval_mode") {
+        if let Some(metadata) = existing_metadata {
+            return Ok(metadata.approval_policy.clone());
+        }
     }
-    approval_policy
+    parse_approval_policy(optional_string_field(payload, "approval_mode").as_deref())
 }
 
 fn normalize_owner_principal(requested: Option<&str>, principal: &str) -> Result<String, String> {
@@ -3266,10 +3235,9 @@ mod tests {
         CronRunStatus, CronScheduleType,
     };
     use crate::routines::{
-        routine_approval_policy_with_auto_enable_guard, RoutineApprovalMode, RoutineApprovalPolicy,
-        RoutineDeliveryConfig, RoutineDeliveryMode, RoutineExecutionConfig,
-        RoutineExecutionPosture, RoutineMetadataRecord, RoutineRunMode, RoutineRunOutcomeKind,
-        RoutineSilentPolicy, RoutineTriggerKind,
+        RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode,
+        RoutineExecutionConfig, RoutineExecutionPosture, RoutineMetadataRecord, RoutineRunMode,
+        RoutineRunOutcomeKind, RoutineSilentPolicy, RoutineTriggerKind,
     };
     use chrono::{Datelike, TimeZone, Timelike};
     use serde_json::{json, Value};
@@ -3521,17 +3489,6 @@ mod tests {
         assert_eq!(schedule_payload["interval_ms"], 30_000);
         assert_eq!(schedule_payload["max_runs"], 2);
         assert_eq!(trigger_payload["last_observed"]["exists"], true);
-        assert_eq!(
-            routine_approval_policy_with_auto_enable_guard(
-                schedule.schedule_type,
-                schedule.schedule_payload_json.as_str(),
-                RoutineApprovalPolicy { mode: RoutineApprovalMode::None },
-            )
-            .mode,
-            RoutineApprovalMode::BeforeEnable,
-            "file-watch poll schedules below the auto-enable floor require approval"
-        );
-
         let _ = fs::remove_file(watched_path);
     }
 
@@ -3909,37 +3866,38 @@ mod tests {
     }
 
     #[test]
-    fn default_approval_policy_requires_first_run_for_implicit_sensitive_tools() {
-        let execution = RoutineExecutionConfig {
-            run_mode: RoutineRunMode::FreshSession,
-            execution_posture: RoutineExecutionPosture::SensitiveTools,
-            ..RoutineExecutionConfig::default()
-        };
-        let approval_policy = super::default_approval_policy_for_execution(
-            &execution,
-            RoutineApprovalPolicy { mode: RoutineApprovalMode::None },
-            false,
-            false,
-        );
+    fn resolve_upsert_approval_policy_defaults_new_sensitive_routines_to_none() {
+        let payload = json!({
+            "execution_posture": "sensitive_tools",
+        })
+        .as_object()
+        .expect("payload should be an object")
+        .clone();
 
-        assert_eq!(approval_policy.mode, RoutineApprovalMode::BeforeFirstRun);
+        let approval_policy = super::resolve_upsert_approval_policy(&payload, None)
+            .expect("omitted approval should use the approval-free default");
+
+        assert_eq!(approval_policy.mode, RoutineApprovalMode::None);
     }
 
     #[test]
-    fn default_approval_policy_requires_first_run_for_explicit_sensitive_tools() {
-        let execution = RoutineExecutionConfig {
-            run_mode: RoutineRunMode::FreshSession,
-            execution_posture: RoutineExecutionPosture::SensitiveTools,
-            ..RoutineExecutionConfig::default()
-        };
-        let approval_policy = super::default_approval_policy_for_execution(
-            &execution,
-            RoutineApprovalPolicy { mode: RoutineApprovalMode::None },
-            false,
-            true,
-        );
+    fn resolve_upsert_approval_policy_preserves_and_clears_explicit_safe_mode() {
+        let mut metadata = test_routine_metadata();
+        metadata.approval_policy =
+            RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun };
+        let omitted = json!({}).as_object().expect("payload should be an object").clone();
+        let cleared = json!({ "approval_mode": "none" })
+            .as_object()
+            .expect("payload should be an object")
+            .clone();
 
-        assert_eq!(approval_policy.mode, RoutineApprovalMode::BeforeFirstRun);
+        let preserved = super::resolve_upsert_approval_policy(&omitted, Some(&metadata))
+            .expect("omitted approval should preserve an existing explicit safe mode");
+        let cleared = super::resolve_upsert_approval_policy(&cleared, Some(&metadata))
+            .expect("explicit none should clear an existing safe mode");
+
+        assert_eq!(preserved.mode, RoutineApprovalMode::BeforeFirstRun);
+        assert_eq!(cleared.mode, RoutineApprovalMode::None);
     }
 
     fn test_cron_job(

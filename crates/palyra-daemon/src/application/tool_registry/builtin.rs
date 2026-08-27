@@ -625,7 +625,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.routines.control",
-            "Create, update, pause, resume, delete, or manually dispatch routines through the approval-aware runtime. For new reminders and monitors, omit routine_id and use operation=upsert with trigger_kind=schedule, name, prompt, and structured schedule fields (schedule_type plus every_interval_ms, cron_expression, at_timestamp_rfc3339, or delay_ms) when the requested timing is clear. For one-shot relative requests like 'in 30 seconds', prefer schedule_type=at with delay_ms so the daemon computes a future timestamp at execution time. Use operation=delete with routine_id when the user asks to remove a routine or clean up a temporary routine after a test. Pass timezone=local, utc, or an IANA timezone such as Europe/Prague when the user gives local wall-clock timing. natural_language_schedule accepts a small English convenience grammar such as 'every 30 minutes' or 'every 40 seconds'. Set max_runs when the user asks for an explicit run cap. For standing orders tied to an absolute user-owned OS file path, use trigger_kind=file_watch with trigger_payload.path and optional trigger_payload.poll_interval_ms. Use workdir for a scheduled project root that future runs should treat as their cwd and output base. Scheduled routines with workdir default to sensitive-tools posture for unattended file/process work. File-watch routines default to fresh sessions and sensitive-tools posture because follow-up work often needs audited OS file tools. Routines with execution_posture=sensitive_tools require approval_mode=before_enable or before_first_run; omitted or none approval is upgraded to before_first_run.",
+            "Create, update, pause, resume, delete, or manually dispatch routines through the approval-aware runtime. For new reminders and monitors, omit routine_id and use operation=upsert with trigger_kind=schedule, name, prompt, and structured schedule fields (schedule_type plus every_interval_ms, cron_expression, at_timestamp_rfc3339, or delay_ms) when the requested timing is clear. For one-shot relative requests like 'in 30 seconds', prefer schedule_type=at with delay_ms so the daemon computes a future timestamp at execution time. Use operation=delete with routine_id when the user asks to remove a routine or clean up a temporary routine after a test. Pass timezone=local, utc, or an IANA timezone such as Europe/Prague when the user gives local wall-clock timing. natural_language_schedule accepts a small English convenience grammar such as 'every 30 minutes' or 'every 40 seconds'. Set max_runs when the user asks for an explicit run cap. For standing orders tied to an absolute user-owned OS file path, use trigger_kind=file_watch with trigger_payload.path and optional trigger_payload.poll_interval_ms. Use workdir for a scheduled project root that future runs should treat as their cwd and output base. Scheduled routines with workdir default to sensitive-tools posture for unattended file/process work. File-watch routines default to fresh sessions and sensitive-tools posture because follow-up work often needs audited OS file tools. Approval mode defaults to none for every execution posture; set before_enable or before_first_run only when the operator explicitly requests an interactive safe mode.",
             object_schema(
                 &["operation"],
                 vec![
@@ -681,7 +681,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "execution_posture",
-                        json!({"type":"string","enum":["standard","sensitive_tools"],"description":"Use sensitive_tools only when a routine needs audited sensitive tools during scheduled or manual runs; this posture requires before_enable or before_first_run approval."}),
+                        json!({"type":"string","enum":["standard","sensitive_tools"],"description":"Use sensitive_tools only when a routine needs audited sensitive tools during scheduled or manual runs. Approval remains independently opt-in."}),
                     ),
                     (
                         "execution_governance",
@@ -762,7 +762,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "approval_mode",
-                        json!({"type":"string","enum":["none","before_enable","before_first_run"],"description":"Approval gate for routine activation. Use before_enable or before_first_run with execution_posture=sensitive_tools; none is only for standard routines."}),
+                        json!({"type":"string","enum":["none","before_enable","before_first_run"],"description":"Optional safe-mode gate for routine activation or first execution. Defaults to none for every execution posture."}),
                     ),
                     ("enabled", json!({"type":"boolean"})),
                 ],

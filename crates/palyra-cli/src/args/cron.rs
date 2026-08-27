@@ -113,13 +113,13 @@ pub enum CronCommand {
         #[arg(
             long,
             value_enum,
-            help = "Tool posture for scheduled runs; when omitted, jobs with --workdir default to sensitive-tools with enable approval"
+            help = "Tool posture for scheduled runs; when omitted, jobs with --workdir default to sensitive-tools and approvals remain opt-in"
         )]
         execution_posture: Option<RoutineExecutionPostureArg>,
         #[arg(
             long,
             value_enum,
-            help = "Approval gate for enabling or first-running this job; when omitted, sensitive-tool jobs default to before-enable"
+            help = "Optional safe-mode gate for enabling or first-running this job; omitted defaults to none for every execution posture"
         )]
         approval_mode: Option<RoutineApprovalModeArg>,
         #[arg(long, default_value_t = false)]

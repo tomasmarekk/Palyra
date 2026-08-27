@@ -15343,7 +15343,7 @@ mod init_command_tests {
         );
         assert!(
             allowed_tools.iter().any(|tool| tool == "palyra.routines.control"),
-            "local init should expose approval-gated routine creation for autonomous monitors"
+            "local init should expose routine creation for autonomous monitors"
         );
         assert!(
             allowed_tools.iter().any(|tool| tool == "palyra.http.fetch"),

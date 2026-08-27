@@ -2678,7 +2678,7 @@ fn scheduled_routine_approval_details_json(
         "workdir": job.workdir.as_deref(),
         "run_mode": routine.execution.run_mode.as_str(),
         "execution_posture": routine.execution.execution_posture.as_str(),
-        "allow_sensitive_tools": routine_allows_sensitive_tools(&routine.execution, &routine.approval_policy),
+        "allow_sensitive_tools": routine_allows_sensitive_tools(&routine.execution),
         "procedure_profile_id": routine.execution.procedure_profile_id.as_deref(),
         "skill_profile_id": routine.execution.skill_profile_id.as_deref(),
         "provider_profile_id": routine.execution.provider_profile_id.as_deref(),
@@ -3735,9 +3735,7 @@ fn build_effective_cron_execution_request(
         .or_else(|| execution.map(|config| config.run_mode))
         .unwrap_or(RoutineRunMode::SameSession);
     let allow_sensitive_tools = options.allow_sensitive_tools.unwrap_or_else(|| {
-        routine.as_ref().is_some_and(|record| {
-            routine_allows_sensitive_tools(&record.execution, &record.approval_policy)
-        })
+        routine.as_ref().is_some_and(|record| routine_allows_sensitive_tools(&record.execution))
     });
     let model_profile_override = options
         .model_profile_override
