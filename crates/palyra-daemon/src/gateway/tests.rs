@@ -785,8 +785,10 @@ async fn process_runner_workspace_alias_subpaths_keep_configured_root() {
 async fn workspace_list_dir_prefers_launch_root_for_top_level_discovery_over_reports_focus() {
     let state = build_test_runtime_state(false);
     let tempdir = gateway_tempdir("gateway-");
-    let workspace = tempdir.path().join("workspace");
+    let configured_workspace = tempdir.path().join("state").join("workspace");
+    let workspace = tempdir.path().join("scenario").join("workspace");
     let reports = workspace.join("reports");
+    fs::create_dir_all(configured_workspace.as_path()).expect("configured workspace should exist");
     fs::create_dir_all(reports.as_path()).expect("reports directory should exist");
     fs::write(workspace.join("slow-report.js"), "console.log('slow');\n")
         .expect("workspace script should exist");
@@ -798,7 +800,7 @@ async fn workspace_list_dir_prefers_launch_root_for_top_level_discovery_over_rep
             agent_id: "workspace-launch-root".to_owned(),
             display_name: "Workspace Launch Root".to_owned(),
             agent_dir: None,
-            workspace_roots: vec![workspace.to_string_lossy().into_owned()],
+            workspace_roots: vec![configured_workspace.to_string_lossy().into_owned()],
             default_model_profile: None,
             execution_backend_preference: None,
             default_tool_allowlist: Vec::new(),
@@ -17949,7 +17951,9 @@ async fn project_memory_defaults_to_launch_workspace_prefix() {
     let context = routines_tool_test_context();
 
     let tempdir = gateway_tempdir("gateway-");
+    let configured_root = tempdir.path().join("state").join("workspace");
     let project_root = tempdir.path().join("client-portal");
+    fs::create_dir_all(configured_root.as_path()).expect("configured root should be created");
     fs::create_dir_all(project_root.as_path()).expect("project root should be created");
     let project_root_text = project_root.to_string_lossy().into_owned();
     state
@@ -17957,7 +17961,7 @@ async fn project_memory_defaults_to_launch_workspace_prefix() {
             agent_id: "project-memory-launch-root".to_owned(),
             display_name: "Project Memory Launch Root".to_owned(),
             agent_dir: None,
-            workspace_roots: vec![project_root_text.clone()],
+            workspace_roots: vec![configured_root.to_string_lossy().into_owned()],
             default_model_profile: None,
             execution_backend_preference: None,
             default_tool_allowlist: Vec::new(),
@@ -19742,7 +19746,7 @@ async fn workspace_patch_tool_does_not_re_root_missing_paths_under_file_focus() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn workspace_patch_tool_ignores_launch_root_outside_agent_workspace() {
+async fn workspace_patch_tool_uses_operator_launch_root_outside_agent_workspace() {
     let state = build_test_runtime_state(false);
     let harness_root = gateway_tempdir("gateway-");
     let configured = harness_root.path().join("state").join("workspace");
@@ -19817,18 +19821,14 @@ async fn workspace_patch_tool_ignores_launch_root_outside_agent_workspace() {
     )
     .await;
 
+    assert!(outcome.success, "patch tool should apply at the launch workspace: {}", outcome.error);
     assert!(
-        outcome.success,
-        "patch tool should apply at the configured workspace: {}",
-        outcome.error
+        scenario_workspace.join("reports").join("workspace-report.md").exists(),
+        "authenticated launch metadata must bind /workspace to the invocation directory"
     );
     assert!(
-        !scenario_workspace.join("reports").join("workspace-report.md").exists(),
-        "caller-supplied launch metadata must not extend the agent workspace boundary"
-    );
-    assert!(
-        configured.join("reports").join("workspace-report.md").exists(),
-        "/workspace must stay bound to the configured agent workspace"
+        !configured.join("reports").join("workspace-report.md").exists(),
+        "the hidden configured workspace must not receive invocation-project patches"
     );
 }
 
