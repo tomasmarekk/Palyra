@@ -17135,6 +17135,47 @@ impl GatewayRuntimeState {
         Ok(deleted)
     }
 
+    /// Atomically deletes a cron job and invalidates pending approvals for its
+    /// exact lifecycle subjects.
+    ///
+    /// # Errors
+    /// Returns the mapped cron/approval store error, or `internal` if the
+    /// worker panicked.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub(crate) async fn delete_cron_job_and_invalidate_pending_approvals(
+        self: &Arc<Self>,
+        job_id: String,
+        principal: String,
+        subject_type: ApprovalSubjectType,
+        subject_ids: Vec<String>,
+        reason: String,
+    ) -> Result<(bool, Vec<ApprovalRecord>), Status> {
+        let state = Arc::clone(self);
+        let (deleted, invalidated) = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .delete_cron_job_and_invalidate_pending_approvals(
+                    job_id.as_str(),
+                    principal.as_str(),
+                    subject_type,
+                    subject_ids.as_slice(),
+                    reason.as_str(),
+                )
+                .map_err(|error| {
+                    map_cron_store_error("delete cron job and invalidate approvals", error)
+                })
+        })
+        .await
+        .map_err(|_| Status::internal("cron delete worker panicked"))??;
+        if deleted {
+            self.counters.cron_jobs_deleted.fetch_add(1, Ordering::Relaxed);
+        }
+        if !invalidated.is_empty() {
+            self.orchestrator_run_notify.notify_waiters();
+        }
+        Ok((deleted, invalidated))
+    }
+
     #[allow(clippy::result_large_err)]
     fn cron_job_blocking(&self, job_id: &str) -> Result<Option<CronJobRecord>, Status> {
         self.journal_store

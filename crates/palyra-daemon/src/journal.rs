@@ -248,6 +248,7 @@ const MAX_CRON_JOBS_LIST_LIMIT: usize = 500;
 const MAX_CRON_RUNS_LIST_LIMIT: usize = 500;
 const MAX_APPROVALS_LIST_LIMIT: usize = 500;
 const MAX_APPROVALS_QUERY_LIMIT: usize = MAX_APPROVALS_LIST_LIMIT + 1;
+const MAX_APPROVAL_INVALIDATION_SUBJECTS: usize = 32;
 const MAX_MEMORY_ITEMS_LIST_LIMIT: usize = 500;
 const MAX_MEMORY_SEARCH_CANDIDATES: usize = 256;
 const MAX_MEMORY_VECTOR_SCAN_CANDIDATES: usize = 1_024;
@@ -23842,25 +23843,52 @@ impl JournalStore {
     pub fn delete_cron_job(&self, job_id: &str) -> Result<bool, JournalError> {
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction()?;
-        let active_runs = transaction.query_row(
-            r#"
-                SELECT COUNT(*)
-                FROM cron_runs
-                WHERE job_ulid = ?1
-                  AND status IN ('accepted', 'running')
-            "#,
-            params![job_id],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if active_runs > 0 {
-            return Err(JournalError::CronJobHasActiveRuns { job_id: job_id.to_owned() });
-        }
-
-        transaction.execute("DELETE FROM cron_runs WHERE job_ulid = ?1", params![job_id])?;
-        let deleted =
-            transaction.execute("DELETE FROM cron_jobs WHERE job_ulid = ?1", params![job_id])?;
+        let deleted = delete_cron_job_tx(&transaction, job_id)?;
         transaction.commit()?;
-        Ok(deleted > 0)
+        Ok(deleted)
+    }
+
+    /// Atomically deletes a cron job and invalidates its pending approval
+    /// subjects for the owning principal.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::CronJobHasActiveRuns`] if a run is still active,
+    /// [`JournalError::InvalidArgument`] for invalid approval subjects, or
+    /// [`JournalError`] on storage failure.
+    pub fn delete_cron_job_and_invalidate_pending_approvals(
+        &self,
+        job_id: &str,
+        principal: &str,
+        subject_type: ApprovalSubjectType,
+        subject_ids: &[String],
+        reason: &str,
+    ) -> Result<(bool, Vec<ApprovalRecord>), JournalError> {
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Err(JournalError::InvalidArgument(
+                "approval invalidation principal cannot be empty".to_owned(),
+            ));
+        }
+        let subject_ids = normalize_approval_invalidation_subjects(subject_ids)?;
+        let reason = sanitize_object_text_field("reason", reason)?;
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = delete_cron_job_tx(&transaction, job_id)?;
+        let invalidated = if deleted {
+            invalidate_pending_approvals_for_subjects_tx(
+                &transaction,
+                principal,
+                subject_type,
+                &subject_ids,
+                reason.as_str(),
+                now,
+            )?
+        } else {
+            Vec::new()
+        };
+        transaction.commit()?;
+        Ok((deleted, invalidated))
     }
 
     /// Returns a cron job, or `None` if absent.
@@ -33290,6 +33318,121 @@ fn load_cron_run_by_id(
         "#,
     )?;
     statement.query_row(params![run_id], map_cron_run_row).optional().map_err(Into::into)
+}
+
+fn delete_cron_job_tx(transaction: &Transaction<'_>, job_id: &str) -> Result<bool, JournalError> {
+    let active_runs = transaction.query_row(
+        r#"
+            SELECT COUNT(*)
+            FROM cron_runs
+            WHERE job_ulid = ?1
+              AND status IN ('accepted', 'running')
+        "#,
+        params![job_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if active_runs > 0 {
+        return Err(JournalError::CronJobHasActiveRuns { job_id: job_id.to_owned() });
+    }
+
+    transaction.execute("DELETE FROM cron_runs WHERE job_ulid = ?1", params![job_id])?;
+    let deleted =
+        transaction.execute("DELETE FROM cron_jobs WHERE job_ulid = ?1", params![job_id])?;
+    Ok(deleted > 0)
+}
+
+fn normalize_approval_invalidation_subjects(
+    subject_ids: &[String],
+) -> Result<BTreeSet<&str>, JournalError> {
+    if subject_ids.len() > MAX_APPROVAL_INVALIDATION_SUBJECTS {
+        return Err(JournalError::InvalidArgument(format!(
+            "approval invalidation supports at most {MAX_APPROVAL_INVALIDATION_SUBJECTS} subjects"
+        )));
+    }
+    let subject_ids =
+        subject_ids.iter().map(|subject_id| subject_id.trim()).collect::<BTreeSet<_>>();
+    if subject_ids.iter().any(|subject_id| subject_id.is_empty()) {
+        return Err(JournalError::InvalidArgument(
+            "approval invalidation subjects cannot be empty".to_owned(),
+        ));
+    }
+    Ok(subject_ids)
+}
+
+fn invalidate_pending_approvals_for_subjects_tx(
+    transaction: &Transaction<'_>,
+    principal: &str,
+    subject_type: ApprovalSubjectType,
+    subject_ids: &BTreeSet<&str>,
+    reason: &str,
+    now: i64,
+) -> Result<Vec<ApprovalRecord>, JournalError> {
+    let mut approval_ids = Vec::new();
+    {
+        let mut statement = transaction.prepare(
+            r#"
+                SELECT approval_ulid
+                FROM approvals
+                WHERE principal = ?1
+                    AND subject_type = ?2
+                    AND subject_id = ?3
+                    AND decision IS NULL
+                ORDER BY approval_ulid ASC
+            "#,
+        )?;
+        for subject_id in subject_ids {
+            let mut rows =
+                statement.query(params![principal, subject_type.as_str(), subject_id])?;
+            while let Some(row) = rows.next()? {
+                approval_ids.push(row.get::<_, String>(0)?);
+            }
+        }
+    }
+
+    let mut invalidated = Vec::with_capacity(approval_ids.len());
+    for approval_id in approval_ids {
+        let updated = transaction.execute(
+            r#"
+                UPDATE approvals
+                SET
+                    decision = 'deny',
+                    decision_scope = 'once',
+                    decision_reason = ?2,
+                    decision_scope_ttl_ms = NULL,
+                    resolved_at_unix_ms = ?3,
+                    updated_at_unix_ms = ?3
+                WHERE approval_ulid = ?1
+                    AND decision IS NULL
+            "#,
+            params![approval_id, reason, now],
+        )?;
+        if updated == 0 {
+            continue;
+        }
+        let record = load_approval_by_id(transaction, approval_id.as_str())?
+            .ok_or_else(|| JournalError::ApprovalNotFound { approval_id: approval_id.clone() })?;
+        startup_recovery::materialize_startup_recovery_resolution_tx(transaction, &record, now)?;
+        wait_coordinator::emit_wake_event_tx(
+            transaction,
+            &wait_coordinator::WakeEventRequest {
+                source_event_id: format!("wake:approval:{approval_id}:deny"),
+                source_kind: wait_coordinator::WaitBarrierKind::Approval.as_str().to_owned(),
+                source_id: approval_id,
+                source_generation: 1,
+                reason_code: "wake.approval.invalidated".to_owned(),
+                evidence_json: json!({
+                    "schema_version": 1,
+                    "approval_id": record.approval_id,
+                    "decision": "deny",
+                    "invalidation_reason": reason,
+                })
+                .to_string(),
+                occurred_at_unix_ms: now,
+            },
+        )?;
+        invalidated.push(record);
+    }
+    Ok(invalidated)
 }
 
 fn map_approval_row(row: &rusqlite::Row<'_>) -> Result<ApprovalRecord, rusqlite::Error> {
@@ -54715,6 +54858,92 @@ mod tests {
 
         assert_eq!(denied.decision, Some(ApprovalDecision::Allow));
         assert_eq!(denied.decision_reason.as_deref(), Some("approved_by_external_console"));
+    }
+
+    #[test]
+    fn cron_delete_atomically_invalidates_pending_approval_subjects() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let job = store
+            .create_cron_job(&sample_cron_job_request("01ARZ3NDEKTSV4RRFFQ69G5FC8"))
+            .expect("cron job should be inserted");
+        let before_enable = "routine:01ARZ3NDEKTSV4RRFFQ69G5FC1:before_enable";
+        let before_first_run = "routine:01ARZ3NDEKTSV4RRFFQ69G5FC1:before_first_run";
+        let cases = [
+            ("01ARZ3NDEKTSV4RRFFQ69G5FC2", before_enable, "user:ops"),
+            ("01ARZ3NDEKTSV4RRFFQ69G5FC3", before_first_run, "user:ops"),
+            ("01ARZ3NDEKTSV4RRFFQ69G5FC4", before_first_run, "user:ops"),
+            ("01ARZ3NDEKTSV4RRFFQ69G5FC5", before_enable, "user:other"),
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5FC6",
+                "routine:01ARZ3NDEKTSV4RRFFQ69G5FC7:before_enable",
+                "user:ops",
+            ),
+        ];
+        for (approval_id, subject_id, principal) in cases {
+            let mut request = sample_approval_request(approval_id);
+            request.principal = principal.to_owned();
+            request.subject_id = subject_id.to_owned();
+            request.prompt.subject_id = subject_id.to_owned();
+            store.create_approval(&request).expect("approval create should persist");
+        }
+        store
+            .resolve_approval(&ApprovalResolveRequest {
+                approval_id: "01ARZ3NDEKTSV4RRFFQ69G5FC4".to_owned(),
+                decision: ApprovalDecision::Allow,
+                decision_scope: ApprovalDecisionScope::Once,
+                decision_reason: "operator_allowed_before_delete".to_owned(),
+                decision_scope_ttl_ms: None,
+            })
+            .expect("existing approval decision should persist");
+
+        let (deleted, invalidated) = store
+            .delete_cron_job_and_invalidate_pending_approvals(
+                job.job_id.as_str(),
+                "user:ops",
+                ApprovalSubjectType::Tool,
+                &[before_enable.to_owned(), before_first_run.to_owned(), before_enable.to_owned()],
+                "routine_deleted_before_approval_resolution",
+            )
+            .expect("routine approval invalidation should commit");
+
+        assert!(deleted, "cron job should be deleted in the invalidation transaction");
+        assert!(
+            store.cron_job(job.job_id.as_str()).expect("cron job lookup should succeed").is_none(),
+            "committed lifecycle cleanup must remove the cron job"
+        );
+        assert_eq!(
+            invalidated.iter().map(|record| record.approval_id.as_str()).collect::<Vec<_>>(),
+            vec!["01ARZ3NDEKTSV4RRFFQ69G5FC2", "01ARZ3NDEKTSV4RRFFQ69G5FC3",]
+        );
+        assert!(invalidated.iter().all(|record| {
+            record.decision == Some(ApprovalDecision::Deny)
+                && record.decision_scope == Some(ApprovalDecisionScope::Once)
+                && record.decision_reason.as_deref()
+                    == Some("routine_deleted_before_approval_resolution")
+                && record.resolved_at_unix_ms.is_some()
+        }));
+        assert_eq!(
+            store
+                .approval("01ARZ3NDEKTSV4RRFFQ69G5FC4")
+                .expect("resolved approval lookup should succeed")
+                .expect("resolved approval should exist")
+                .decision,
+            Some(ApprovalDecision::Allow),
+            "invalidation must preserve an existing operator decision"
+        );
+        for approval_id in ["01ARZ3NDEKTSV4RRFFQ69G5FC5", "01ARZ3NDEKTSV4RRFFQ69G5FC6"] {
+            assert!(
+                store
+                    .approval(approval_id)
+                    .expect("unrelated approval lookup should succeed")
+                    .expect("unrelated approval should exist")
+                    .decision
+                    .is_none(),
+                "foreign and unrelated pending approvals must remain unchanged"
+            );
+        }
     }
 
     #[test]

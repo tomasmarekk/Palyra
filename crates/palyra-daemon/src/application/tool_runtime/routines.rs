@@ -1226,8 +1226,13 @@ async fn delete_routine(
         .update_cron_job(routine.job.job_id.clone(), routine_delete_cleanup_patch())
         .await
         .map_err(sanitize_status_message)?;
-    let deleted = runtime_state
-        .delete_cron_job(routine.job.job_id.clone())
+    let (deleted, invalidated_pending_approvals) =
+        cron::delete_cron_job_and_invalidate_pending_routine_approvals(
+            runtime_state,
+            routine.job.job_id.as_str(),
+            routine.metadata.routine_id.as_str(),
+            context.principal.as_str(),
+        )
         .await
         .map_err(sanitize_status_message)?;
     let _ = runtime
@@ -1239,6 +1244,7 @@ async fn delete_routine(
         "operation": "delete",
         "deleted": deleted,
         "routine_id": routine.metadata.routine_id,
+        "invalidated_pending_approvals": invalidated_pending_approvals,
     }))
 }
 

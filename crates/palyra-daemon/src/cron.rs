@@ -2588,6 +2588,32 @@ fn routine_approval_subject_id(routine_id: &str, mode: RoutineApprovalMode) -> S
     format!("routine:{routine_id}:{}", mode.as_str())
 }
 
+/// Deletes a routine's cron job while invalidating every pending approval
+/// generation that can belong to it.
+///
+/// Both approval modes are included because a routine may retain a pending
+/// request from an earlier configuration revision.
+pub(crate) async fn delete_cron_job_and_invalidate_pending_routine_approvals(
+    state: &Arc<GatewayRuntimeState>,
+    job_id: &str,
+    routine_id: &str,
+    owner_principal: &str,
+) -> Result<(bool, usize), Status> {
+    let subject_ids = [RoutineApprovalMode::BeforeEnable, RoutineApprovalMode::BeforeFirstRun]
+        .map(|mode| routine_approval_subject_id(routine_id, mode))
+        .to_vec();
+    state
+        .delete_cron_job_and_invalidate_pending_approvals(
+            job_id.to_owned(),
+            owner_principal.to_owned(),
+            ApprovalSubjectType::Tool,
+            subject_ids,
+            "routine_deleted_before_approval_resolution".to_owned(),
+        )
+        .await
+        .map(|(deleted, invalidated)| (deleted, invalidated.len()))
+}
+
 /// Schedule and file-watch routines are autonomous recurring jobs, so they
 /// honor the before-first-run approval gate; manual routines are gated by the
 /// manual dispatch path instead.

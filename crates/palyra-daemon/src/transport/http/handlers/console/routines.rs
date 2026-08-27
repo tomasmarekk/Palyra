@@ -688,9 +688,13 @@ pub(crate) async fn console_routine_delete_handler(
         session.context.principal.as_str(),
     )
     .await?;
-    let deleted = state
-        .runtime
-        .delete_cron_job(routine.job.job_id.clone())
+    let (deleted, invalidated_pending_approvals) =
+        cron::delete_cron_job_and_invalidate_pending_routine_approvals(
+            &state.runtime,
+            routine.job.job_id.as_str(),
+            routine.metadata.routine_id.as_str(),
+            session.context.principal.as_str(),
+        )
         .await
         .map_err(runtime_status_response)?;
     let _ = state
@@ -700,6 +704,7 @@ pub(crate) async fn console_routine_delete_handler(
     Ok(Json(json!({
         "deleted": deleted,
         "routine_id": routine.metadata.routine_id,
+        "invalidated_pending_approvals": invalidated_pending_approvals,
     })))
 }
 
