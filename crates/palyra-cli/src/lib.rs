@@ -795,7 +795,11 @@ const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.process.status",
     "palyra.process.list",
 ];
-const LOCAL_DESKTOP_DEFAULT_PROCESS_EXECUTABLES: &[&str] = &["pwd", "echo", "ls", "dir"];
+// Local desktop is the operator's agentic host profile, so executable and
+// interpreter access is usable by default. Workspace/approved-root scoping,
+// protected OS paths, resource limits, and explicit restrictive profiles
+// remain the security boundaries.
+const LOCAL_DESKTOP_DEFAULT_PROCESS_EXECUTABLES: &[&str] = &["*"];
 
 fn build_init_config_document(
     mode: InitMode,
@@ -992,7 +996,7 @@ fn apply_local_desktop_tool_defaults(
     set_value_at_path(
         document,
         "tool_call.process_runner.path_access_mode",
-        toml::Value::String("workspace_only".to_owned()),
+        toml::Value::String("approved_roots".to_owned()),
     )?;
     set_value_at_path(
         document,
@@ -1002,12 +1006,12 @@ fn apply_local_desktop_tool_defaults(
     set_value_at_path(
         document,
         "tool_call.process_runner.allow_interpreters",
-        toml::Value::Boolean(false),
+        toml::Value::Boolean(true),
     )?;
     set_value_at_path(
         document,
         "tool_call.process_runner.egress_enforcement_mode",
-        toml::Value::String("preflight".to_owned()),
+        toml::Value::String("none".to_owned()),
     )?;
     set_value_at_path(
         document,
@@ -15413,17 +15417,14 @@ mod init_command_tests {
             !has_path(&document, "tool_call.http_fetch.credential_bindings"),
             "local init must not write implicit HTTP credential recipient bindings"
         );
-        assert_eq!(
-            read_bool(&document, "tool_call.process_runner.allow_interpreters"),
-            Some(false)
-        );
+        assert_eq!(read_bool(&document, "tool_call.process_runner.allow_interpreters"), Some(true));
         assert_eq!(
             read_string(&document, "tool_call.process_runner.egress_enforcement_mode").as_deref(),
-            Some("preflight")
+            Some("none")
         );
         assert_eq!(
             read_string(&document, "tool_call.process_runner.path_access_mode").as_deref(),
-            Some("workspace_only")
+            Some("approved_roots")
         );
         assert_eq!(
             read_integer(&document, "tool_call.process_runner.cpu_time_limit_ms"),
@@ -15445,7 +15446,7 @@ mod init_command_tests {
         );
         assert_eq!(
             read_string_array(&document, "tool_call.process_runner.allowed_executables"),
-            vec!["pwd".to_owned(), "echo".to_owned(), "ls".to_owned(), "dir".to_owned()]
+            vec!["*".to_owned()]
         );
     }
 
