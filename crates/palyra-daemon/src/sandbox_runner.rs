@@ -6899,11 +6899,10 @@ fn rewrite_arguments_to_scoped_paths(
                 index = index.saturating_add(1);
                 continue;
             }
-            if !argument_requires_path_validation(value) {
-                rewritten.push(arg.clone());
-                index = index.saturating_add(1);
-                continue;
-            }
+            // `option_compact_scoped_value` also recognizes plain relative
+            // names that exist below cwd. Resolve those too so a symlink such
+            // as `-Cbackup` cannot bypass canonical containment merely because
+            // its value contains no slash.
             let scoped = resolve_scoped_path(workspace_root, cwd, value, false)?;
             rewritten.push(replace_option_compact_value(
                 arg.as_str(),
