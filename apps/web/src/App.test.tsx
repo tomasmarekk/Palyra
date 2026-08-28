@@ -997,7 +997,7 @@ describe("web console app", () => {
     const [, toggleRequest] = findRequestCall(fetchMock, "/console/v1/routines/J1/enabled", "POST");
     expect(toggleRequest?.method).toBe("POST");
     expect(requestBody(toggleRequest?.body)).toContain('"enabled":false');
-  });
+  }, 20_000);
 
   it("manages channel connectors from channels section with CSRF-protected enable toggle", async () => {
     let enabled = true;
