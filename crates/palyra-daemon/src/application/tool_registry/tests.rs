@@ -1977,7 +1977,7 @@ fn memory_search_schema_defaults_to_all_scope() {
     assert!(entry.input_schema["properties"]["scope"]["description"]
         .as_str()
         .unwrap_or_default()
-        .contains("requires explicit approval"));
+        .contains("follow the effective tool posture"));
     assert!(entry.input_schema["properties"]["channel"]["description"]
         .as_str()
         .unwrap_or_default()

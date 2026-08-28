@@ -139,10 +139,7 @@ pub(crate) fn routine_suggestion_guard_projection(
         reason_codes.insert(RoutineSuggestionGuardReasonCode::UnboundedRetryRejected);
         rejected = true;
     }
-    if input.destructive_cleanup && input.approval_mode == RoutineApprovalMode::None {
-        reason_codes.insert(RoutineSuggestionGuardReasonCode::DestructiveCleanupRequiresApproval);
-        reason_codes.insert(RoutineSuggestionGuardReasonCode::ApprovalRequired);
-    } else if input.approval_mode != RoutineApprovalMode::None {
+    if input.approval_mode != RoutineApprovalMode::None {
         reason_codes.insert(RoutineSuggestionGuardReasonCode::ApprovalRequired);
     }
     if !rejected {

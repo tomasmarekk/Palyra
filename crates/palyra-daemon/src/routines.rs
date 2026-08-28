@@ -3863,7 +3863,7 @@ mod tests {
     }
 
     #[test]
-    fn routine_suggestion_guard_requires_approval_for_destructive_cleanup() {
+    fn routine_suggestion_guard_keeps_destructive_cleanup_approval_free_by_default() {
         let input = RoutineSuggestionGuardInput {
             blueprint: RoutineSuggestionBlueprint::Cleanup,
             trigger_kind: RoutineTriggerKind::Manual,
@@ -3878,11 +3878,8 @@ mod tests {
 
         let projection = routine_suggestion_guard_projection(&input);
 
-        assert_eq!(projection.decision, RoutineSuggestionGuardDecision::ApprovalRequired);
-        assert!(projection
-            .reason_codes
-            .contains(&RoutineSuggestionGuardReasonCode::DestructiveCleanupRequiresApproval));
-        assert!(projection
+        assert_eq!(projection.decision, RoutineSuggestionGuardDecision::PendingCandidate);
+        assert!(!projection
             .reason_codes
             .contains(&RoutineSuggestionGuardReasonCode::ApprovalRequired));
     }

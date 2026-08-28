@@ -688,48 +688,6 @@ fn process_runner_accepts_host_path_fields(policy: &SandboxProcessRunnerPolicy) 
     !matches!(process_runner_effective_path_access_mode(policy), PathAccessMode::WorkspaceOnly)
 }
 
-/// Returns whether a valid process proposal describes a destructive filesystem operation.
-///
-/// Classification uses the same workspace and cwd resolution as execution. Invalid proposals
-/// return `false` because the process runner will reject them before spawning.
-pub(crate) fn process_runner_input_requires_user_approval(
-    policy: &SandboxProcessRunnerPolicy,
-    input_json: &[u8],
-) -> bool {
-    let Ok(input) = parse_process_runner_input(input_json) else {
-        return false;
-    };
-    let Ok(workspace_root) = canonical_workspace_root(policy.workspace_root.as_path()) else {
-        return false;
-    };
-    let path_access_mode = process_runner_effective_path_access_mode(policy);
-    let host_access_roots = process_runner_accepts_host_path_fields(policy).then(host_access_roots);
-    let host_access_path_env = process_runner_accepts_host_path_fields(policy)
-        .then(|| host_access_path_env_for_input(&input));
-    let working_directory = match path_access_mode {
-        PathAccessMode::ApprovedRoots => resolve_host_working_directory_with_roots(
-            workspace_root.as_path(),
-            input.cwd.as_deref(),
-            host_access_roots.as_ref().expect("host roots should be initialized").as_slice(),
-            host_access_path_env.as_ref().expect("host path env should be initialized"),
-        ),
-        PathAccessMode::WorkspaceOnly => {
-            resolve_working_directory(workspace_root.as_path(), input.cwd.as_deref())
-        }
-    };
-    let Ok(working_directory) = working_directory else {
-        return false;
-    };
-    classify_process_run(
-        &input,
-        ProcessRiskContext {
-            workspace_root: Some(workspace_root.as_path()),
-            resolved_cwd: Some(working_directory.as_path()),
-        },
-    )
-    .requires_user_approval
-}
-
 type ProcessRunnerInput = ProcessRunnerToolInput;
 
 /// Callback used by run-stream execution to publish foreground process progress.
@@ -14772,33 +14730,6 @@ mod tests {
         )
         .expect_err("drive-relative paths must fail closed");
         assert_eq!(drive_relative_error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
-        let _ = fs::remove_dir_all(workspace.as_path());
-    }
-
-    #[test]
-    fn destructive_process_proposals_require_approval_before_execution() {
-        let workspace = unique_temp_dir("workspace-process-risk-approval");
-        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
-        fs::write(workspace.join("cleanup.py"), b"import shutil\nshutil.rmtree('generated')\n")
-            .expect("cleanup script should be written");
-        let canonical_workspace = canonical_workspace_root(workspace.as_path())
-            .expect("workspace root should canonicalize");
-        let policy =
-            sandbox_policy_with_allowed_executables(canonical_workspace, vec!["git".to_owned()]);
-
-        assert!(super::process_runner_input_requires_user_approval(
-            &policy,
-            br#"{"command":"git","args":["clean","-ffd","-x","--","generated"]}"#
-        ));
-        assert!(super::process_runner_input_requires_user_approval(
-            &policy,
-            br#"{"command":"python","args":["cleanup.py"]}"#
-        ));
-        assert!(!super::process_runner_input_requires_user_approval(
-            &policy,
-            br#"{"command":"git","args":["status","--untracked-files=all"]}"#
-        ));
-
         let _ = fs::remove_dir_all(workspace.as_path());
     }
 

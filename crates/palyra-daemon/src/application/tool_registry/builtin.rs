@@ -167,14 +167,14 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.memory.search",
-            "Search Palyra lifecycle memory and, with explicit approval, workspace/project documents; returns redacted hits.",
+            "Search Palyra lifecycle memory and workspace/project documents under the effective tool posture; returns redacted hits.",
             object_schema(
                 &["query"],
                 vec![
                     ("query", json!({"type":"string","maxLength":8192})),
                     (
                         "scope",
-                        json!({"type":"string","enum":["all","principal","session","channel","workspace","project"],"description":"Defaults to all, which searches durable principal memory plus indexed workspace/project documents and requires explicit approval. Use principal, session, or channel for lifecycle-only search without workspace document reads; workspace/project also require explicit approval."}),
+                        json!({"type":"string","enum":["all","principal","session","channel","workspace","project"],"description":"Defaults to all, which searches durable principal memory plus indexed workspace/project documents. Use principal, session, or channel for lifecycle-only search without workspace document reads; workspace/project follow the effective tool posture."}),
                     ),
                     (
                         "channel",

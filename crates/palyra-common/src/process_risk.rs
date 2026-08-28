@@ -142,11 +142,11 @@ pub struct ProcessRiskReport {
     pub schema_version: u8,
     /// Enforcement posture selected from the detected risk classes.
     pub policy: String,
-    /// True because approval mediation, rather than this classifier, controls execution.
+    /// True because posture and runtime policy, rather than this classifier, control execution.
     pub execution_allowed: bool,
-    /// False because this report requests approval but does not itself make the decision.
+    /// False because this report is advisory and does not itself make the decision.
     pub blocks_execution: bool,
-    /// True only for destructive filesystem operations that require explicit user mediation.
+    /// Compatibility field that remains false because approval is selected by tool posture.
     pub requires_user_approval: bool,
     /// Highest severity across all findings, or `Low` when none were detected.
     pub highest_severity: ProcessRiskSeverity,
@@ -193,20 +193,12 @@ pub fn classify_process_run(
 
     let highest_severity =
         findings.iter().map(|finding| finding.severity).max().unwrap_or(ProcessRiskSeverity::Low);
-    let requires_user_approval = findings
-        .iter()
-        .any(|finding| finding.risk_class == ProcessRiskClass::DestructiveFilesystemOperation);
     ProcessRiskReport {
         schema_version: 1,
-        policy: if requires_user_approval {
-            "approval_required_for_destructive_operations"
-        } else {
-            "advisory_only"
-        }
-        .to_owned(),
+        policy: "advisory_only".to_owned(),
         execution_allowed: true,
         blocks_execution: false,
-        requires_user_approval,
+        requires_user_approval: false,
         highest_severity,
         target_runtime,
         findings,
@@ -1200,26 +1192,26 @@ mod tests {
     }
 
     #[test]
-    fn git_clean_force_requires_user_approval() {
+    fn git_clean_force_remains_advisory_under_default_posture() {
         let report = classify_process_run(
             &input("git", &["clean", "-ffd", "-x", "--", "generated", "node_modules"]),
             ProcessRiskContext::default(),
         );
 
         assert!(has_class(&report, ProcessRiskClass::DestructiveFilesystemOperation));
-        assert!(report.requires_user_approval);
-        assert_eq!(report.policy, "approval_required_for_destructive_operations");
+        assert!(!report.requires_user_approval);
+        assert_eq!(report.policy, "advisory_only");
         assert!(!report.blocks_execution);
     }
 
     #[test]
-    fn git_clean_long_force_requires_user_approval() {
+    fn git_clean_long_force_remains_advisory_under_default_posture() {
         let report = classify_process_run(
             &input("git", &["clean", "--force", "-d", "--", "generated"]),
             ProcessRiskContext::default(),
         );
 
-        assert!(report.requires_user_approval);
+        assert!(!report.requires_user_approval);
         assert!(has_class(&report, ProcessRiskClass::DestructiveFilesystemOperation));
     }
 
@@ -1233,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_delete_in_workspace_script_requires_user_approval() {
+    fn recursive_delete_in_workspace_script_remains_advisory_under_default_posture() {
         let workspace = tempfile::tempdir().expect("temp workspace should be created");
         let script = workspace.path().join("cleanup.py");
         fs::write(script.as_path(), b"import shutil\nshutil.rmtree('generated')\n")
@@ -1252,7 +1244,7 @@ mod tests {
             .iter()
             .find(|finding| finding.risk_class == ProcessRiskClass::DestructiveFilesystemOperation)
             .expect("recursive cleanup script should be classified");
-        assert!(report.requires_user_approval);
+        assert!(!report.requires_user_approval);
         assert_eq!(finding.affected_paths, vec!["cleanup.py"]);
     }
 

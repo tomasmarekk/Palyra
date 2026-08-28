@@ -35,7 +35,6 @@ use crate::{
     },
     gateway::{
         current_unix_ms, GatewayRuntimeState, ToolApprovalOutcome, ToolSkillContext,
-        PROCESS_RUNNER_ALIAS_TOOL_NAME, PROCESS_RUNNER_TOOL_NAME,
         SKILL_EXECUTION_DENY_REASON_PREFIX,
     },
     journal::{JournalAppendRequest, SkillExecutionStatus},
@@ -467,6 +466,17 @@ pub(crate) fn annotate_tool_decision_with_backend_context(
     decision
 }
 
+fn proposal_requires_approval(
+    skill_gate_decision: Option<&ToolDecision>,
+    effective_posture: ToolPostureState,
+    backend_approval_required: bool,
+) -> bool {
+    skill_gate_decision
+        .map(|decision| decision.allowed && effective_posture == ToolPostureState::AskEachTime)
+        .unwrap_or(effective_posture == ToolPostureState::AskEachTime)
+        || backend_approval_required
+}
+
 /// Formats an allowlist for denial reasons, making emptiness explicit.
 fn allowlist_display(allowlist: &[String]) -> String {
     if allowlist.is_empty() {
@@ -634,22 +644,14 @@ pub(crate) async fn evaluate_tool_proposal_security(
     if skill_gate_decision.is_none() {
         skill_gate_decision = evaluate_backend_capability_gate(tool_name, &backend_selection);
     }
-    let destructive_process_requires_approval =
-        matches!(tool_name, PROCESS_RUNNER_TOOL_NAME | PROCESS_RUNNER_ALIAS_TOOL_NAME)
-            && crate::sandbox_runner::process_runner_input_requires_user_approval(
-                &runtime_state.config.tool_call.process_runner,
-                input_json,
-            );
-    // Ordinary commands remain approval-free by default. Destructive deletion is the narrow
-    // exception because a caller-selected deny mode must mediate it before any process starts.
-    let proposal_approval_required = skill_gate_decision
-        .as_ref()
-        .map(|decision| {
-            decision.allowed && effective_posture.effective_state == ToolPostureState::AskEachTime
-        })
-        .unwrap_or(effective_posture.effective_state == ToolPostureState::AskEachTime)
-        || backend_selection.resolution.approval_required
-        || destructive_process_requires_approval;
+    // Risk classification remains available for audit and operator surfaces, but it does not
+    // silently replace the resolved tool posture. Operators who want interactive mediation for
+    // process mutations can opt into `ask_each_time` at any supported posture scope.
+    let proposal_approval_required = proposal_requires_approval(
+        skill_gate_decision.as_ref(),
+        effective_posture.effective_state,
+        backend_selection.resolution.approval_required,
+    );
     let approval_subject_id =
         build_tool_approval_subject_id(tool_name, skill_context.as_ref(), input_json);
     ToolProposalSecurityEvaluation {
@@ -996,13 +998,14 @@ mod tests {
         },
         execution_backends::{ExecutionBackendPreference, ExecutionBackendResolution},
         gateway::ToolSkillContext,
+        tool_posture::ToolPostureState,
         tool_protocol::ToolDecision,
     };
 
     use super::{
         annotate_tool_decision_with_backend_context, evaluate_backend_capability_gate,
         evaluate_delegation_scope_gate, execution_gate_pipeline_enabled_for_tool,
-        ToolProposalBackendSelection,
+        proposal_requires_approval, ToolProposalBackendSelection,
     };
 
     fn networked_worker_selection() -> ToolProposalBackendSelection {
@@ -1094,6 +1097,12 @@ mod tests {
         assert!(execution_gate_pipeline_enabled_for_tool("palyra.fs.apply_patch", false));
         assert!(execution_gate_pipeline_enabled_for_tool("palyra.process.run", false));
         assert!(execution_gate_pipeline_enabled_for_tool("palyra.fs.apply_patch", true));
+    }
+
+    #[test]
+    fn always_allow_posture_does_not_infer_approval_from_mutation_risk() {
+        assert!(!proposal_requires_approval(None, ToolPostureState::AlwaysAllow, false));
+        assert!(proposal_requires_approval(None, ToolPostureState::AskEachTime, false));
     }
 
     #[test]

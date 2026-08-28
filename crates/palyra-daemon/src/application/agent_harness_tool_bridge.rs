@@ -66,7 +66,7 @@ impl HarnessToolBridgePolicy {
             visible_tools: visible_tools.into_iter().map(Into::into).collect(),
             approval_denied_tool_call_ids: BTreeSet::new(),
             catalog_snapshot_id: catalog_snapshot_id.into(),
-            approval_required_for_mutation: true,
+            approval_required_for_mutation: false,
             execution_gate_required: true,
             harness_result_projection_limit_bytes: 4 * 1024,
         }
@@ -181,12 +181,6 @@ pub fn evaluate_harness_tool_call(
         RuntimeIdempotencyClass::ReadOnly | RuntimeIdempotencyClass::DeterministicIdempotent
     );
     let approval_required = host_classifies_mutation && policy.approval_required_for_mutation;
-    if host_classifies_mutation && !approval_required {
-        return Ok(denied_decision(
-            normalized_tool_name,
-            "harness_tool.mutating_approval_required",
-        ));
-    }
     if approval_required
         && policy.approval_denied_tool_call_ids.contains(request.tool_call_id.trim())
     {
@@ -240,6 +234,7 @@ pub fn project_codex_command_event(
 #[must_use]
 pub fn project_codex_file_change_event(
     file_view_report: &WorkspacePatchFileViewReport,
+    policy: &HarnessToolBridgePolicy,
 ) -> CodexEventProjection {
     if file_view_report.hard_block {
         return CodexEventProjection {
@@ -264,7 +259,7 @@ pub fn project_codex_file_change_event(
         reason_code: "codex.file_change.patch_pipeline".to_owned(),
         route: "host_tool:palyra.fs.apply_patch".to_owned(),
         normalized_tool_name: Some("palyra.fs.apply_patch".to_owned()),
-        approval_required: true,
+        approval_required: policy.approval_required_for_mutation,
         execution_gate_required: true,
         synthetic_result: None,
         journal_event_type: "codex.event.file_change.projected".to_owned(),
@@ -474,19 +469,20 @@ mod tests {
             .expect("host should classify the mutating tool");
 
         assert!(!read_only.approval_required);
-        assert!(mutating.approval_required);
+        assert!(mutating.allowed);
+        assert!(!mutating.approval_required);
     }
 
     #[test]
-    fn bridge_fails_closed_when_host_mutation_approval_is_disabled() {
+    fn bridge_can_opt_into_host_mutation_approval() {
         let mut policy = HarnessToolBridgePolicy::new(["palyra.process.run"], "catalog-1");
-        policy.approval_required_for_mutation = false;
+        policy.approval_required_for_mutation = true;
 
         let decision = evaluate_harness_tool_call(&request("palyra.process.run", false), &policy)
-            .expect("host-classified mutation should become a denied decision");
+            .expect("host-classified mutation should require approval in explicit safe mode");
 
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason_code, "harness_tool.mutating_approval_required");
+        assert!(decision.allowed);
+        assert!(decision.approval_required);
     }
 
     #[test]
@@ -516,6 +512,7 @@ mod tests {
     #[test]
     fn bridge_returns_safe_denied_result_for_approval_deny() {
         let mut policy = HarnessToolBridgePolicy::new(["palyra.fs.apply_patch"], "catalog-1");
+        policy.approval_required_for_mutation = true;
         policy.deny_approval_for("call-1");
 
         let decision = evaluate_harness_tool_call(&request("palyra.fs.apply_patch", true), &policy)
@@ -571,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_command_projection_uses_host_process_tool_and_approval() {
+    fn codex_command_projection_uses_host_process_tool_without_default_approval() {
         let policy = HarnessToolBridgePolicy::new(["palyra.process.run"], "catalog-1");
 
         let projection = project_codex_command_event(
@@ -585,7 +582,7 @@ mod tests {
 
         assert!(projection.allowed);
         assert_eq!(projection.normalized_tool_name.as_deref(), Some("palyra.process.run"));
-        assert!(projection.approval_required);
+        assert!(!projection.approval_required);
         assert!(projection.execution_gate_required);
     }
 
@@ -598,7 +595,8 @@ mod tests {
             diagnostics: Vec::new(),
         };
 
-        let projection = project_codex_file_change_event(&report);
+        let policy = HarnessToolBridgePolicy::new(["palyra.fs.apply_patch"], "catalog-1");
+        let projection = project_codex_file_change_event(&report, &policy);
 
         assert!(!projection.allowed);
         assert_eq!(projection.reason_code, "codex.file_change.stale_view_blocked");
