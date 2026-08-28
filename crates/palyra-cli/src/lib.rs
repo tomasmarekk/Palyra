@@ -12256,22 +12256,9 @@ fn create_optional_directory_symlink(target: &str, link: &Path) -> Result<bool> 
 
 fn open_cli_vault() -> Result<Vault> {
     let identity_store_root = resolve_cli_identity_store_root()?;
-    let vault_root = match env::var("PALYRA_VAULT_DIR") {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                anyhow::bail!("PALYRA_VAULT_DIR must not be empty");
-            }
-            Some(PathBuf::from(trimmed))
-        }
-        Err(std::env::VarError::NotPresent) => Some(resolve_cli_vault_root()?),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("PALYRA_VAULT_DIR must contain valid UTF-8")
-        }
-    };
     let backend_preference = parse_cli_vault_backend_preference()?;
     Vault::open_with_config(VaultConfigOptions {
-        root: vault_root,
+        root: Some(resolve_cli_vault_root()?),
         identity_store_root: Some(identity_store_root),
         backend_preference,
         ..VaultConfigOptions::default()
@@ -12692,6 +12679,24 @@ fn effective_config_path() -> Option<String> {
 }
 
 fn resolve_cli_identity_store_root() -> Result<PathBuf> {
+    match env::var("PALYRA_GATEWAY_IDENTITY_STORE_DIR") {
+        Ok(raw) => {
+            return parse_cli_runtime_directory(
+                raw.as_str(),
+                "PALYRA_GATEWAY_IDENTITY_STORE_DIR",
+                false,
+            );
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PALYRA_GATEWAY_IDENTITY_STORE_DIR must contain valid UTF-8");
+        }
+        Err(std::env::VarError::NotPresent) => {}
+    }
+    if let Some(parsed) = load_effective_root_file_config()? {
+        if let Some(raw) = parsed.gateway.and_then(|gateway| gateway.identity_store_dir) {
+            return parse_cli_runtime_directory(raw.as_str(), "gateway.identity_store_dir", false);
+        }
+    }
     if let Some(context) = app::current_root_context() {
         return Ok(context.state_root().join("identity"));
     }
@@ -12699,10 +12704,190 @@ fn resolve_cli_identity_store_root() -> Result<PathBuf> {
 }
 
 fn resolve_cli_vault_root() -> Result<PathBuf> {
+    match env::var("PALYRA_VAULT_DIR") {
+        Ok(raw) => {
+            let path = parse_cli_runtime_directory(raw.as_str(), "PALYRA_VAULT_DIR", true)?;
+            return Ok(resolve_state_relative_cli_path(path));
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PALYRA_VAULT_DIR must contain valid UTF-8");
+        }
+        Err(std::env::VarError::NotPresent) => {}
+    }
+    if let Some(parsed) = load_effective_root_file_config()? {
+        if let Some(raw) = parsed.storage.and_then(|storage| storage.vault_dir) {
+            let path = parse_cli_runtime_directory(raw.as_str(), "storage.vault_dir", true)?;
+            return Ok(resolve_state_relative_cli_path(path));
+        }
+    }
     if let Some(context) = app::current_root_context() {
         return Ok(context.state_root().join("vault"));
     }
     Ok(app::resolve_cli_state_root(None)?.join("vault"))
+}
+
+/// Loads the daemon config selected by the root context so local CLI vault
+/// operations use the same identity and storage paths as daemon consumers.
+fn load_effective_root_file_config() -> Result<Option<RootFileConfig>> {
+    let Some(raw_path) = effective_config_path() else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(raw_path);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    load_root_file_config(path.as_path())
+        .with_context(|| {
+            format!("failed to load {} while resolving CLI vault paths", path.display())
+        })
+        .map(Some)
+}
+
+/// Applies the daemon's directory-path validation to CLI-side vault paths.
+fn parse_cli_runtime_directory(raw: &str, source: &str, reject_parent: bool) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{source} must not be empty");
+    }
+    if trimmed.contains('\0') {
+        anyhow::bail!("{source} must not contain embedded NUL byte");
+    }
+    let path = PathBuf::from(trimmed);
+    if reject_parent && path.components().any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!("{source} must not contain parent traversal ('..')");
+    }
+    Ok(path)
+}
+
+/// Anchors relative vault paths to the runtime state root, matching daemon
+/// config loading after desktop runtime-root discovery.
+fn resolve_state_relative_cli_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    if let Some(context) = app::current_root_context() {
+        return context.state_root().join(path);
+    }
+    match app::resolve_cli_state_root(None) {
+        Ok(state_root) => state_root.join(path),
+        Err(_) => path,
+    }
+}
+
+#[cfg(test)]
+mod vault_path_tests {
+    use super::{resolve_cli_identity_store_root, resolve_cli_vault_root};
+    use crate::{app, args::RootOptions};
+    use anyhow::Result;
+    use std::{env, ffi::OsString, fs};
+    use tempfile::tempdir;
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn cli_vault_paths_follow_daemon_config_across_desktop_runtime_root() -> Result<()> {
+        let _guard = app::test_env_lock_for_tests().lock().expect("env lock");
+        app::clear_root_context_for_tests();
+        let temp = tempdir()?;
+        let outer_state_root = temp.path().join("state");
+        let runtime_state_root = outer_state_root.join("desktop-control-center").join("runtime");
+        let configured_identity_root = outer_state_root.join("identity");
+        let configured_vault_root = outer_state_root.join("vault");
+        let config_path = outer_state_root.join("config").join("palyra.toml");
+        fs::create_dir_all(runtime_state_root.as_path())?;
+        fs::create_dir_all(config_path.parent().expect("config parent"))?;
+        fs::write(
+            config_path.as_path(),
+            format!(
+                "[gateway]\nidentity_store_dir = '{}'\n\n[storage]\nvault_dir = '{}'\n",
+                configured_identity_root.display(),
+                configured_vault_root.display()
+            ),
+        )?;
+        let _state_root = ScopedEnvVar::set("PALYRA_STATE_ROOT", outer_state_root.as_path());
+        let _vault_dir = ScopedEnvVar::unset("PALYRA_VAULT_DIR");
+        let _identity_dir = ScopedEnvVar::unset("PALYRA_GATEWAY_IDENTITY_STORE_DIR");
+        let _profile = ScopedEnvVar::unset("PALYRA_CLI_PROFILE");
+        let _profiles_path =
+            ScopedEnvVar::set("PALYRA_CLI_PROFILES_PATH", temp.path().join("profiles.toml"));
+
+        let context = app::install_root_context(RootOptions {
+            config_path: Some(config_path.display().to_string()),
+            ..RootOptions::default()
+        })?;
+
+        assert_eq!(context.state_root(), runtime_state_root.as_path());
+        assert_eq!(resolve_cli_identity_store_root()?, configured_identity_root);
+        assert_eq!(resolve_cli_vault_root()?, configured_vault_root);
+        app::clear_root_context_for_tests();
+        Ok(())
+    }
+
+    #[test]
+    fn cli_vault_environment_overrides_configured_paths() -> Result<()> {
+        let _guard = app::test_env_lock_for_tests().lock().expect("env lock");
+        app::clear_root_context_for_tests();
+        let temp = tempdir()?;
+        let state_root = temp.path().join("state");
+        let config_path = temp.path().join("palyra.toml");
+        let configured_identity_root = temp.path().join("configured-identity");
+        let configured_vault_root = temp.path().join("configured-vault");
+        let environment_identity_root = temp.path().join("environment-identity");
+        let environment_vault_root = temp.path().join("environment-vault");
+        fs::write(
+            config_path.as_path(),
+            format!(
+                "[gateway]\nidentity_store_dir = '{}'\n\n[storage]\nvault_dir = '{}'\n",
+                configured_identity_root.display(),
+                configured_vault_root.display()
+            ),
+        )?;
+        let _state_root = ScopedEnvVar::set("PALYRA_STATE_ROOT", state_root.as_path());
+        let _vault_dir = ScopedEnvVar::set("PALYRA_VAULT_DIR", environment_vault_root.as_path());
+        let _identity_dir = ScopedEnvVar::set(
+            "PALYRA_GATEWAY_IDENTITY_STORE_DIR",
+            environment_identity_root.as_path(),
+        );
+        let _profile = ScopedEnvVar::unset("PALYRA_CLI_PROFILE");
+        let _profiles_path =
+            ScopedEnvVar::set("PALYRA_CLI_PROFILES_PATH", temp.path().join("profiles.toml"));
+        app::install_root_context(RootOptions {
+            config_path: Some(config_path.display().to_string()),
+            ..RootOptions::default()
+        })?;
+
+        assert_eq!(resolve_cli_identity_store_root()?, environment_identity_root);
+        assert_eq!(resolve_cli_vault_root()?, environment_vault_root);
+        app::clear_root_context_for_tests();
+        Ok(())
+    }
 }
 
 fn resolve_identity_store_root(store_dir: Option<String>) -> Result<PathBuf> {
