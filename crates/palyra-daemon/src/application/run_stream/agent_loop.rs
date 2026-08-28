@@ -37,6 +37,7 @@ const PROCESS_STATUS_TOOL_NAME: &str = "palyra.process.status";
 const PROCESS_STOP_TOOL_NAME: &str = "palyra.process.stop";
 const ROUTINES_QUERY_TOOL_NAME: &str = "palyra.routines.query";
 const ROUTINES_CONTROL_TOOL_NAME: &str = "palyra.routines.control";
+const TOOL_CATALOG_INVOKE_TOOL_NAME: &str = "palyra.tools.invoke";
 const WORKSPACE_LIST_DIR_TOOL_NAME: &str = "palyra.fs.list_dir";
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 const WORKSPACE_READ_FILE_TOOL_NAME: &str = "palyra.fs.read_file";
@@ -1469,21 +1470,28 @@ fn verification_activity_from_messages(
             continue;
         };
         let output = model_visible_tool_result_payload(&raw_output);
-        if tool_call.tool_name == WORKSPACE_PATCH_TOOL_NAME
+        let effective_tool_call = effective_tool_call_ref(tool_call);
+        if effective_tool_call.tool_name == WORKSPACE_PATCH_TOOL_NAME
             && model_visible_tool_result_succeeded(&raw_output)
         {
-            observe_workspace_patch_verification_requirements(
-                run_id,
-                tool_call_id,
-                output,
-                &mut activity,
-            );
+            let projected_summary = projected_tool_result_summary(output);
+            let evidence_outputs = std::iter::once(output)
+                .chain(projected_summary.as_ref())
+                .chain(output.get("progress_evidence"));
+            for evidence_output in evidence_outputs {
+                observe_workspace_patch_verification_requirements(
+                    run_id,
+                    tool_call_id,
+                    evidence_output,
+                    &mut activity,
+                );
+            }
             continue;
         }
-        if tool_call.tool_name == PROCESS_RUN_TOOL_NAME
+        if effective_tool_call.tool_name == PROCESS_RUN_TOOL_NAME
             && process_run_verification_result_passed(&raw_output, output)
         {
-            observe_process_run_verification(tool_call, tool_call_id, &mut activity);
+            observe_process_run_verification(&effective_tool_call, tool_call_id, &mut activity);
         }
     }
 
@@ -1736,6 +1744,7 @@ fn build_run_progress_checkpoint(
             continue;
         };
         let output = model_visible_tool_result_payload(&raw_output);
+        let effective_tool_call = effective_tool_call_ref(tool_call);
 
         if model_visible_tool_result_succeeded(&raw_output) {
             let projected_summary = projected_tool_result_summary(output);
@@ -1744,22 +1753,23 @@ fn build_run_progress_checkpoint(
                 .chain(output.get("progress_evidence"));
             for evidence_output in evidence_outputs {
                 collect_produced_files(
-                    tool_call.tool_name.as_str(),
+                    effective_tool_call.tool_name.as_str(),
                     evidence_output,
                     &mut produced_files_by_path,
                 );
                 collect_satisfied_file_evidence(
-                    tool_call.tool_name.as_str(),
+                    effective_tool_call.tool_name.as_str(),
                     evidence_output,
                     &mut satisfied_file_paths,
                 );
                 collect_process_progress(
-                    tool_call.tool_name.as_str(),
+                    effective_tool_call.tool_name.as_str(),
                     evidence_output,
                     &mut process_by_pid,
                 );
             }
-            last_successful_tool = Some(tool_success_summary(tool_call.tool_name.as_str(), output));
+            last_successful_tool =
+                Some(tool_success_summary(effective_tool_call.tool_name.as_str(), output));
         } else if known_failed_attempts.len() < RUN_PROGRESS_MAX_FAILED_ATTEMPTS {
             known_failed_attempts
                 .push(tool_failure_summary(tool_call.tool_name.as_str(), &raw_output));
@@ -1792,6 +1802,23 @@ fn build_run_progress_checkpoint(
 struct ProviderMessageToolCallRef {
     tool_name: String,
     input_json: Value,
+}
+
+fn effective_tool_call_ref(tool_call: &ProviderMessageToolCallRef) -> ProviderMessageToolCallRef {
+    if tool_call.tool_name != TOOL_CATALOG_INVOKE_TOOL_NAME {
+        return tool_call.clone();
+    }
+    // Successful compact bridge results were validated and executed against
+    // this target; finalization must classify the target rather than the bridge.
+    let Some(tool_name) =
+        tool_call.input_json.get("tool_id").and_then(Value::as_str).filter(|name| !name.is_empty())
+    else {
+        return tool_call.clone();
+    };
+    let Some(input_json) = tool_call.input_json.get("arguments") else {
+        return tool_call.clone();
+    };
+    ProviderMessageToolCallRef { tool_name: tool_name.to_owned(), input_json: input_json.clone() }
 }
 
 fn model_visible_tool_result_payload(output: &Value) -> &Value {
@@ -2836,6 +2863,68 @@ mod tests {
         )]);
     }
 
+    fn append_compact_projected_workspace_patch(
+        state: &mut AgentRunLoopState,
+        proposal_id: &str,
+        path: &str,
+    ) {
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: proposal_id.to_owned(),
+                tool_name: TOOL_CATALOG_INVOKE_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({
+                    "tool_id": WORKSPACE_PATCH_TOOL_NAME,
+                    "schema_digest": "digest",
+                    "arguments": {
+                        "patch": format!("patch for {path}")
+                    }
+                }),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            proposal_id,
+            serde_json::json!({
+                "success": true,
+                "error": "",
+                "output": {
+                    "schema_version": 1,
+                    "visibility": "redacted_preview",
+                    "projection_policy": "redacted_preview_and_artifact",
+                    "summary": serde_json::json!({
+                        "dry_run": false,
+                        "files_touched": [{
+                            "path": path,
+                            "workspace_root_index": 0,
+                            "operation": "create",
+                            "after_sha256": "sha",
+                            "after_size_bytes": 84
+                        }]
+                    }).to_string(),
+                    "progress_evidence": {
+                        "schema_version": 1,
+                        "kind": "workspace_patch",
+                        "dry_run": false,
+                        "rollback_performed": false,
+                        "files_touched": [{
+                            "path": path,
+                            "workspace_root_index": 0,
+                            "operation": "create",
+                            "after_sha256": "sha",
+                            "after_size_bytes": 84
+                        }],
+                        "files_touched_truncated": false
+                    }
+                }
+            })
+            .to_string(),
+        )]);
+    }
+
     fn append_workspace_patch_with_stale_verification(
         state: &mut AgentRunLoopState,
         proposal_id: &str,
@@ -3317,6 +3406,33 @@ mod tests {
             .expect("evidence refs should be an array")
             .iter()
             .any(|value| value == "file:reports/event-order.md"));
+    }
+
+    #[test]
+    fn compact_projected_patch_preserves_mutation_and_artifact_evidence() {
+        let path = "reports/compact-result.md";
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text(format!("Create {path}."))],
+            2,
+            4,
+            10_000,
+        );
+        append_compact_projected_workspace_patch(&mut state, "call-compact-patch", path);
+
+        let checkpoint =
+            state.progress_checkpoint("run-01", AgentLoopTerminationReason::FinalAnswer);
+        assert_eq!(checkpoint.produced_files.len(), 1);
+        assert_eq!(checkpoint.produced_files[0].path, path);
+        assert!(checkpoint.missing_artifacts.is_empty());
+
+        let verification = state.verify_before_finish_guard(
+            "run-01",
+            AgentLoopTerminationReason::FinalAnswer,
+            format!("Created {path}.").as_str(),
+        );
+        assert!(verification.code_mutation_seen);
+        assert_eq!(verification.status, FinalizationVerificationStatus::Verified);
+        assert_ne!(verification.reason_code, "verification.finalizer.no_code_mutation");
     }
 
     #[test]
