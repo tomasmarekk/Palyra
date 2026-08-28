@@ -4634,15 +4634,17 @@ fn cron_workspace_patch_output_confirms_mutation(
     target_hints: &[String],
 ) -> bool {
     serde_json::from_slice::<Value>(output_json).ok().is_some_and(|value| {
-        value.get("dry_run").and_then(Value::as_bool) == Some(false)
-            && value.get("files_touched").and_then(Value::as_array).is_some_and(|files| {
-                !files.is_empty()
-                    && files.iter().any(|file| {
-                        file.get("path").and_then(Value::as_str).is_some_and(|path| {
-                            cron_completion_path_matches_hints(path, target_hints)
+        cron_tool_output_evidence_values(&value).iter().any(|evidence| {
+            evidence.get("dry_run").and_then(Value::as_bool) == Some(false)
+                && evidence.get("files_touched").and_then(Value::as_array).is_some_and(|files| {
+                    !files.is_empty()
+                        && files.iter().any(|file| {
+                            file.get("path").and_then(Value::as_str).is_some_and(|path| {
+                                cron_completion_path_matches_hints(path, target_hints)
+                            })
                         })
-                    })
-            })
+                })
+        })
     })
 }
 
@@ -4652,16 +4654,18 @@ fn cron_os_file_output_confirms_mutation(
     target_hints: &[String],
 ) -> bool {
     serde_json::from_slice::<Value>(output_json).ok().is_some_and(|value| {
-        value.get("operation").and_then(Value::as_str) == Some(expected_operation)
-            && value.get("dry_run").and_then(Value::as_bool) == Some(false)
-            && (expected_operation != "permissions_set_owner_only"
-                || value.get("verified").and_then(Value::as_bool) == Some(true))
-            && ["path", "resolved_path"].iter().any(|field| {
-                value
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| cron_completion_path_matches_hints(path, target_hints))
-            })
+        cron_tool_output_evidence_values(&value).iter().any(|evidence| {
+            evidence.get("operation").and_then(Value::as_str) == Some(expected_operation)
+                && evidence.get("dry_run").and_then(Value::as_bool) == Some(false)
+                && (expected_operation != "permissions_set_owner_only"
+                    || evidence.get("verified").and_then(Value::as_bool) == Some(true))
+                && ["path", "resolved_path"].iter().any(|field| {
+                    evidence
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|path| cron_completion_path_matches_hints(path, target_hints))
+                })
+        })
     })
 }
 
@@ -4669,12 +4673,10 @@ fn cron_browser_output_confirms_saved_file(output_json: &[u8], target_hints: &[S
     let Ok(value) = serde_json::from_slice::<Value>(output_json) else {
         return false;
     };
-    cron_tool_output_saved_file_path(&value)
-        .is_some_and(|path| cron_completion_path_matches_hints(path, target_hints))
-        || cron_tool_output_summary_value(&value).is_some_and(|summary| {
-            cron_tool_output_saved_file_path(&summary)
-                .is_some_and(|path| cron_completion_path_matches_hints(path, target_hints))
-        })
+    cron_tool_output_evidence_values(&value).iter().any(|evidence| {
+        cron_tool_output_saved_file_path(evidence)
+            .is_some_and(|path| cron_completion_path_matches_hints(path, target_hints))
+    })
 }
 
 fn cron_completion_path_matches_hints(path: &str, target_hints: &[String]) -> bool {
@@ -4704,11 +4706,27 @@ fn cron_tool_output_saved_file_path(value: &Value) -> Option<&str> {
     value.pointer("/saved_file/path").and_then(Value::as_str)
 }
 
-fn cron_tool_output_summary_value(value: &Value) -> Option<Value> {
-    value
-        .get("summary")
-        .and_then(Value::as_str)
-        .and_then(|summary| serde_json::from_str::<Value>(summary).ok())
+fn cron_tool_output_evidence_values(value: &Value) -> Vec<Value> {
+    let mut evidence = vec![value.clone()];
+    let mut cursor = 0;
+    while cursor < evidence.len() && evidence.len() < 8 {
+        let candidate = evidence[cursor].clone();
+        for nested in ["output", "progress_evidence"] {
+            if let Some(value) = candidate.get(nested) {
+                evidence.push(value.clone());
+            }
+        }
+        if let Some(summary) = candidate
+            .get("summary")
+            .and_then(Value::as_str)
+            .and_then(|summary| serde_json::from_str::<Value>(summary).ok())
+        {
+            evidence.push(summary);
+        }
+        cursor += 1;
+    }
+    evidence.truncate(8);
+    evidence
 }
 
 fn build_cron_prompt(
@@ -5939,6 +5957,14 @@ mod tests {
             br#"{"patch":"*** Begin Patch","dry_run":false}"#
         )
         .is_confirmed_by_output(applied_patch, target_hints.as_slice()));
+        assert!(cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.apply_patch",
+            br#"{"patch":"*** Begin Patch","dry_run":false}"#
+        )
+        .is_confirmed_by_output(
+            br#"{"schema_version":1,"progress_evidence":{"kind":"workspace_patch","dry_run":false,"files_touched":[{"path":"reports/feed.md"}]}}"#,
+            target_hints.as_slice()
+        ));
         assert!(!cron_completion_candidate_for_tool_proposal(
             "palyra.fs.apply_patch",
             br#"{"patch":"*** Begin Patch","dry_run":true}"#
