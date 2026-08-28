@@ -1606,6 +1606,31 @@ fn background_budget_guard_counts_model_visible_tool_schemas() {
 }
 
 #[test]
+fn background_budget_guard_excludes_compact_catalog_index_metadata() {
+    let mut request = ProviderRequest::from_input_text(
+        "short background task".to_owned(),
+        false,
+        Vec::new(),
+        None,
+    );
+    request.tool_catalog_snapshot = Some(serde_json::json!({
+        "exposed_tool_count": 3,
+        "estimated_exposed_tool_bytes": 512,
+        "indexed_tools": [{
+            "name": "palyra.hidden",
+            "description": vec!["hidden-schema"; 8_000].join(" ")
+        }],
+        "tools": []
+    }));
+
+    let decision = apply_background_budget_guard(&mut request, 1_000, 0)
+        .expect("compact catalog audit metadata must not consume provider budget");
+
+    assert!(decision.estimated_input_tokens < 1_000);
+    assert!(decision.max_output_tokens > 0);
+}
+
+#[test]
 fn background_budget_overrun_detects_provider_usage_after_turn() {
     assert!(background_budget_overrun_message(1_000, 1_001)
         .expect("usage above budget must be rejected")

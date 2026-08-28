@@ -11,11 +11,28 @@ pub(super) fn runtime_kernel_provider_request_input_tokens(request: &ProviderReq
     let tool_catalog_tokens = request
         .tool_catalog_snapshot
         .as_ref()
-        .map(|catalog| estimate_background_budget_text_tokens(catalog.to_string().as_str()))
+        .map(estimate_provider_visible_tool_catalog_tokens)
         .unwrap_or_default();
     let vision_tokens =
         u64::try_from(request.vision_inputs.len()).unwrap_or(u64::MAX).saturating_mul(256);
     message_tokens.saturating_add(tool_catalog_tokens).saturating_add(vision_tokens)
+}
+
+fn estimate_provider_visible_tool_catalog_tokens(catalog: &Value) -> u64 {
+    let Some(exposed_bytes) = catalog.get("estimated_exposed_tool_bytes").and_then(Value::as_u64)
+    else {
+        // Compatibility requests without a typed catalog snapshot retain the
+        // conservative whole-value estimate.
+        return estimate_background_budget_text_tokens(catalog.to_string().as_str());
+    };
+    let exposed_tool_count =
+        catalog.get("exposed_tool_count").and_then(Value::as_u64).unwrap_or_default();
+    // The catalog builder measures the exact serialized provider tool
+    // payloads. Add bounded array framing before converting bytes to the same
+    // dense-text token estimate used for messages.
+    let wire_bytes =
+        exposed_bytes.saturating_add(exposed_tool_count.saturating_sub(1)).saturating_add(2);
+    wire_bytes.saturating_add(3) / 4
 }
 
 fn estimate_provider_message_input_tokens(message: &ProviderMessage) -> u64 {
