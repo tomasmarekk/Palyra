@@ -279,6 +279,23 @@ pub(crate) async fn run_sessions_async(
             reset,
             json: _,
         } => {
+            let (session_id, session_key, session_label, require_existing) =
+                if session_id.is_none() && session_key.is_none() {
+                    let requested_label = normalize_optional_text(session_label)
+                        .context("session_id, session_key, or session_label is required")?;
+                    let session =
+                        load_session_summary_by_label(&runtime, requested_label.as_str()).await?;
+                    let session_id = session
+                        .session_id
+                        .as_ref()
+                        .map(|id| id.ulid.trim())
+                        .filter(|ulid| !ulid.is_empty())
+                        .map(ToOwned::to_owned)
+                        .context("session label resolved a session without a session_id")?;
+                    (Some(session_id), None, None, true)
+                } else {
+                    (session_id, session_key, session_label, require_existing)
+                };
             let response = runtime
                 .resolve_session(build_resolve_session_request(
                     session_id,
@@ -1157,6 +1174,46 @@ fn build_resolve_session_request(
     })
 }
 
+async fn load_session_summary_by_label(
+    runtime: &client::operator::OperatorRuntime,
+    requested_label: &str,
+) -> Result<gateway_v1::SessionSummary> {
+    let mut matched = None;
+    let mut after_session_key = None;
+    loop {
+        let response =
+            runtime.list_sessions(after_session_key.clone(), true, Some(100), None).await?;
+        for session in response.sessions {
+            track_unique_session_label_match(&mut matched, session, requested_label)?;
+        }
+
+        let next_after_session_key = normalize_optional_text(Some(response.next_after_session_key));
+        if next_after_session_key.is_none() || next_after_session_key == after_session_key {
+            break;
+        }
+        after_session_key = next_after_session_key;
+    }
+
+    matched.with_context(|| format!("session label not found: {requested_label}"))
+}
+
+fn track_unique_session_label_match(
+    matched: &mut Option<gateway_v1::SessionSummary>,
+    session: gateway_v1::SessionSummary,
+    requested_label: &str,
+) -> Result<()> {
+    if session.session_label.trim() != requested_label {
+        return Ok(());
+    }
+    if matched.is_some() {
+        anyhow::bail!(
+            "session label is ambiguous: {requested_label}; use --session-id or --session-key"
+        );
+    }
+    *matched = Some(session);
+    Ok(())
+}
+
 /// Finds a session summary by id and/or key by paging through `list_sessions`;
 /// the gateway exposes no direct summary lookup. When both selectors are given,
 /// they must resolve to the same session.
@@ -1743,7 +1800,7 @@ mod tests {
         build_cleanup_session_request, build_resolve_session_request,
         build_session_retry_agent_run_input, redacted_canonical_id_text,
         redacted_cleanup_warning_json, redacted_cleanup_warning_text, resolved_session_to_json,
-        session_to_json,
+        session_to_json, track_unique_session_label_match,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
@@ -1775,6 +1832,34 @@ mod tests {
         assert_eq!(request.session_label, "Ops Triage");
         assert!(request.require_existing);
         assert!(!request.reset_session);
+    }
+
+    #[test]
+    fn session_label_selector_rejects_ambiguous_matches() {
+        let mut matched = None;
+        track_unique_session_label_match(
+            &mut matched,
+            gateway_v1::SessionSummary {
+                session_label: "Ops triage".to_owned(),
+                session_key: "ops:first".to_owned(),
+                ..Default::default()
+            },
+            "Ops triage",
+        )
+        .expect("first matching label should be accepted");
+
+        let error = track_unique_session_label_match(
+            &mut matched,
+            gateway_v1::SessionSummary {
+                session_label: " Ops triage ".to_owned(),
+                session_key: "ops:second".to_owned(),
+                ..Default::default()
+            },
+            "Ops triage",
+        )
+        .expect_err("duplicate labels must require a canonical selector");
+
+        assert!(error.to_string().contains("session label is ambiguous"));
     }
 
     #[test]
