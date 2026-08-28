@@ -242,6 +242,9 @@ jobs:
     name: Runtime / Contract snapshots (ubuntu-latest)
     runs-on: ubuntu-latest
     env:
+      # The monolithic daemon test binary can otherwise exhaust a hosted runner
+      # during cold codegen and terminate the runner before tests start.
+      CARGO_BUILD_JOBS: "1"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"

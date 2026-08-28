@@ -71,7 +71,10 @@ fi
 
 cd "$ROOT_DIR"
 CARGO_BIN="$(resolve_cargo)"
+# This acceptance test lives in the daemon library. Building unrelated binary
+# and integration-test targets only increases hosted-runner memory pressure.
 "$CARGO_BIN" test \
+  --lib \
   -p palyra-daemon \
   journal::tests::pre_v2_golden_migration_acceptance \
   --locked \
