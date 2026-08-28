@@ -1723,7 +1723,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "background",
                         json!({
                             "type":"boolean",
-                            "description":"Start an allowlisted local background process and return immediately. Use this instead of shell background syntax or nohup for temporary dev servers. The runtime returns bounded startup stdout/stderr snapshots, which may include a server URL or selected dynamic port. If the direct launcher exits during startup with code 0, the call succeeds with launcher_completed_successfully=true and no run-owned PID after terminating the launcher process tree; do not assume an external service remains alive. Non-zero startup exits still fail fast. Long-running child lifetimes default to run-owned: Palyra automatically stops them when the agent run reaches a terminal state, and may also stop them at the operator-configured tool execution timeout/runtime hard cap. For services that must survive the final answer or a hidden verifier, set lifetime_mode='detached' or keep_running_after_run=true; detached processes are not registered for terminal run cleanup, but still auto-kill after the returned cleanup.auto_kill_after_ms and must be handed off with cleanup.portable_stop_command. For local browser verification, bind to 127.0.0.1 with an explicit port and omit timeout_ms unless a specific long lifetime is needed; short background timeout_ms values are raised to the safe minimum when the execution cap permits."
+                            "description":"Start an allowlisted run-owned local background process and return immediately. Use this instead of shell background syntax or nohup for temporary dev servers. The runtime returns bounded startup stdout/stderr snapshots, which may include a server URL or selected dynamic port. If the direct launcher exits during startup with code 0, the call succeeds with launcher_completed_successfully=true and no run-owned PID after terminating the launcher process tree; do not assume an external service remains alive. Non-zero startup exits still fail fast. Palyra automatically stops long-running child processes when the agent run reaches a terminal state, and may also stop them at the operator-configured tool execution timeout/runtime hard cap. Durable post-run process handoff is not currently exposed by this tool. For local browser verification, bind to 127.0.0.1 with an explicit port and omit timeout_ms unless a specific long lifetime is needed; short background timeout_ms values are raised to the safe minimum when the execution cap permits."
                         }),
                     ),
                     (
@@ -1777,15 +1777,8 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "lifetime_mode",
                         json!({
                             "type":"string",
-                            "enum":["run_owned","detached","until_verifier"],
-                            "description":"Optional background lifecycle. Defaults to run_owned. Use detached or until_verifier only with background=true when the user or verifier explicitly needs the service after the agent final answer; the result includes durable_handoff=true, PID, inferred ports, safe start command preview, status command, stop command, and cleanup handle. Detached lifetimes are approval-free out of the box, but remain bounded by timeout_ms or the runtime maximum and surface advisory risk metadata when relevant."
-                        }),
-                    ),
-                    (
-                        "keep_running_after_run",
-                        json!({
-                            "type":"boolean",
-                            "description":"Compatibility alias for lifetime_mode='detached'. Use only with background=true when a service must survive terminal run cleanup for user or verifier handoff."
+                            "enum":["run_owned"],
+                            "description":"Optional background lifecycle. The current local executor supports run_owned only: Palyra stops the process when the agent run terminates. Durable detached or hidden-verifier handoff is not exposed until the executor can enforce and persist that lifecycle."
                         }),
                     ),
                     (
@@ -2889,14 +2882,17 @@ mod tests {
         assert!(background_description.contains("omit timeout_ms"));
         assert!(background_description.contains("safe minimum"));
         assert!(background_description.contains("terminal state"));
+        assert!(background_description.contains("not currently exposed"));
 
-        let lifetime_mode_description = entry
+        let lifetime_mode = entry
             .input_schema
-            .pointer("/properties/lifetime_mode/description")
-            .and_then(serde_json::Value::as_str)
-            .expect("lifetime_mode description should be visible to models");
-        assert!(lifetime_mode_description.contains("approval-free out of the box"));
-        assert!(lifetime_mode_description.contains("advisory risk metadata"));
+            .pointer("/properties/lifetime_mode")
+            .expect("lifetime_mode schema should be visible to models");
+        assert_eq!(lifetime_mode["enum"], serde_json::json!(["run_owned"]));
+        assert!(lifetime_mode["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("supports run_owned only")));
+        assert!(entry.input_schema.pointer("/properties/keep_running_after_run").is_none());
 
         let timeout_description = entry
             .input_schema
