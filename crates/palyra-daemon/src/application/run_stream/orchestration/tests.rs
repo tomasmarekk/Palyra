@@ -1557,7 +1557,7 @@ fn background_budget_guard_clamps_provider_output_tokens() {
     );
     request.max_output_tokens = Some(900);
 
-    let decision = apply_background_budget_guard(&mut request, 1_000, 200)
+    let decision = apply_background_budget_guard(&mut request, 1_000, 200, 8_192)
         .expect("small background task should fit inside budget");
 
     assert_eq!(decision.budget_tokens, 1_000);
@@ -1571,7 +1571,7 @@ fn background_budget_guard_rejects_over_budget_input() {
     let mut request =
         ProviderRequest::from_input_text(vec!["word"; 1_100].join(" "), false, Vec::new(), None);
 
-    let message = apply_background_budget_guard(&mut request, 1_000, 0)
+    let message = apply_background_budget_guard(&mut request, 1_000, 0, 8_192)
         .expect_err("oversized background prompt must fail before provider execution");
 
     assert!(message.contains("background task token budget exhausted"));
@@ -1597,7 +1597,7 @@ fn background_budget_guard_counts_model_visible_tool_schemas() {
         }]
     }));
 
-    let message = apply_background_budget_guard(&mut request, 1_000, 0)
+    let message = apply_background_budget_guard(&mut request, 1_000, 0, 8_192)
         .expect_err("tool schema overhead must be included before provider execution");
 
     assert!(message.contains("background task token budget exhausted before provider turn"));
@@ -1623,11 +1623,35 @@ fn background_budget_guard_excludes_compact_catalog_index_metadata() {
         "tools": []
     }));
 
-    let decision = apply_background_budget_guard(&mut request, 1_000, 0)
+    let decision = apply_background_budget_guard(&mut request, 1_000, 0, 8_192)
         .expect("compact catalog audit metadata must not consume provider budget");
 
     assert!(decision.estimated_input_tokens < 1_000);
     assert!(decision.max_output_tokens > 0);
+}
+
+#[test]
+fn background_budget_guard_caps_implicit_output_to_provider_context() {
+    let mut request = ProviderRequest::from_input_text(
+        "short background task".to_owned(),
+        false,
+        Vec::new(),
+        None,
+    );
+    request.tool_catalog_snapshot = Some(serde_json::json!({
+        "exposed_tool_count": 3,
+        "estimated_exposed_tool_bytes": 1_338,
+        "tools": []
+    }));
+
+    let decision = apply_background_budget_guard(&mut request, 65_536, 0, 8_192)
+        .expect("default background output reserve should fit the provider context window");
+
+    assert_eq!(decision.max_output_tokens, 4_096);
+    assert!(
+        decision.estimated_input_tokens.saturating_add(decision.max_output_tokens) <= 8_192,
+        "the background guard must not create context pressure from its own output reserve"
+    );
 }
 
 #[test]

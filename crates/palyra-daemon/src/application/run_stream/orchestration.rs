@@ -71,8 +71,9 @@ use crate::{
         ManagedCodexAppServerConfig, CODEX_MANAGED_RUNTIME_ID,
     },
     application::context_recovery::{
-        recover_provider_request_after_overflow, recover_provider_request_preflight,
-        ContextPreflightRecoveryOutcome, CONTEXT_RECOVERY_EVENT,
+        provider_context_limit_tokens_for_route, recover_provider_request_after_overflow,
+        recover_provider_request_preflight, ContextPreflightRecoveryOutcome,
+        CONTEXT_RECOVERY_EVENT,
     },
     application::external_agent_harness::ManagedExternalAgentHarness,
     application::learning::schedule_post_run_reflection,
@@ -903,6 +904,7 @@ fn apply_background_budget_guard(
     request: &mut ProviderRequest,
     budget_tokens: u64,
     consumed_tokens: u64,
+    provider_context_limit_tokens: u64,
 ) -> Result<BackgroundBudgetGuardDecision, String> {
     let estimated_input_tokens = runtime_kernel_provider_request_input_tokens(request);
     let committed_tokens = consumed_tokens.saturating_add(estimated_input_tokens);
@@ -912,10 +914,17 @@ fn apply_background_budget_guard(
         ));
     }
     let available_output_tokens = budget_tokens.saturating_sub(committed_tokens).max(1);
+    let available_provider_output_tokens =
+        provider_context_limit_tokens.saturating_sub(estimated_input_tokens).max(1);
+    // A task budget is a cumulative ceiling, not a request for one provider turn to consume every
+    // remaining token. Keep the implicit per-turn output below half of the selected context window
+    // so a short background prompt cannot trigger context recovery solely from its output reserve.
+    let default_output_tokens = provider_context_limit_tokens.saturating_div(2).max(1);
     let max_output_tokens = request
         .max_output_tokens
-        .unwrap_or(available_output_tokens)
+        .unwrap_or(default_output_tokens)
         .min(available_output_tokens)
+        .min(available_provider_output_tokens)
         .max(1);
     request.max_output_tokens = Some(max_output_tokens);
     Ok(BackgroundBudgetGuardDecision {
@@ -5350,12 +5359,22 @@ async fn process_run_stream_message_inner(
         // adapter can attest the exact request path it actually executed.
         provider_request.qa_attestation_context =
             base_provider_request.qa_attestation_context.clone();
+        let selected_model_id = provider_request
+            .model_override
+            .clone()
+            .unwrap_or_else(|| routing_decision.actual_model_id.clone());
         if let Some(budget_tokens) = background_budget_tokens {
             let consumed_tokens = loop_state.snapshot(run_id.as_str(), None).usage.total_tokens;
+            let provider_context_limit_tokens = provider_context_limit_tokens_for_route(
+                &provider_snapshot,
+                lease_provider_id.as_str(),
+                selected_model_id.as_str(),
+            );
             match apply_background_budget_guard(
                 &mut provider_request,
                 budget_tokens,
                 consumed_tokens,
+                provider_context_limit_tokens,
             ) {
                 Ok(decision) => {
                     append_agent_loop_tape_event(
@@ -5403,10 +5422,6 @@ async fn process_run_stream_message_inner(
             context_pressure_report.tape_payload().to_string(),
         )
         .await?;
-        let selected_model_id = provider_request
-            .model_override
-            .clone()
-            .unwrap_or_else(|| routing_decision.actual_model_id.clone());
         match recover_provider_request_preflight(
             &mut provider_request,
             &provider_snapshot,

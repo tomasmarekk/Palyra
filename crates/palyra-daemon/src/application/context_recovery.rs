@@ -536,11 +536,11 @@ pub(crate) fn context_recovery_input_for_request(
             && model.provider_id == selected_provider_id
             && model.model_id == selected_model_id
     });
-    let provider_limit_tokens = selected_model
-        .and_then(|model| model.capabilities.max_context_tokens)
-        .or(provider_snapshot.capabilities.max_context_tokens)
-        .map(u64::from)
-        .unwrap_or(DEFAULT_PROVIDER_CONTEXT_LIMIT_TOKENS);
+    let provider_limit_tokens = provider_context_limit_tokens_for_route(
+        provider_snapshot,
+        selected_provider_id,
+        selected_model_id,
+    );
     let selected_cost_tier = selected_model
         .map(|model| model.capabilities.cost_tier.as_str())
         .unwrap_or(provider_snapshot.capabilities.cost_tier.as_str());
@@ -580,6 +580,27 @@ pub(crate) fn context_recovery_input_for_request(
         recovery_budget: ContextRecoveryBudget::default(),
         route_fallback,
     }
+}
+
+#[must_use]
+pub(crate) fn provider_context_limit_tokens_for_route(
+    provider_snapshot: &ProviderStatusSnapshot,
+    selected_provider_id: &str,
+    selected_model_id: &str,
+) -> u64 {
+    provider_snapshot
+        .registry
+        .models
+        .iter()
+        .find(|model| {
+            model.enabled
+                && model.provider_id == selected_provider_id
+                && model.model_id == selected_model_id
+        })
+        .and_then(|model| model.capabilities.max_context_tokens)
+        .or(provider_snapshot.capabilities.max_context_tokens)
+        .map(u64::from)
+        .unwrap_or(DEFAULT_PROVIDER_CONTEXT_LIMIT_TOKENS)
 }
 
 #[must_use]
