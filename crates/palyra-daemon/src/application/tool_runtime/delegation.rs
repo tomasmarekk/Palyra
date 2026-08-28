@@ -83,7 +83,7 @@ struct DelegationToolInput {
     #[serde(default)]
     memory_scope: Option<DelegationMemoryScopeKind>,
     #[serde(default)]
-    tool_allowlist: Vec<String>,
+    tool_allowlist: Option<Vec<String>>,
     #[serde(default)]
     skill_allowlist: Vec<String>,
     #[serde(default)]
@@ -208,6 +208,7 @@ struct DelegationSpawnRequest {
     model_profile: Option<String>,
     memory_scope: Option<DelegationMemoryScopeKind>,
     tool_allowlist: Vec<String>,
+    tool_allowlist_was_provided: bool,
     explicit_empty_tool_allowlist: bool,
     skill_allowlist: Vec<String>,
     approval_required: Option<bool>,
@@ -314,38 +315,10 @@ async fn create_delegation(
     child_task_parent_context: Option<&CancellationContextV1>,
 ) -> Result<Value, Status> {
     let objective = normalize_required(input.objective.as_deref(), "objective")?;
-    let task = create_delegation_background_task(
-        runtime,
-        context,
-        DelegationSpawnRequest {
-            objective,
-            profile_id: normalize_optional(input.profile_id.as_deref()),
-            template_id: normalize_optional(input.template_id.as_deref()),
-            group_id: normalize_optional(input.group_id.as_deref()),
-            execution_mode: input.execution_mode,
-            display_name: None,
-            model_profile: normalize_optional(input.model_profile.as_deref()),
-            memory_scope: input.memory_scope,
-            tool_allowlist: input.tool_allowlist.clone(),
-            explicit_empty_tool_allowlist: false,
-            skill_allowlist: input.skill_allowlist.clone(),
-            approval_required: input.approval_required,
-            budget_tokens: input.budget_tokens,
-            max_attempts: input.max_attempts,
-            max_concurrent_children: input.max_concurrent_children,
-            max_children_per_parent: input.max_children_per_parent,
-            max_total_children: input.max_total_children,
-            max_parallel_groups: input.max_parallel_groups,
-            max_depth: input.max_depth,
-            max_budget_share_bps: input.max_budget_share_bps,
-            child_timeout_ms: input.child_timeout_ms,
-            priority: input.priority.unwrap_or(0).clamp(-10, 10),
-            preallocated_child_run_id: None,
-            payload_json: None,
-        },
-        child_task_parent_context,
-    )
-    .await?;
+    let request = direct_delegation_spawn_request(input, objective);
+    let task =
+        create_delegation_background_task(runtime, context, request, child_task_parent_context)
+            .await?;
 
     Ok(json!({
         "schema_version": 1,
@@ -359,6 +332,42 @@ async fn create_delegation(
             "state": task.state,
         },
     }))
+}
+
+fn direct_delegation_spawn_request(
+    input: &DelegationToolInput,
+    objective: String,
+) -> DelegationSpawnRequest {
+    let tool_allowlist =
+        input.tool_allowlist.as_ref().map(|values| normalize_tool_list(values)).unwrap_or_default();
+    let tool_allowlist_was_provided = input.tool_allowlist.is_some();
+    DelegationSpawnRequest {
+        objective,
+        profile_id: normalize_optional(input.profile_id.as_deref()),
+        template_id: normalize_optional(input.template_id.as_deref()),
+        group_id: normalize_optional(input.group_id.as_deref()),
+        execution_mode: input.execution_mode,
+        display_name: None,
+        model_profile: normalize_optional(input.model_profile.as_deref()),
+        memory_scope: input.memory_scope,
+        explicit_empty_tool_allowlist: tool_allowlist_was_provided && tool_allowlist.is_empty(),
+        tool_allowlist_was_provided,
+        tool_allowlist,
+        skill_allowlist: input.skill_allowlist.clone(),
+        approval_required: input.approval_required,
+        budget_tokens: input.budget_tokens,
+        max_attempts: input.max_attempts,
+        max_concurrent_children: input.max_concurrent_children,
+        max_children_per_parent: input.max_children_per_parent,
+        max_total_children: input.max_total_children,
+        max_parallel_groups: input.max_parallel_groups,
+        max_depth: input.max_depth,
+        max_budget_share_bps: input.max_budget_share_bps,
+        child_timeout_ms: input.child_timeout_ms,
+        priority: input.priority.unwrap_or(0).clamp(-10, 10),
+        preallocated_child_run_id: None,
+        payload_json: None,
+    }
 }
 
 async fn create_sessions_spawn(
@@ -397,6 +406,7 @@ fn sessions_spawn_delegation_spawn_request(
         model_profile: None,
         memory_scope: input.context_mode,
         tool_allowlist: allowed_tools,
+        tool_allowlist_was_provided: input.allowed_tools.is_some(),
         explicit_empty_tool_allowlist,
         skill_allowlist: Vec::new(),
         approval_required: None,
@@ -422,15 +432,10 @@ async fn create_delegation_background_task(
     child_task_parent_context: Option<&CancellationContextV1>,
 ) -> Result<OrchestratorBackgroundTaskRecord, Status> {
     let parent_run_id = context.run_id.to_owned();
-    // The delegation resolver enforces per-child budget-share limits against
-    // the parent budget, but tool input does not carry the real parent
-    // budget. Synthesize one: double the requested child budget (keeps the
-    // child's share at 50%), falling back to the objective's estimated token
-    // count when no budget was requested.
-    let parent_budget_tokens =
-        request.budget_tokens.map(|budget| budget.saturating_mul(2).max(1)).or_else(|| {
-            Some(crate::orchestrator::estimate_token_count(request.objective.as_str()).max(1))
-        });
+    // Tool execution does not carry a real parent token ceiling. Preserve an
+    // explicit child request's share check, but never invent a ceiling from
+    // objective text when the caller omitted the optional child budget.
+    let parent_budget_tokens = request.budget_tokens.map(|budget| budget.saturating_mul(2).max(1));
     let resolved_agent = runtime
         .resolve_agent_for_context(AgentResolveRequest {
             principal: context.principal.to_owned(),
@@ -440,7 +445,10 @@ async fn create_delegation_background_task(
             persist_session_binding: false,
         })
         .await?;
-    let delegation_request = delegation_request_for_spawn(&request);
+    let delegation_request = delegation_request_for_spawn(
+        &request,
+        resolved_agent.agent.default_tool_allowlist.as_slice(),
+    );
     let delegation = resolve_delegation_request(
         &delegation_request,
         &DelegationParentContext {
@@ -537,13 +545,20 @@ fn derive_child_task_cancellation_context(
         })
 }
 
-fn delegation_request_for_spawn(request: &DelegationSpawnRequest) -> DelegationRequestInput {
+fn delegation_request_for_spawn(
+    request: &DelegationSpawnRequest,
+    parent_tool_allowlist: &[String],
+) -> DelegationRequestInput {
+    // Omitted grants adapt to a parent with no tool authority as a tool-free
+    // child. Explicit non-empty grants still pass through subset validation.
+    let clear_tool_allowlist = request.explicit_empty_tool_allowlist
+        || (!request.tool_allowlist_was_provided && parent_tool_allowlist.is_empty());
     DelegationRequestInput {
         profile_id: request.profile_id.clone(),
         template_id: request.template_id.clone(),
         group_id: request.group_id.clone(),
         execution_mode: request.execution_mode,
-        clear_tool_allowlist: request.explicit_empty_tool_allowlist,
+        clear_tool_allowlist,
         manifest: Some(DelegationManifestInput {
             display_name: request.display_name.clone(),
             model_profile: request.model_profile.clone(),
@@ -692,7 +707,7 @@ async fn sessions_yield_pending_subscriptions(
         group_id: None,
         model_profile: None,
         memory_scope: None,
-        tool_allowlist: Vec::new(),
+        tool_allowlist: None,
         skill_allowlist: Vec::new(),
         approval_required: None,
         max_concurrent_children: None,
@@ -753,7 +768,7 @@ async fn sessions_yield_snapshot(
         group_id: None,
         model_profile: None,
         memory_scope: None,
-        tool_allowlist: Vec::new(),
+        tool_allowlist: None,
         skill_allowlist: Vec::new(),
         approval_required: None,
         max_concurrent_children: None,
@@ -1516,12 +1531,13 @@ fn build_outcome(
 mod tests {
     use super::{
         delegation_request_for_spawn, derive_child_task_cancellation_context,
-        execute_delegation_tool_inner, sessions_spawn_delegation_spawn_request,
-        sessions_spawn_response, sessions_yield_idempotency_key, sessions_yield_missing_child_json,
+        direct_delegation_spawn_request, execute_delegation_tool_inner,
+        sessions_spawn_delegation_spawn_request, sessions_spawn_response,
+        sessions_yield_idempotency_key, sessions_yield_missing_child_json,
         sessions_yield_requested_run_id, sessions_yield_selects_task,
         sessions_yield_task_projection, sessions_yield_terminal_run_state, task_merge_preview,
-        task_safe_json, SessionsSpawnBudgetInput, SessionsSpawnInput, SessionsSpawnReturnMode,
-        SessionsYieldReturnMode,
+        task_safe_json, DelegationToolInput, SessionsSpawnBudgetInput, SessionsSpawnInput,
+        SessionsSpawnReturnMode, SessionsYieldReturnMode,
     };
     use crate::{
         delegation::{
@@ -1723,7 +1739,7 @@ mod tests {
         assert_eq!(request.preallocated_child_run_id.as_deref(), Some("child-run"));
 
         let snapshot = resolve_delegation_request(
-            &delegation_request_for_spawn(&request),
+            &delegation_request_for_spawn(&request, &[]),
             &test_parent_context(Some(2_000)),
         )
         .expect("explicit no-tool delegation should resolve");
@@ -1749,12 +1765,62 @@ mod tests {
         let request = sessions_spawn_delegation_spawn_request(&input, "child-run".to_owned())
             .expect("sessions_spawn request should normalize");
         let error = resolve_delegation_request(
-            &delegation_request_for_spawn(&request),
+            &delegation_request_for_spawn(&request, &[]),
             &test_parent_context(Some(2_000)),
         )
         .expect_err("child budget above parent share should be denied");
 
         assert!(error.message().contains("configured parent budget share"));
+    }
+
+    #[test]
+    fn minimal_direct_delegation_resolves_as_tool_free_within_available_budget() {
+        let input = serde_json::from_value::<DelegationToolInput>(serde_json::json!({
+            "operation": "delegate",
+            "objective": "Return the exact text CHILD_OK without using tools.",
+            "execution_mode": "serial",
+            "memory_scope": "none",
+            "max_depth": 1,
+            "max_total_children": 1
+        }))
+        .expect("minimal delegation input should parse");
+        let request = direct_delegation_spawn_request(
+            &input,
+            "Return the exact text CHILD_OK without using tools.".to_owned(),
+        );
+        let parent = test_parent_context(None);
+
+        let snapshot = resolve_delegation_request(
+            &delegation_request_for_spawn(&request, parent.parent_tool_allowlist.as_slice()),
+            &parent,
+        )
+        .expect("omitted optional limits should resolve for a tool-free child");
+
+        assert_eq!(snapshot.budget_tokens, 1_800);
+        assert!(snapshot.tool_allowlist.is_empty());
+
+        let input = serde_json::from_value::<DelegationToolInput>(serde_json::json!({
+            "operation": "delegate",
+            "objective": "Return the exact text CHILD_OK without using tools.",
+            "execution_mode": "serial",
+            "memory_scope": "none",
+            "budget_tokens": 256,
+            "max_budget_share_bps": 10000
+        }))
+        .expect("bounded delegation input should parse");
+        let request = direct_delegation_spawn_request(
+            &input,
+            "Return the exact text CHILD_OK without using tools.".to_owned(),
+        );
+        let parent = test_parent_context(Some(512));
+        let snapshot = resolve_delegation_request(
+            &delegation_request_for_spawn(&request, parent.parent_tool_allowlist.as_slice()),
+            &parent,
+        )
+        .expect("explicit bounded tool-free child should resolve");
+
+        assert_eq!(snapshot.budget_tokens, 256);
+        assert!(snapshot.tool_allowlist.is_empty());
     }
 
     #[test]
