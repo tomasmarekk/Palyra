@@ -1506,6 +1506,12 @@ fn markdown_escape(value: &str) -> String {
 }
 
 fn build_provider_compat_report(path: &Path) -> Result<QaProviderCompatReport> {
+    if !path.is_file() && !path.is_dir() {
+        anyhow::bail!(
+            "provider compatibility --path {} must be an existing YAML file or directory; pass --path <path>",
+            path.display()
+        );
+    }
     let pack_paths = collect_yaml_paths(path, "provider compatibility fixture")?;
     let mut packs = Vec::with_capacity(pack_paths.len());
     for pack_path in pack_paths {
@@ -2168,6 +2174,21 @@ mod tests {
             "qa/fixtures/provider_compat/p0_provider_compat_pack.yaml"
         )));
         assert!(!is_provider_compat_fixture_path(Path::new("qa/fixtures/provider_basic.yaml")));
+    }
+
+    #[test]
+    fn provider_compat_missing_default_is_an_actionable_validation_error() {
+        let root = tempfile::tempdir().expect("fixture root should be available");
+        let missing = root.path().join("qa").join("fixtures").join("provider_compat");
+
+        let error = build_provider_compat_report(missing.as_path())
+            .expect_err("missing provider fixtures must fail");
+
+        assert!(
+            error.to_string().contains("pass --path <path>"),
+            "error should explain how to select installed fixtures: {error}"
+        );
+        assert_eq!(crate::output::classify_error(&error), crate::output::CliExitCode::Validation);
     }
 
     #[test]
