@@ -1659,7 +1659,7 @@ async fn chromium_session_proxy_allows_private_targets_after_session_opt_in() {
 }
 
 #[test]
-fn chromium_private_target_policy_scopes_navigation_override_to_exact_tab_url() {
+fn chromium_private_target_policy_scopes_navigation_override_to_tab_origin() {
     let policy = Arc::new(ChromiumPrivateTargetPolicy::new(false));
     assert!(
         !policy.allows_host_port("127.0.0.1", 7143),
@@ -1679,8 +1679,8 @@ fn chromium_private_target_policy_scopes_navigation_override_to_exact_tab_url() 
         "passive URL checks must not widen the scoped navigation URL"
     );
     assert!(
-        !policy.allows_tab_request_target("tab-a", "http://127.0.0.1:7143/styles.css"),
-        "response guard must not widen the scoped URL to same-target subresources"
+        policy.allows_tab_request_target("tab-a", "http://127.0.0.1:7143/styles.css"),
+        "response guard should accept same-origin subresources during navigation"
     );
     assert!(
         !policy.allows_tab_url("tab-b", "http://127.0.0.1:7143/status"),
@@ -1695,12 +1695,16 @@ fn chromium_private_target_policy_scopes_navigation_override_to_exact_tab_url() 
         "owning tab request should arm one proxy CONNECT allowance"
     );
     assert!(
-        !policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/styles.css"),
-        "same-origin subresource must not inherit an exact navigation allowance"
+        policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/styles.css"),
+        "same-origin subresource should inherit the live navigation allowance"
     );
     assert!(
         policy.allows_host_port("127.0.0.1", 7143),
-        "SOCKS5 proxy should consume the armed target allowance"
+        "SOCKS5 proxy should consume the navigation request allowance"
+    );
+    assert!(
+        policy.allows_host_port("127.0.0.1", 7143),
+        "SOCKS5 proxy should consume the subresource request allowance"
     );
     assert!(
         !policy.allows_host_port("127.0.0.1", 7143),
@@ -1734,8 +1738,12 @@ fn chromium_private_target_policy_revokes_target_after_navigation_scope() {
         "navigation request should arm one proxy CONNECT allowance"
     );
     assert!(
-        !policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/mock-data.json"),
-        "same-target subresources must not widen the exact navigation scope"
+        policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/mock-data.json"),
+        "same-origin subresources should remain available during navigation"
+    );
+    assert!(
+        policy.allows_host_port("127.0.0.1", 7143),
+        "same-origin subresource should arm one proxy CONNECT allowance"
     );
     drop(scoped);
     assert!(
@@ -3818,7 +3826,7 @@ async fn browser_service_chromium_blocks_unapproved_private_same_origin_fetches(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn browser_service_chromium_blocks_unapproved_initial_private_css_subresource() {
+async fn browser_service_chromium_loads_scoped_same_origin_private_css_subresource() {
     let Some(chromium_path) = resolve_chromium_path_for_tests() else {
         return;
     };
@@ -3921,11 +3929,13 @@ async fn browser_service_chromium_blocks_unapproved_initial_private_css_subresou
             .find(|style| style.name == name)
             .map(|style| style.value.as_str())
     };
-    assert_eq!(style_value("display"), Some("inline"));
+    assert_eq!(style_value("display"), Some("block"));
+    assert_eq!(style_value("padding-top"), Some("14px"));
+    assert_eq!(style_value("background-color"), Some("rgb(31, 77, 255)"));
 
     assert!(
-        !handle.join().expect("test server thread should exit"),
-        "exact private URL scope must not reach a sibling stylesheet path"
+        handle.join().expect("test server thread should exit"),
+        "scoped private navigation should load its same-origin stylesheet"
     );
 }
 

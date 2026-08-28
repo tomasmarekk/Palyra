@@ -1347,7 +1347,7 @@ impl ChromiumPrivateTargetPolicy {
         else {
             return false;
         };
-        self.allows_exact_request_scope(&scope)
+        self.allows_navigation_request_scope(&scope)
     }
 
     pub(crate) fn authorize_tab_request_url(&self, tab_target_id: &str, raw_url: &str) -> bool {
@@ -1362,7 +1362,7 @@ impl ChromiumPrivateTargetPolicy {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        if !state.scoped_requests.contains_key(&scope) {
+        if !Self::navigation_request_scope_is_active(&state, &scope) {
             return false;
         }
         let requested_target = scope.target_scope();
@@ -1416,8 +1416,26 @@ impl ChromiumPrivateTargetPolicy {
         Ok(Some(ChromiumScopedPrivateTarget { policy: Arc::clone(self), scope }))
     }
 
+    #[cfg(test)]
     fn allows_exact_request_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
         self.state.lock().map(|state| state.scoped_requests.contains_key(scope)).unwrap_or(false)
+    }
+
+    fn allows_navigation_request_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
+        self.state
+            .lock()
+            .map(|state| Self::navigation_request_scope_is_active(&state, scope))
+            .unwrap_or(false)
+    }
+
+    fn navigation_request_scope_is_active(
+        state: &ChromiumPrivateTargetState,
+        requested: &ChromiumPrivateTargetRequestScope,
+    ) -> bool {
+        state.scoped_requests.keys().any(|active| {
+            active.tab_target_id == requested.tab_target_id
+                && active.url.allows_navigation_request(&requested.url)
+        })
     }
 
     fn consume_proxy_scope(&self, scope: &ChromiumPrivateTargetScope) -> bool {
@@ -1538,6 +1556,23 @@ impl ChromiumPrivateTargetUrlScope {
                 ChromiumPrivateTargetScope::Network { host: host.clone(), port: *port }
             }
             Self::File(path) => ChromiumPrivateTargetScope::File(path.clone()),
+        }
+    }
+
+    fn allows_navigation_request(&self, requested: &Self) -> bool {
+        match (self, requested) {
+            (
+                Self::Network { scheme, host, port, .. },
+                Self::Network {
+                    scheme: requested_scheme,
+                    host: requested_host,
+                    port: requested_port,
+                    ..
+                },
+            ) => scheme == requested_scheme && host == requested_host && port == requested_port,
+            // A file navigation never authorizes sibling filesystem paths.
+            (Self::File(active), Self::File(requested)) => active == requested,
+            _ => false,
         }
     }
 }
