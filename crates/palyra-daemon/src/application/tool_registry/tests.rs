@@ -889,6 +889,41 @@ fn catalog_bridge_search_describe_and_invoke_use_current_index_digest() {
 }
 
 #[test]
+fn catalog_bridge_refreshes_stale_schema_digests_without_failing_the_tool_call() {
+    let config = config(&["palyra.echo"]);
+    let mut policy = catalog_policy(&config);
+    policy.exposure_mode = ToolCatalogExposureMode::Compact;
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &policy,
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+    let current_digest = snapshot.index.entries[0].provider_schema_hash.as_str();
+
+    let describe = describe_catalog_tool(
+        &snapshot,
+        br#"{"tool_id":"palyra.echo","schema_digest":"stale-digest"}"#,
+    )
+    .expect("describe should transparently return the current schema");
+    assert_eq!(describe["schema_digest"], current_digest);
+    assert_eq!(describe["schema_digest_refreshed"], true);
+
+    let invoke = resolve_catalog_invoke_target(
+        &snapshot,
+        br#"{"tool_id":"palyra.echo","schema_digest":"stale-digest","arguments":{"text":"hello"}}"#,
+    )
+    .expect("invoke should validate against the current catalog schema");
+    assert_eq!(invoke.schema_digest, current_digest);
+}
+
+#[test]
 fn compact_catalog_projects_effective_runtime_approval_posture() {
     let file_config = config(&["palyra.fs.read_file"]);
     let mut policy = catalog_policy(&file_config);

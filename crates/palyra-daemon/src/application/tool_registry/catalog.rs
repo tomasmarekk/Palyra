@@ -366,20 +366,20 @@ pub(crate) fn describe_catalog_tool(
     let input = parse_bridge_input(input_json)?;
     let tool_id = required_string(&input, "tool_id")?;
     let tool = indexed_tool(snapshot, tool_id.as_str())?;
-    if let Some(expected_digest) = input.get("schema_digest").and_then(Value::as_str) {
-        if !expected_digest.trim().is_empty() && expected_digest != tool.provider_schema_hash {
-            return Err(bridge_error(
-                "tool_catalog.schema_digest_mismatch",
-                "requested schema_digest does not match the current catalog snapshot",
-            ));
-        }
-    }
+    // A digest can legitimately cross a provider turn while dynamic catalog
+    // state rebuilds. The current authorized tool entry remains authoritative.
+    let schema_digest_refreshed = input
+        .get("schema_digest")
+        .and_then(Value::as_str)
+        .filter(|digest| !digest.trim().is_empty())
+        .is_some_and(|digest| digest != tool.provider_schema_hash);
     Ok(json!({
         "schema_version": 1,
         "tool_id": tool.name,
         "description": tool.description,
         "provider_schema": tool.provider_schema,
         "schema_digest": tool.provider_schema_hash,
+        "schema_digest_refreshed": schema_digest_refreshed,
         "internal_schema_digest": tool.internal_schema_hash,
         "capabilities": tool.capabilities,
         "approval_required": matches!(
@@ -403,14 +403,10 @@ pub(crate) fn resolve_catalog_invoke_target(
 ) -> Result<ToolCatalogInvokeTarget, ToolCatalogBridgeError> {
     let input = parse_bridge_input(input_json)?;
     let tool_id = required_string(&input, "tool_id")?;
-    let schema_digest = required_string(&input, "schema_digest")?;
+    // Treat the caller digest as an optimistic snapshot hint. The target and
+    // arguments are still authorized and validated against the current schema.
+    let _requested_schema_digest = required_string(&input, "schema_digest")?;
     let tool = indexed_tool(snapshot, tool_id.as_str())?;
-    if schema_digest != tool.provider_schema_hash {
-        return Err(bridge_error(
-            "tool_catalog.schema_digest_mismatch",
-            "schema_digest must match the current catalog snapshot before invoking a compact tool",
-        ));
-    }
     if is_catalog_bridge_tool(tool.name.as_str()) {
         return Err(bridge_error(
             "tool_catalog.recursive_bridge_invoke",
@@ -428,7 +424,7 @@ pub(crate) fn resolve_catalog_invoke_target(
     }
     Ok(ToolCatalogInvokeTarget {
         tool_name: tool.name.clone(),
-        schema_digest,
+        schema_digest: tool.provider_schema_hash.clone(),
         input_json: canonical_json_bytes(arguments),
     })
 }
