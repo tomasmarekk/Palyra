@@ -2899,23 +2899,10 @@ pub(crate) async fn build_console_browser_client(
             "browser service is disabled (tool_call.browser_service.enabled=false)",
         )));
     }
-    let endpoint = tonic::transport::Endpoint::from_shared(browser_service_config.endpoint.clone())
-        .map_err(|error| {
-            runtime_status_response(tonic::Status::invalid_argument(format!(
-                "invalid browser service endpoint '{}': {error}",
-                browser_service_config.endpoint
-            )))
-        })?
-        .connect_timeout(std::time::Duration::from_millis(
-            browser_service_config.connect_timeout_ms,
-        ))
-        .timeout(std::time::Duration::from_millis(browser_service_config.request_timeout_ms));
-    let channel = endpoint.connect().await.map_err(|error| {
-        runtime_status_response(tonic::Status::unavailable(format!(
-            "failed to connect to browser service '{}': {error}",
-            browser_service_config.endpoint
-        )))
-    })?;
+    let channel = state
+        .runtime
+        .browser_service_channel(&browser_service_config)
+        .map_err(|error| runtime_status_response(tonic::Status::invalid_argument(error)))?;
     Ok(browser_v1::browser_service_client::BrowserServiceClient::new(channel))
 }
 

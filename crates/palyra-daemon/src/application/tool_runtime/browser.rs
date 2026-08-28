@@ -18,7 +18,6 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -48,9 +47,9 @@ use crate::{
         },
     },
     gateway::{
-        current_unix_ms, truncate_with_ellipsis, BrowserServiceRuntimeConfig, GatewayRuntimeState,
-        ToolRuntimeExecutionContext, BROWSER_CDP_INVOKE_TOOL_NAME, BROWSER_CLICK_TOOL_NAME,
-        BROWSER_CONSOLE_LOG_TOOL_NAME, BROWSER_DIALOG_TOOL_NAME, BROWSER_DOWNLOADS_GET_TOOL_NAME,
+        current_unix_ms, truncate_with_ellipsis, GatewayRuntimeState, ToolRuntimeExecutionContext,
+        BROWSER_CDP_INVOKE_TOOL_NAME, BROWSER_CLICK_TOOL_NAME, BROWSER_CONSOLE_LOG_TOOL_NAME,
+        BROWSER_DIALOG_TOOL_NAME, BROWSER_DOWNLOADS_GET_TOOL_NAME,
         BROWSER_DOWNLOADS_LIST_TOOL_NAME, BROWSER_FILL_TOOL_NAME, BROWSER_HIGHLIGHT_TOOL_NAME,
         BROWSER_IMAGES_LIST_TOOL_NAME, BROWSER_NAVIGATE_TOOL_NAME, BROWSER_NETWORK_LOG_TOOL_NAME,
         BROWSER_OBSERVE_TOOL_NAME, BROWSER_PDF_TOOL_NAME, BROWSER_PERMISSIONS_GET_TOOL_NAME,
@@ -1478,7 +1477,7 @@ pub(crate) async fn execute_browser_tool(
     }
 
     let browser_service_channel =
-        match connect_browser_service_channel(browser_service_config.clone()).await {
+        match runtime_state.browser_service_channel(&browser_service_config) {
             Ok(value) => value,
             Err(error) => {
                 return browser_tool_execution_outcome(
@@ -4851,7 +4850,7 @@ pub(crate) async fn close_browser_session_for_run_cleanup(
         format!("palyra.browser.session cleanup session_id is invalid: {error}")
     })?;
 
-    let channel = connect_browser_service_channel(browser_service_config.clone()).await?;
+    let channel = runtime_state.browser_service_channel(&browser_service_config)?;
     let mut client = browser_v1::browser_service_client::BrowserServiceClient::new(channel);
     let mut request = Request::new(browser_v1::CloseSessionRequest {
         v: CANONICAL_PROTOCOL_MAJOR,
@@ -4864,29 +4863,6 @@ pub(crate) async fn close_browser_session_for_run_cleanup(
             format!("palyra.browser.session cleanup failed: {}", sanitize_status_message(&error))
         },
     )
-}
-
-/// Dials the configured browserd gRPC endpoint.
-///
-/// Connect and per-request timeouts come from runtime config, so every client
-/// built from the returned channel carries the configured deadline.
-///
-/// # Errors
-/// Returns a tool-facing message when the endpoint URI is invalid or the
-/// connection cannot be established.
-async fn connect_browser_service_channel(
-    config: BrowserServiceRuntimeConfig,
-) -> Result<tonic::transport::Channel, String> {
-    let endpoint = tonic::transport::Endpoint::from_shared(config.endpoint.clone())
-        .map_err(|error| {
-            format!("invalid browser service endpoint '{}': {error}", config.endpoint)
-        })?
-        .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
-        .timeout(Duration::from_millis(config.request_timeout_ms));
-    let channel = endpoint.connect().await.map_err(|error| {
-        format!("failed to connect to browser service '{}': {error}", config.endpoint)
-    })?;
-    Ok(channel)
 }
 
 /// Best-effort capability probe: health-RPC failures degrade to an

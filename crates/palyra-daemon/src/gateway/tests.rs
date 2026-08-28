@@ -6674,6 +6674,27 @@ fn browser_service_runtime_reload_updates_connection_but_not_enablement() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn browser_service_channel_reuses_matching_connection_settings() {
+    let state = build_test_runtime_state(false);
+    let initial = state.browser_service_config_snapshot();
+    assert!(!state.browser_service_channel_is_cached_for(&initial));
+
+    let first =
+        state.browser_service_channel(&initial).expect("initial browser channel should build");
+    assert!(state.browser_service_channel_is_cached_for(&initial));
+    let second =
+        state.browser_service_channel(&initial).expect("matching browser channel should be reused");
+    drop((first, second));
+
+    let mut replacement = initial.clone();
+    replacement.endpoint = "http://127.0.0.1:7544".to_owned();
+    assert!(!state.browser_service_channel_is_cached_for(&replacement));
+    state.browser_service_channel(&replacement).expect("replacement browser channel should build");
+    assert!(state.browser_service_channel_is_cached_for(&replacement));
+    assert!(!state.browser_service_channel_is_cached_for(&initial));
+}
+
 #[test]
 fn clear_memory_search_cache_recovers_from_poisoned_lock() {
     let state = build_test_runtime_state(false);

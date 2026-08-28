@@ -1065,6 +1065,21 @@ pub struct BrowserServiceRuntimeConfig {
     pub max_title_bytes: usize,
 }
 
+struct BrowserServiceChannelCache {
+    endpoint: String,
+    connect_timeout_ms: u64,
+    request_timeout_ms: u64,
+    channel: tonic::transport::Channel,
+}
+
+impl BrowserServiceChannelCache {
+    fn matches(&self, config: &BrowserServiceRuntimeConfig) -> bool {
+        self.endpoint == config.endpoint
+            && self.connect_timeout_ms == config.connect_timeout_ms
+            && self.request_timeout_ms == config.request_timeout_ms
+    }
+}
+
 /// Canvas host limits: enablement, public base URL, token TTL, and
 /// state/bundle/update-rate caps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3151,6 +3166,7 @@ pub struct GatewayRuntimeState {
     pub(crate) build: BuildSnapshot,
     pub(crate) config: GatewayRuntimeConfigSnapshot,
     browser_service_config: RwLock<BrowserServiceRuntimeConfig>,
+    browser_service_channel: Mutex<Option<BrowserServiceChannelCache>>,
     pub(crate) journal_config: GatewayJournalConfigSnapshot,
     pub(crate) counters: RuntimeCounters,
     feature_usage: FeatureUsageRegistry,
@@ -4947,6 +4963,7 @@ impl GatewayRuntimeState {
             },
             config,
             browser_service_config: RwLock::new(browser_service_config),
+            browser_service_channel: Mutex::new(None),
             journal_config,
             counters: RuntimeCounters {
                 run_stream_requests: AtomicU64::new(0),
@@ -18189,6 +18206,58 @@ impl GatewayRuntimeState {
             Err(poisoned) => {
                 warn!("browser service config lock poisoned while reading runtime config");
                 poisoned.into_inner().clone()
+            }
+        }
+    }
+
+    /// Returns one multiplexed browserd channel for the current connection settings.
+    ///
+    /// Endpoint or timeout changes replace the cached channel on the first
+    /// subsequent request. Authentication stays request-scoped and therefore
+    /// does not require reconnecting the transport.
+    ///
+    /// # Errors
+    /// Returns an error when the configured endpoint URI is invalid.
+    pub(crate) fn browser_service_channel(
+        &self,
+        config: &BrowserServiceRuntimeConfig,
+    ) -> Result<tonic::transport::Channel, String> {
+        let mut cache = match self.browser_service_channel.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                warn!("browser service channel cache lock poisoned while resolving transport");
+                poisoned.into_inner()
+            }
+        };
+        if let Some(cached) = cache.as_ref().filter(|cached| cached.matches(config)) {
+            return Ok(cached.channel.clone());
+        }
+
+        let endpoint = tonic::transport::Endpoint::from_shared(config.endpoint.clone())
+            .map_err(|error| {
+                format!("invalid browser service endpoint '{}': {error}", config.endpoint)
+            })?
+            .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
+            .timeout(Duration::from_millis(config.request_timeout_ms));
+        let channel = endpoint.connect_lazy();
+        *cache = Some(BrowserServiceChannelCache {
+            endpoint: config.endpoint.clone(),
+            connect_timeout_ms: config.connect_timeout_ms,
+            request_timeout_ms: config.request_timeout_ms,
+            channel: channel.clone(),
+        });
+        Ok(channel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn browser_service_channel_is_cached_for(
+        &self,
+        config: &BrowserServiceRuntimeConfig,
+    ) -> bool {
+        match self.browser_service_channel.lock() {
+            Ok(cache) => cache.as_ref().is_some_and(|cached| cached.matches(config)),
+            Err(poisoned) => {
+                poisoned.into_inner().as_ref().is_some_and(|cached| cached.matches(config))
             }
         }
     }
