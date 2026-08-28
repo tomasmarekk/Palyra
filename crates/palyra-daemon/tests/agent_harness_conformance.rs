@@ -256,6 +256,7 @@ fn conformance_routes_tool_and_callback_through_host_boundaries() {
 #[test]
 fn conformance_returns_safe_projection_for_approval_denial() {
     let mut policy = HarnessToolBridgePolicy::new(["palyra.fs.apply_patch"], "catalog-1");
+    policy.approval_required_for_mutation = true;
     policy.deny_approval_for("call-1");
 
     let decision = evaluate_harness_tool_call(
