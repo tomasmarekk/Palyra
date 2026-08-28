@@ -37,6 +37,7 @@ use crate::{
 const DEFAULT_FLOW_PAGE_LIMIT: usize = 100;
 const MAX_FLOW_PAGE_LIMIT: usize = 500;
 const DEFAULT_FLOW_EVENT_LIMIT: usize = 512;
+const MAX_FLOW_STEPS_PER_CREATE: usize = 256;
 const MAX_FLOW_STEP_KEY_CHARS: usize = 64;
 
 /// Query filters for `GET /console/v1/flows`; terminal flows are included by
@@ -468,12 +469,17 @@ pub(crate) async fn console_flow_dependencies_repair_handler(
 fn build_console_flow_steps(
     steps: Vec<ConsoleFlowStepCreateRequest>,
 ) -> Result<Vec<FlowStepCreateRequest>, tonic::Status> {
+    if steps.len() > MAX_FLOW_STEPS_PER_CREATE {
+        return Err(tonic::Status::invalid_argument(format!(
+            "flow cannot contain more than {MAX_FLOW_STEPS_PER_CREATE} steps"
+        )));
+    }
     let adapter_names = flows::flow_adapter_contracts()
         .into_iter()
         .map(|contract| contract.adapter)
         .collect::<Vec<_>>();
     let mut step_ids_by_key = std::collections::BTreeMap::<String, String>::new();
-    let mut prepared = Vec::with_capacity(steps.len());
+    let mut prepared = Vec::new();
     for (index, step) in steps.into_iter().enumerate() {
         let ConsoleFlowStepCreateRequest {
             step_key,
@@ -933,6 +939,7 @@ fn json_value(raw: &str) -> Value {
 mod tests {
     use super::{
         authorize_console_flow_bundle, build_console_flow_steps, ConsoleFlowStepCreateRequest,
+        MAX_FLOW_STEPS_PER_CREATE,
     };
     use crate::{
         journal::{FlowBundleRecord, FlowRecord},
@@ -992,6 +999,18 @@ mod tests {
                 .expect_err("unknown local dependency key must fail closed");
 
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn console_flow_steps_reject_oversized_bundles() {
+        let steps = (0..=MAX_FLOW_STEPS_PER_CREATE)
+            .map(|index| console_step(format!("step-{index}").as_str(), None))
+            .collect();
+        let error =
+            build_console_flow_steps(steps).expect_err("oversized flow bundle must be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("cannot contain more than"));
     }
 
     fn console_step(

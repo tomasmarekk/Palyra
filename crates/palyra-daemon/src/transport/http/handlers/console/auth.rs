@@ -11,6 +11,7 @@ use reqwest::Url;
 const CONSOLE_BROWSER_HANDOFF_TTL_MS: i64 = 60_000;
 const DEFAULT_CONSOLE_BROWSER_REDIRECT_PATH: &str = "/#/control/overview";
 const CONSOLE_BROWSER_HANDOFF_HOST: &str = "127.0.0.1";
+const MAX_AUTH_SELECTION_CREDENTIAL_TYPES: usize = 16;
 
 /// Browser handoff consume query carrying the one-time handoff token.
 #[derive(Debug, Clone, Deserialize)]
@@ -651,10 +652,8 @@ pub(crate) async fn console_auth_selection_explain_handler(
         payload.provider_kind.as_deref(),
         payload.provider_custom_name.as_deref(),
     )?;
-    let mut allowed_credential_types = Vec::with_capacity(payload.allowed_credential_types.len());
-    for value in &payload.allowed_credential_types {
-        allowed_credential_types.push(parse_runtime_auth_credential_type(value.as_str())?);
-    }
+    let allowed_credential_types =
+        parse_runtime_auth_credential_types(&payload.allowed_credential_types)?;
     let agent_id = normalize_optional_query_value(payload.agent_id.as_deref(), "agent_id")?;
     let request = palyra_auth::AuthProfileSelectionRequest {
         provider,
@@ -847,6 +846,19 @@ fn parse_runtime_auth_credential_type(
             "allowed_credential_types contains unsupported credential type",
         ))),
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_runtime_auth_credential_types(
+    values: &[String],
+) -> Result<Vec<palyra_auth::AuthCredentialType>, Response> {
+    if values.len() > MAX_AUTH_SELECTION_CREDENTIAL_TYPES {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+            "allowed_credential_types cannot contain more than \
+             {MAX_AUTH_SELECTION_CREDENTIAL_TYPES} entries"
+        ))));
+    }
+    values.iter().map(|value| parse_runtime_auth_credential_type(value.as_str())).collect()
 }
 
 #[allow(clippy::result_large_err)]
@@ -1789,5 +1801,19 @@ fn lock_console_browser_handoffs<'a>(
     match handoffs.lock() {
         Ok(guard) => guard,
         Err(error) => error.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_runtime_auth_credential_types, MAX_AUTH_SELECTION_CREDENTIAL_TYPES};
+
+    #[test]
+    fn auth_selection_rejects_oversized_credential_type_lists() {
+        let values = vec!["api_key".to_owned(); MAX_AUTH_SELECTION_CREDENTIAL_TYPES + 1];
+        let response = parse_runtime_auth_credential_types(&values)
+            .expect_err("oversized credential type list must be rejected");
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 }

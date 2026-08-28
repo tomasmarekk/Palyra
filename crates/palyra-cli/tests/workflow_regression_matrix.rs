@@ -996,7 +996,7 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
         .context("browser session create should return a reusable session_id")?;
     assert!(
         Ulid::from_string(created_session_id).is_ok(),
-        "browser session create should return a canonical ULID: {created_session_id}"
+        "browser session create should return a canonical ULID"
     );
     let session_id = created_session_id.to_owned();
 

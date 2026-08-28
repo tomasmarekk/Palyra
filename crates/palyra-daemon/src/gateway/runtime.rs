@@ -16948,7 +16948,7 @@ impl GatewayRuntimeState {
             .journal_store
             .orchestrator_tape_page(run_id, after_seq, limit.saturating_add(1))
             .map_err(|error| map_orchestrator_store_error("load orchestrator tape", error))?;
-        let mut events = Vec::with_capacity(limit);
+        let mut events = Vec::new();
         let mut returned_bytes = 0_usize;
         let mut has_more = false;
 

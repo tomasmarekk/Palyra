@@ -7287,7 +7287,7 @@ mod tests {
             !sanitized.contains("topsecret")
                 && !sanitized.contains("token=abc123")
                 && !sanitized.contains("sessionid=xyz"),
-            "sanitized error text must not leak secret-like values: {sanitized}"
+            "sanitized error text contained an unredacted sentinel"
         );
     }
 

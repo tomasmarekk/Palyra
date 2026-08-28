@@ -245,7 +245,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
             }
             if let Some(max_tape_entries_per_response) = file_gateway.max_tape_entries_per_response
             {
-                gateway.max_tape_entries_per_response = parse_positive_usize(
+                gateway.max_tape_entries_per_response = parse_gateway_tape_entry_limit(
                     max_tape_entries_per_response,
                     "gateway.max_tape_entries_per_response",
                 )?;
@@ -1654,7 +1654,7 @@ fn load_config_from_resolved_path(config_path: Option<PathBuf>) -> Result<Loaded
     if let Ok(max_tape_entries_per_response) =
         env::var("PALYRA_GATEWAY_MAX_TAPE_ENTRIES_PER_RESPONSE")
     {
-        gateway.max_tape_entries_per_response = parse_positive_usize(
+        gateway.max_tape_entries_per_response = parse_gateway_tape_entry_limit(
             max_tape_entries_per_response
                 .parse::<u64>()
                 .context("PALYRA_GATEWAY_MAX_TAPE_ENTRIES_PER_RESPONSE must be a valid u64")?,
@@ -5880,6 +5880,15 @@ fn parse_positive_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).with_context(|| format!("{name} exceeds platform usize range"))
 }
 
+fn parse_gateway_tape_entry_limit(value: u64, name: &str) -> Result<usize> {
+    parse_bounded_usize(
+        parse_positive_usize(value, name)?,
+        1,
+        MAX_GATEWAY_TAPE_ENTRIES_PER_RESPONSE,
+        name,
+    )
+}
+
 fn parse_bounded_u64(value: u64, minimum: u64, maximum: u64, name: &str) -> Result<u64> {
     if !(minimum..=maximum).contains(&value) {
         anyhow::bail!("{name} must be between {minimum} and {maximum}");
@@ -6067,28 +6076,29 @@ mod tests {
         parse_canvas_host_public_base_url, parse_channel_identifier_list,
         parse_channel_routing_rule, parse_content_type_allowlist, parse_cron_timezone_mode,
         parse_default_memory_ttl_ms, parse_direct_message_policy, parse_dns_suffix_allowlist,
-        parse_host_allowlist, parse_http_fetch_credential_bindings, parse_http_header_allowlist,
-        parse_journal_db_path, parse_mcp_server_config, parse_memory_retention_vacuum_schedule,
-        parse_model_provider_auth_provider_kind, parse_model_provider_registry_entry,
-        parse_model_provider_registry_model, parse_openai_base_url, parse_openai_embeddings_dims,
-        parse_optional_auth_profile_id, parse_optional_browser_state_dir,
-        parse_optional_openai_embeddings_model, parse_optional_sha256_digest_field,
-        parse_optional_vault_ref_field, parse_positive_u32, parse_positive_usize,
-        parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
-        parse_process_runner_path_access_mode, parse_process_runner_tier,
-        parse_promoted_runtime_mode, parse_provider_reasoning_effort, parse_provider_service_tier,
-        parse_root_file_config, parse_runtime_preview_mode, parse_storage_prefix_allowlist,
-        parse_structured_secret_ref_field, parse_tool_allowlist, parse_vault_dir,
-        parse_vault_ref_allowlist, validate_acp_runtime_registry, validate_connector_auth_binding,
-        validate_optional_capability_dependencies, validate_runtime_preview_config,
-        AcpRuntimeBackendConfig, AcpRuntimeConfig, AdminConfig, AuxiliaryExecutorConfig,
-        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
-        DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FileAcpRuntimeBackendConfig,
-        FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
-        HttpFetchConfig, HttpFetchCredentialBindingConfig, IdentityConfig, MemoryConfig,
-        ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig, ProcessRunnerConfig,
-        PruningPolicyMatrixConfig, ReplayCaptureConfig, RetrievalDualPathConfig,
-        RuntimeKernelProfile, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
+        parse_gateway_tape_entry_limit, parse_host_allowlist, parse_http_fetch_credential_bindings,
+        parse_http_header_allowlist, parse_journal_db_path, parse_mcp_server_config,
+        parse_memory_retention_vacuum_schedule, parse_model_provider_auth_provider_kind,
+        parse_model_provider_registry_entry, parse_model_provider_registry_model,
+        parse_openai_base_url, parse_openai_embeddings_dims, parse_optional_auth_profile_id,
+        parse_optional_browser_state_dir, parse_optional_openai_embeddings_model,
+        parse_optional_sha256_digest_field, parse_optional_vault_ref_field, parse_positive_u32,
+        parse_positive_usize, parse_process_executable_allowlist,
+        parse_process_runner_egress_enforcement_mode, parse_process_runner_path_access_mode,
+        parse_process_runner_tier, parse_promoted_runtime_mode, parse_provider_reasoning_effort,
+        parse_provider_service_tier, parse_root_file_config, parse_runtime_preview_mode,
+        parse_storage_prefix_allowlist, parse_structured_secret_ref_field, parse_tool_allowlist,
+        parse_vault_dir, parse_vault_ref_allowlist, validate_acp_runtime_registry,
+        validate_connector_auth_binding, validate_optional_capability_dependencies,
+        validate_runtime_preview_config, AcpRuntimeBackendConfig, AcpRuntimeConfig, AdminConfig,
+        AuxiliaryExecutorConfig, BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig,
+        CronConfig, DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode,
+        FileAcpRuntimeBackendConfig, FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig,
+        GatewayTlsConfig, HttpFetchConfig, HttpFetchCredentialBindingConfig, IdentityConfig,
+        MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
+        ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
+        RetrievalDualPathConfig, RuntimeKernelProfile, SessionQueuePolicyConfig, StorageConfig,
+        ToolCallConfig, MAX_GATEWAY_TAPE_ENTRIES_PER_RESPONSE,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
     use crate::model_provider::{
@@ -9342,6 +9352,24 @@ state_dir = "browserd-state"
     fn parse_positive_usize_rejects_zero() {
         let result = parse_positive_usize(0, "gateway.max_tape_entries_per_response");
         assert!(result.is_err(), "zero should not be accepted for positive usize fields");
+    }
+
+    #[test]
+    fn gateway_tape_entry_limit_rejects_oversized_allocations() {
+        let error = parse_gateway_tape_entry_limit(
+            u64::try_from(MAX_GATEWAY_TAPE_ENTRIES_PER_RESPONSE)
+                .expect("gateway tape maximum should fit u64")
+                + 1,
+            "gateway.max_tape_entries_per_response",
+        )
+        .expect_err("oversized gateway tape page must be rejected");
+
+        assert!(
+            error.to_string().contains(
+                format!("between 1 and {MAX_GATEWAY_TAPE_ENTRIES_PER_RESPONSE}").as_str()
+            ),
+            "error should identify the supported gateway tape page range"
+        );
     }
 
     #[test]

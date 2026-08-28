@@ -20983,12 +20983,15 @@ api key: qwerty
                 .expect("failure output should be UTF-8 JSON");
 
         for secret in ["hunter2", "qwerty", "abc123"] {
-            assert!(!payload.contains(secret), "failure payload leaked {secret}: {payload}");
+            assert!(!payload.contains(secret), "failure payload contained an unredacted sentinel");
         }
-        assert!(payload.contains("stderr_preview"), "{payload}");
+        assert!(
+            payload.contains("stderr_preview"),
+            "failure payload omitted the stderr preview field"
+        );
         assert!(
             payload.contains("<redacted>") || payload.contains("[REDACTED_SECRET]"),
-            "{payload}"
+            "failure payload omitted its redaction marker"
         );
     }
 
@@ -21003,13 +21006,22 @@ api key: qwerty
         let message =
             process_failure_message(super::ProcessFailureClass::NonzeroExit, 101, &stdout, &stderr);
 
-        assert!(message.contains("stderr_bytes="), "{message}");
-        assert!(message.contains("stderr_preview=Some("), "{message}");
-        assert!(!message.contains("stderr_tail="), "{message}");
-        assert!(!message.contains("unique-secret-suffix"), "{message}");
+        assert!(message.contains("stderr_bytes="), "failure message omitted the stderr byte count");
+        assert!(
+            message.contains("stderr_preview=Some("),
+            "failure message omitted the redacted stderr preview"
+        );
+        assert!(
+            !message.contains("stderr_tail="),
+            "failure message included a secret-bearing stderr tail"
+        );
+        assert!(
+            !message.contains("unique-secret-suffix"),
+            "failure message included the secret sentinel"
+        );
         assert!(
             message.contains("<redacted>") || message.contains("[REDACTED_SECRET]"),
-            "{message}"
+            "failure message omitted its redaction marker"
         );
     }
 
