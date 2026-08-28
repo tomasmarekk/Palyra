@@ -18,7 +18,7 @@ use anyhow::Result;
 use crate::{
     args::ChannelsDiscordCommand,
     commands::channels::{post_connector_action, resolve_connector_status},
-    output::channels as channels_output,
+    output::{self, channels as channels_output},
 };
 
 /// Dispatches a `palyra channels discord` subcommand to its handler.
@@ -66,7 +66,7 @@ pub(crate) fn run(command: ChannelsDiscordCommand) -> Result<()> {
                 channel,
                 "failed to call discord channels status endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            emit_status(response, json)?;
         }
         ChannelsDiscordCommand::HealthRefresh {
             account_id,
@@ -90,7 +90,7 @@ pub(crate) fn run(command: ChannelsDiscordCommand) -> Result<()> {
                 channel,
                 "failed to call discord channels health-refresh endpoint",
             )?;
-            channels_output::emit_status(response, json)?;
+            emit_status(response, json)?;
         }
         ChannelsDiscordCommand::Verify {
             account_id,
@@ -121,4 +121,14 @@ pub(crate) fn run(command: ChannelsDiscordCommand) -> Result<()> {
         )?,
     }
     Ok(())
+}
+
+fn emit_status(response: serde_json::Value, explicit_json: bool) -> Result<()> {
+    if output::preferred_json(explicit_json) {
+        channels_output::emit_status(response, true)
+    } else if output::preferred_ndjson(explicit_json, false) {
+        output::print_json_line(&response, "failed to encode Discord channel status as NDJSON")
+    } else {
+        channels_output::emit_status(response, false)
+    }
 }

@@ -101,6 +101,59 @@ fn channels_discord_status_and_health_refresh_preserve_text_and_json_contracts()
         "status output should preserve the queue operations line: {status_stdout}"
     );
 
+    for output_format in ["json", "ndjson"] {
+        let formatted_output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+            .args([
+                "--output-format",
+                output_format,
+                "channels",
+                "discord",
+                "status",
+                "--url",
+                base_url.as_str(),
+                "--token",
+                ADMIN_TOKEN,
+                "--principal",
+                "user:ops",
+                "--device-id",
+                DEVICE_ID,
+                "--channel",
+                "cli",
+            ])
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to execute palyra channels discord status with {output_format} output"
+                )
+            })?;
+        assert!(
+            formatted_output.status.success(),
+            "channels discord status with {output_format} output should succeed: {}",
+            String::from_utf8_lossy(&formatted_output.stderr)
+        );
+        let payload: Value =
+            serde_json::from_slice(&formatted_output.stdout).with_context(|| {
+                format!("channels discord status should emit valid {output_format}")
+            })?;
+        assert_eq!(
+            payload
+                .get("connector")
+                .and_then(|value| value.get("connector_id"))
+                .and_then(Value::as_str),
+            Some("discord:default"),
+            "global {output_format} output should preserve the connector identity"
+        );
+        if output_format == "ndjson" {
+            let stdout = String::from_utf8(formatted_output.stdout)
+                .context("NDJSON status stdout was not valid UTF-8")?;
+            assert_eq!(
+                stdout.lines().count(),
+                1,
+                "single-record status should emit one NDJSON line"
+            );
+        }
+    }
+
     let refresh_output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .args([
             "channels",
