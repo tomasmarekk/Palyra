@@ -12185,20 +12185,8 @@ fn update_skill_current_pointer(skill_root: &Path, version: &str) -> Result<()> 
     let current = skill_root.join(SKILLS_CURRENT_LINK_NAME);
     // exists() follows symlinks, so a dangling `current` link reports false;
     // the symlink_metadata branch below still detects and clears it.
-    if current.exists() {
-        if current.is_dir() && !current.is_symlink() {
-            fs::remove_dir_all(current.as_path()).with_context(|| {
-                format!("failed to remove existing current directory {}", current.display())
-            })?;
-        } else {
-            fs::remove_file(current.as_path()).with_context(|| {
-                format!("failed to remove existing current pointer {}", current.display())
-            })?;
-        }
-    } else if fs::symlink_metadata(current.as_path()).is_ok() {
-        fs::remove_file(current.as_path()).with_context(|| {
-            format!("failed to remove existing current pointer {}", current.display())
-        })?;
+    if current.exists() || fs::symlink_metadata(current.as_path()).is_ok() {
+        remove_skill_current_entry(current.as_path())?;
     }
     let created = create_optional_directory_symlink(version, current.as_path())?;
     if !created {
@@ -12216,14 +12204,38 @@ fn remove_skill_current_pointer(skill_root: &Path) -> Result<()> {
     if !current.exists() && fs::symlink_metadata(current.as_path()).is_err() {
         return Ok(());
     }
-    if current.is_dir() && !current.is_symlink() {
-        fs::remove_dir_all(current.as_path())
+    remove_skill_current_entry(current.as_path())
+}
+
+fn remove_skill_current_entry(current: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(current)
+        .with_context(|| format!("failed to inspect current pointer {}", current.display()))?;
+    if metadata.file_type().is_symlink() {
+        remove_directory_symlink(current)
+            .with_context(|| format!("failed to remove current pointer {}", current.display()))?;
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(current)
             .with_context(|| format!("failed to remove current directory {}", current.display()))?;
     } else {
-        fs::remove_file(current.as_path())
+        fs::remove_file(current)
             .with_context(|| format!("failed to remove current pointer {}", current.display()))?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn remove_directory_symlink(link: &Path) -> Result<()> {
+    fs::remove_file(link).context("failed to unlink directory symlink")
+}
+
+#[cfg(windows)]
+fn remove_directory_symlink(link: &Path) -> Result<()> {
+    match fs::remove_dir(link) {
+        Ok(()) => Ok(()),
+        Err(directory_error) => fs::remove_file(link).with_context(|| {
+            format!("failed to remove symlink as a directory ({directory_error}) or file")
+        }),
+    }
 }
 
 #[cfg(unix)]

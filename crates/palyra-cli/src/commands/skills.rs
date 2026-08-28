@@ -1905,6 +1905,18 @@ fn run_skills_remove(
             SKILLS_CURRENT_LINK_NAME, skill_id, error
         );
     }
+    let skill_root = skills_root.join(skill_id.as_str());
+    if skill_root.is_dir()
+        && skill_root
+            .read_dir()
+            .with_context(|| format!("failed to inspect skill directory {}", skill_root.display()))?
+            .next()
+            .is_none()
+    {
+        fs::remove_dir(skill_root.as_path()).with_context(|| {
+            format!("failed to remove empty skill directory {}", skill_root.display())
+        })?;
+    }
     save_installed_skills_index(skills_root.as_path(), &index)?;
     append_skills_audit_event(
         skills_root.as_path(),

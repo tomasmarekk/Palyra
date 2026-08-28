@@ -567,6 +567,15 @@ fn skills_install_verify_remove_lifecycle_roundtrip() -> Result<()> {
         .and_then(Value::as_array)
         .context("list-after output must include entries array")?;
     assert!(entries_after.is_empty(), "installed skill list should be empty after removal");
+    let removed_skill_root = skills_dir.join("acme.echo_http");
+    assert!(
+        std::fs::symlink_metadata(removed_skill_root.join("current")).is_err(),
+        "skills remove must delete the current pointer even when its version target is gone"
+    );
+    assert!(
+        !removed_skill_root.exists(),
+        "skills remove must delete the empty per-skill directory"
+    );
 
     Ok(())
 }
