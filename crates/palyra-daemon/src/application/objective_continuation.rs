@@ -23,6 +23,7 @@ use crate::{
         ObjectiveGuardDisposition, ObjectiveGuardEvaluation,
         OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskRecord,
         OrchestratorBackgroundTaskWorkerUpdateRequest, OrchestratorRunStatusSnapshot,
+        OrchestratorTapeRecord,
     },
     objective_judge::{ObjectiveJudgeInput, ObjectiveJudgeOutput, ObjectiveJudgeStatus},
     objectives::{
@@ -37,6 +38,7 @@ const OBJECTIVE_CONTINUATION_PRIORITY: i64 = -100;
 const OBJECTIVE_JUDGE_PRIORITY: i64 = -90;
 const OBJECTIVE_PARSE_RETRY_LIMIT: u64 = 3;
 const OBJECTIVE_RECONCILE_LIMIT: usize = 256;
+const OBJECTIVE_CANDIDATE_FINAL_MAX_BYTES: usize = 8 * 1_024;
 
 /// Bounded startup reconciliation outcome exposed to startup diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -389,13 +391,14 @@ async fn reserve_and_enqueue_judge(
     let mut evidence_refs = objective.linked_artifact_paths.clone();
     evidence_refs.extend(objective.linked_run_ids.clone());
     evidence_refs.push(format!("run:{}", source_run.run_id));
+    let (candidate_final, candidate_event_ref) =
+        objective_candidate_final(runtime, source_run).await?;
+    if let Some(candidate_event_ref) = candidate_event_ref {
+        evidence_refs.push(candidate_event_ref);
+    }
     evidence_refs.sort();
     evidence_refs.dedup();
     evidence_refs.truncate(128);
-    let candidate_final = Some(format!(
-        "Terminal objective run {} completed with state {}.",
-        source_run.run_id, source_run.state
-    ));
     let input = ObjectiveJudgeInput::from_objective(objective, candidate_final, evidence_refs);
     let judge_payload_json = serde_json::to_string(&input).map_err(|error| {
         Status::internal(format!("failed to encode objective judge input: {error}"))
@@ -443,6 +446,61 @@ async fn reserve_and_enqueue_judge(
     .map_err(|_| Status::internal("objective attempt reservation worker panicked"))??;
     ensure_judge_task(runtime, &attempt).await?;
     mark_judge_enqueued(runtime, attempt.judge_task_id.clone()).await
+}
+
+/// Projects the latest redacted user-visible answer from the source run into
+/// bounded judge input, falling back to terminal metadata when no answer was
+/// persisted.
+async fn objective_candidate_final(
+    runtime: &Arc<GatewayRuntimeState>,
+    source_run: &OrchestratorRunStatusSnapshot,
+) -> Result<(Option<String>, Option<String>), Status> {
+    let state = Arc::clone(runtime);
+    let run_id = source_run.run_id.clone();
+    let tape = tokio::task::spawn_blocking(move || {
+        state.journal_store.orchestrator_tape(run_id.as_str()).map_err(objective_journal_status)
+    })
+    .await
+    .map_err(|_| Status::internal("objective candidate evidence worker panicked"))??;
+    if let Some((answer, event_type)) = candidate_answer_from_tape(tape.as_slice()) {
+        return Ok((
+            Some(truncate_utf8_bytes(answer, OBJECTIVE_CANDIDATE_FINAL_MAX_BYTES)),
+            Some(format!("tape:{}:{event_type}", source_run.run_id)),
+        ));
+    }
+    Ok((
+        Some(format!(
+            "Terminal objective run {} completed with state {}.",
+            source_run.run_id, source_run.state
+        )),
+        None,
+    ))
+}
+
+fn candidate_answer_from_tape(tape: &[OrchestratorTapeRecord]) -> Option<(String, &'static str)> {
+    for event_type in ["agent_loop.terminated", "message.replied", "provider_turn_output"] {
+        for event in tape.iter().rev().filter(|event| event.event_type == event_type) {
+            let Ok(payload) = serde_json::from_str::<Value>(event.payload_json.as_str()) else {
+                continue;
+            };
+            let candidate = match event_type {
+                "agent_loop.terminated" => {
+                    payload.pointer("/finalization/user_visible_message").and_then(Value::as_str)
+                }
+                "message.replied" => {
+                    payload.get("reply_text").and_then(Value::as_str).or_else(|| {
+                        payload.pointer("/message/replied/reply_text").and_then(Value::as_str)
+                    })
+                }
+                "provider_turn_output" => payload.get("full_text").and_then(Value::as_str),
+                _ => None,
+            };
+            if let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty()) {
+                return Some((candidate.to_owned(), event_type));
+            }
+        }
+    }
+    None
 }
 
 async fn ensure_judge_task(
@@ -1217,6 +1275,55 @@ fn objective_registry_status(error: crate::objectives::ObjectiveRegistryError) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn objective_candidate_uses_terminal_user_visible_answer() {
+        let tape = vec![
+            OrchestratorTapeRecord {
+                seq: 1,
+                event_type: "provider_turn_output".to_owned(),
+                payload_json: json!({"full_text": "draft answer"}).to_string(),
+            },
+            OrchestratorTapeRecord {
+                seq: 2,
+                event_type: "agent_loop.terminated".to_owned(),
+                payload_json: json!({
+                    "finalization": {
+                        "user_visible_message": "OBJECTIVE_CLI_OK"
+                    }
+                })
+                .to_string(),
+            },
+        ];
+
+        let (answer, event_type) =
+            candidate_answer_from_tape(tape.as_slice()).expect("candidate answer should exist");
+
+        assert_eq!(answer, "OBJECTIVE_CLI_OK");
+        assert_eq!(event_type, "agent_loop.terminated");
+    }
+
+    #[test]
+    fn objective_candidate_falls_back_to_latest_provider_output() {
+        let tape = vec![
+            OrchestratorTapeRecord {
+                seq: 1,
+                event_type: "provider_turn_output".to_owned(),
+                payload_json: json!({"full_text": "first"}).to_string(),
+            },
+            OrchestratorTapeRecord {
+                seq: 2,
+                event_type: "provider_turn_output".to_owned(),
+                payload_json: json!({"full_text": " final answer "}).to_string(),
+            },
+        ];
+
+        let (answer, event_type) =
+            candidate_answer_from_tape(tape.as_slice()).expect("candidate answer should exist");
+
+        assert_eq!(answer, "final answer");
+        assert_eq!(event_type, "provider_turn_output");
+    }
 
     #[test]
     fn objective_outcome_preserves_verification_and_missing_artifacts() {
