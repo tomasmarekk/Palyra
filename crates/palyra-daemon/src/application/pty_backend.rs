@@ -615,10 +615,13 @@ impl NativePtySession {
         drop(pair.slave);
         let pid = child.process_id().ok_or(PtyBackendError::MissingProcessIdentity)?;
         #[cfg(unix)]
-        let process_group_id = pair
-            .master
-            .process_group_leader()
-            .ok_or_else(|| PtyBackendError::Spawn("PTY process group is unavailable".to_owned()))?;
+        // The Unix portable-pty launcher completes `setsid()` before spawn
+        // succeeds, so the child PID is the stable session and process-group
+        // anchor. Querying the foreground group through the master races a
+        // short-lived child and can spuriously degrade a real PTY to pipes.
+        let process_group_id = libc::pid_t::try_from(pid).map_err(|_| {
+            PtyBackendError::Spawn("PTY process identity exceeds the Unix PID range".to_owned())
+        })?;
         #[cfg(windows)]
         let job = WindowsPtyJob::bind(child.as_ref(), pid)?;
         let reader = pair
