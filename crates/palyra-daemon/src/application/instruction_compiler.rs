@@ -420,7 +420,7 @@ mod tests {
         let first = compiler.compile_with_runtime_context(input.clone(), fixed_runtime_context());
         let second = compiler.compile_with_runtime_context(input, fixed_runtime_context());
         assert_eq!(first.hash, second.hash);
-        assert_eq!(first.version, 35);
+        assert_eq!(first.version, 36);
         assert_eq!(first.provider_messages().len(), 2);
     }
 
