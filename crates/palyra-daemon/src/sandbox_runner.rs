@@ -6331,6 +6331,14 @@ fn validate_host_interpreter_argument_guardrails_with_roots(
     args: &[String],
     host_roots: &[PathBuf],
 ) -> Result<(), SandboxProcessRunError> {
+    if host_command_bridges_unscoped_namespace(command) {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!(
+                "sandbox denied: host namespace bridge '{command}' cannot enforce Windows approved-root authority inside the nested runtime; use an enforceable Tier C sandbox or a dedicated nested-runtime authority"
+            ),
+        });
+    }
     if !process_executable_is_interpreter(command.trim()) {
         return Ok(());
     }
@@ -6368,6 +6376,15 @@ fn validate_host_interpreter_argument_guardrails_with_roots(
     }
 
     Ok(())
+}
+
+fn host_command_bridges_unscoped_namespace(command: &str) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    // These Windows launchers cross into a separate WSL filesystem, where
+    // relative paths and HOME no longer inherit the approved Windows roots.
+    matches!(normalized_process_command_name(command).as_str(), "wsl" | "bash")
 }
 
 fn interpreter_absolute_path_argument_stays_in_workspace(
@@ -14370,6 +14387,30 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace.as_path());
         let _ = fs::remove_dir_all(outside.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn host_access_rejects_relative_wsl_execution_outside_windows_root_authority() {
+        let workspace = unique_temp_dir("workspace-host-wsl-relative-deny");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args =
+            vec!["--exec".to_owned(), "sh".to_owned(), "scripts/configure-user.sh".to_owned()];
+
+        let error = validate_host_interpreter_argument_guardrails_with_roots(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "wsl.exe",
+            args.as_slice(),
+            std::slice::from_ref(&canonical_workspace),
+        )
+        .expect_err("WSL must not inherit Windows approved-root authority");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("nested runtime"), "{}", error.message);
+        let _ = fs::remove_dir_all(workspace.as_path());
     }
 
     #[test]
