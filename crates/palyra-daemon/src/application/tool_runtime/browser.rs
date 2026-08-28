@@ -379,13 +379,20 @@ fn browser_tool_requires_open_session(tool_name: &str) -> bool {
 ///
 /// A `file://` target reaches this helper only after the caller has confined
 /// the canonical file to an active workspace root. Network targets require the
-/// explicit model-visible opt-in carried by an approval-gated browser call.
+/// explicit model-visible opt-in carried by the browser call.
 fn browser_private_target_flag_for_validated_url(url: &str, explicitly_allowed: bool) -> bool {
     browser_url_uses_file_scheme(url) || explicitly_allowed
 }
 
 fn browser_private_targets_requested(payload: &serde_json::Map<String, Value>) -> bool {
     payload.get("allow_private_targets").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn browser_reload_private_target_flag_for_validated_url(
+    url: &str,
+    payload: &serde_json::Map<String, Value>,
+) -> bool {
+    browser_private_target_flag_for_validated_url(url, browser_private_targets_requested(payload))
 }
 
 fn browser_url_uses_file_scheme(raw_url: &str) -> bool {
@@ -400,8 +407,7 @@ fn browser_reload_expected_url_from_payload(
     let Some(expected_url) = payload.get("expected_url").and_then(Value::as_str).map(str::trim)
     else {
         return Err(
-            "palyra.browser.reload requires expected_url so approval shows the reload destination"
-                .to_owned(),
+            "palyra.browser.reload requires expected_url to bind the reload destination".to_owned()
         );
     };
     if expected_url.is_empty() || expected_url.chars().any(char::is_control) {
@@ -1882,7 +1888,7 @@ pub(crate) async fn execute_browser_tool(
                 ),
             }
         }
-        // browserd has no native reload RPC: reload binds an approval-visible
+        // browserd has no native reload RPC: reload binds the model-visible
         // expected_url to the active tab URL, then re-navigates it with the
         // same file-URL and private-target checks as a fresh navigation.
         BROWSER_RELOAD_TOOL_NAME => {
@@ -2030,8 +2036,10 @@ pub(crate) async fn execute_browser_tool(
                     error,
                 );
             }
-            let allow_private_targets =
-                browser_private_target_flag_for_validated_url(current_url.as_str(), false);
+            let allow_private_targets = browser_reload_private_target_flag_for_validated_url(
+                current_url.as_str(),
+                &payload,
+            );
             let requested_url = redact_url(current_url.as_str());
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
@@ -6011,21 +6019,22 @@ mod tests {
         browser_max_redirects_from_payload, browser_network_log_entry_to_json,
         browser_observe_include_visible_text, browser_output_with_runtime_capabilities,
         browser_private_target_flag_for_validated_url, browser_private_targets_requested,
-        browser_reload_expected_url_from_payload, browser_rescue_rollout_disabled_output,
-        browser_rescue_trace_payload, browser_resilience_rollout_mismatch,
-        browser_screenshot_image_observation_hint, browser_session_closed_error_message,
-        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
-        browser_storage_origin_to_json, browser_tool_execution_outcome,
-        browser_tool_requires_open_session, browser_user_owned_os_roots,
-        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
-        default_browser_session_persistence_id, evaluate_browser_rescue_trigger,
-        filter_browser_network_log_entries_since, normalize_browser_press_key_input,
-        parse_browser_download_artifact_id, parse_browser_observe_string_array,
-        resolve_browser_output_path, resolve_browser_upload_path,
-        validate_browser_file_url_path_scope, validate_browser_workspace_relative_path,
-        write_browser_output_file, BrowserRescueTriggerKind, BrowserRuntimeCapabilities,
-        BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
-        BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
+        browser_reload_expected_url_from_payload,
+        browser_reload_private_target_flag_for_validated_url,
+        browser_rescue_rollout_disabled_output, browser_rescue_trace_payload,
+        browser_resilience_rollout_mismatch, browser_screenshot_image_observation_hint,
+        browser_session_closed_error_message, browser_session_persistence_from_payload,
+        browser_session_profile_id_from_payload, browser_storage_origin_to_json,
+        browser_tool_execution_outcome, browser_tool_requires_open_session,
+        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
+        canonical_file_path_is_inside_workspace_roots, default_browser_session_persistence_id,
+        evaluate_browser_rescue_trigger, filter_browser_network_log_entries_since,
+        normalize_browser_press_key_input, parse_browser_download_artifact_id,
+        parse_browser_observe_string_array, resolve_browser_output_path,
+        resolve_browser_upload_path, validate_browser_file_url_path_scope,
+        validate_browser_workspace_relative_path, write_browser_output_file,
+        BrowserRescueTriggerKind, BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER,
+        BROWSER_COOKIE_VALUE_WITHHELD, BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -6569,12 +6578,27 @@ mod tests {
         assert!(error.contains("expected_url is invalid"));
 
         let visible_destination =
-            json!({"expected_url": "https://example.test/dashboard?nonce=approval-visible"});
+            json!({"expected_url": "https://example.test/dashboard?nonce=destination-bound"});
         let expected_url = browser_reload_expected_url_from_payload(
             visible_destination.as_object().expect("payload should be an object"),
         )
         .expect("valid expected_url should parse");
-        assert_eq!(expected_url, "https://example.test/dashboard?nonce=approval-visible");
+        assert_eq!(expected_url, "https://example.test/dashboard?nonce=destination-bound");
+    }
+
+    #[test]
+    fn browser_reload_private_target_flag_honors_model_visible_opt_in() {
+        let private_reload = json!({"allow_private_targets": true});
+        assert!(browser_reload_private_target_flag_for_validated_url(
+            "http://127.0.0.1:4173/dashboard",
+            private_reload.as_object().expect("payload should be an object"),
+        ));
+
+        let default_reload = json!({});
+        assert!(!browser_reload_private_target_flag_for_validated_url(
+            "http://127.0.0.1:4173/dashboard",
+            default_reload.as_object().expect("payload should be an object"),
+        ));
     }
 
     #[test]

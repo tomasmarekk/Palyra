@@ -2397,7 +2397,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 "allow_private_targets",
                 json!({
                     "type":"boolean",
-                    "description":"Set true only when the user explicitly authorizes this approval-gated navigation to localhost, loopback, or another private-network target. Omit or leave false for public targets. Browserd still validates the destination and redirects."
+                    "description":"Set true when this navigation needs localhost, loopback, or another private-network target. Omit or leave false for public targets. Browserd still validates the destination and redirects."
                 }),
             ));
             required.push("url");
@@ -2417,7 +2417,14 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 "expected_url",
                 json!({
                     "type":"string",
-                    "description":"Required active tab URL expected to be reloaded. Obtain it from palyra.browser.tabs.list or palyra.browser.session.create output and copy it exactly so approval shows the destination and runtime can fail closed if the active tab changed."
+                    "description":"Required active tab URL expected to be reloaded. Obtain it from palyra.browser.tabs.list or palyra.browser.session.create output and copy it exactly so runtime can fail closed if the active tab changed."
+                }),
+            ));
+            properties.push((
+                "allow_private_targets",
+                json!({
+                    "type":"boolean",
+                    "description":"Set true when reloading localhost, loopback, or another private-network URL. Omit or leave false for public targets. Browserd still validates the destination and redirects."
                 }),
             ));
             properties.push((
@@ -2551,7 +2558,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 "allow_private_targets",
                 json!({
                     "type":"boolean",
-                    "description":"Set true only when the user explicitly authorizes this approval-gated session to reach localhost, loopback, or another private-network target. Omit or leave false for ordinary public browsing. Browserd still validates each destination and redirect."
+                    "description":"Set true when this session needs localhost, loopback, or another private-network target. Omit or leave false for ordinary public browsing. Browserd still validates each destination and redirect."
                 }),
             ));
             properties.push((
@@ -2823,7 +2830,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_reload_registry_requires_approval_visible_expected_url() {
+    fn browser_reload_registry_requires_fail_closed_expected_url() {
         let reload = registry_entry("palyra.browser.reload").expect("reload entry exists");
         let required = reload
             .input_schema
@@ -2839,7 +2846,6 @@ mod tests {
             .pointer("/properties/expected_url/description")
             .and_then(serde_json::Value::as_str)
             .expect("reload expected_url description should be visible to models");
-        assert!(expected_url_description.contains("approval shows the destination"));
         assert!(expected_url_description.contains("fail closed"));
     }
 
@@ -3295,8 +3301,7 @@ mod tests {
             .pointer("/properties/allow_private_targets/description")
             .and_then(serde_json::Value::as_str)
             .expect("navigation should expose an explicit private-target capability");
-        assert!(private_target_description.contains("explicitly authorizes"));
-        assert!(private_target_description.contains("approval-gated"));
+        assert!(!private_target_description.contains("approval"));
         assert!(private_target_description.contains("localhost"));
 
         let reload = registry_entry("palyra.browser.reload").expect("reload entry exists");
@@ -3305,7 +3310,7 @@ mod tests {
             Some("session_id")
         );
         assert!(reload.input_schema.pointer("/properties/url").is_none());
-        assert!(reload.input_schema.pointer("/properties/allow_private_targets").is_none());
+        assert!(reload.input_schema.pointer("/properties/allow_private_targets").is_some());
         assert!(reload.input_schema.pointer("/properties/allow_redirects").is_some());
         assert!(reload.input_schema.pointer("/properties/max_redirects").is_some());
         let session_create =
