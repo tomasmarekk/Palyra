@@ -1354,15 +1354,15 @@ fn resolve_final_state_root(
         return parse_config_path(explicit)
             .with_context(|| format!("state root path is invalid: {explicit}"));
     }
-    if let Some(raw) = normalize_optional_text(env::var("PALYRA_STATE_ROOT").ok().as_deref()) {
-        return parse_config_path(raw)
-            .with_context(|| "PALYRA_STATE_ROOT contains an invalid path");
-    }
     if let Some(profile_state_root) =
         profile.and_then(|profile| normalize_optional_text(profile.state_root.as_deref()))
     {
         return parse_config_path(profile_state_root)
             .with_context(|| format!("profile state_root is invalid: {profile_state_root}"));
+    }
+    if let Some(raw) = normalize_optional_text(env::var("PALYRA_STATE_ROOT").ok().as_deref()) {
+        return parse_config_path(raw)
+            .with_context(|| "PALYRA_STATE_ROOT contains an invalid path");
     }
     resolve_cli_state_root(None)
 }
@@ -1427,16 +1427,6 @@ fn resolve_config_path(
         return Ok(managed_path.exists().then_some(managed_path));
     }
 
-    if let Ok(raw) = env::var("PALYRA_CONFIG") {
-        if let Some(raw) = normalize_optional_text(Some(raw.as_str())) {
-            let parsed =
-                parse_config_path(raw).with_context(|| "PALYRA_CONFIG contains an invalid path")?;
-            if parsed.exists() {
-                return Ok(Some(parsed));
-            }
-        }
-    }
-
     if let Some(profile_path) =
         profile.and_then(|profile| normalize_optional_text(profile.config_path.as_deref()))
     {
@@ -1446,6 +1436,16 @@ fn resolve_config_path(
             anyhow::bail!("profile config file does not exist: {}", parsed.display());
         }
         return Ok(Some(parsed));
+    }
+
+    if let Ok(raw) = env::var("PALYRA_CONFIG") {
+        if let Some(raw) = normalize_optional_text(Some(raw.as_str())) {
+            let parsed =
+                parse_config_path(raw).with_context(|| "PALYRA_CONFIG contains an invalid path")?;
+            if parsed.exists() {
+                return Ok(Some(parsed));
+            }
+        }
     }
 
     Ok(default_config_search_paths().into_iter().find(|candidate| candidate.exists()))
@@ -1977,7 +1977,7 @@ mode = "local"
     }
 
     #[test]
-    fn env_overrides_default_profile_config_path_and_state_root() -> Result<()> {
+    fn active_profile_paths_override_launcher_environment() -> Result<()> {
         let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
         clear_env();
         let temp = tempdir()?;
@@ -2027,11 +2027,11 @@ port = 9222
         let context =
             build_root_context(RootOptions::default(), ExplicitConfigPathPolicy::RequireExisting)?;
 
-        assert_eq!(context.config_path(), Some(env_config.as_path()));
-        assert_eq!(context.state_root(), env_state_root.as_path());
+        assert_eq!(context.config_path(), Some(profile_config.as_path()));
+        assert_eq!(context.state_root(), profile_state_root.as_path());
         let http = context
             .resolve_http_connection(ConnectionOverrides::default(), ConnectionDefaults::ADMIN)?;
-        assert_eq!(http.base_url, "http://127.0.0.1:9222");
+        assert_eq!(http.base_url, "http://127.0.0.1:8110");
         Ok(())
     }
 
