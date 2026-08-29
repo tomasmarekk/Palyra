@@ -1862,6 +1862,23 @@ pub fn shadow_manual_schedule_payload_json() -> String {
     .to_string()
 }
 
+/// Returns the operator-visible enabled state for a routine.
+///
+/// Clock-driven routines retain cron's exhausted one-shot semantics. Event
+/// routines use an inert `at` row only for storage compatibility, so their
+/// absence of a next tick must not make an enabled definition appear disabled.
+#[must_use]
+pub(crate) fn visible_routine_enabled(
+    job: &CronJobRecord,
+    trigger_kind: RoutineTriggerKind,
+) -> bool {
+    if matches!(trigger_kind, RoutineTriggerKind::Schedule | RoutineTriggerKind::FileWatch) {
+        cron::visible_cron_job_enabled(job)
+    } else {
+        job.enabled
+    }
+}
+
 /// Validates a raw file-watch trigger payload and takes the initial observation.
 ///
 /// With `fire_on_start` the baseline is left empty so the first poll reports an event even for
@@ -3681,17 +3698,17 @@ mod tests {
         routine_capability_profile_projection, routine_delivery_contract, routine_delivery_preview,
         routine_retention_dry_run, routine_run_lifecycle_snapshot, routine_runtime_backfill_plan,
         shadow_manual_schedule_payload_json, validate_routine_export_bundle,
-        validate_routine_prompt_self_contained, CronRoutinePreviewAuditDecision,
-        CronRoutinePreviewAuditInput, CronRoutinePreviewAuditProjection,
-        CronRoutinePreviewAuditReasonCode, HeartbeatDeliveryDecision,
-        HeartbeatDeliveryJournalProjection, HeartbeatDeliveryReasonCode, RoutineApprovalGateState,
-        RoutineApprovalMode, RoutineApprovalPolicy, RoutineCapabilityProfileDecision,
-        RoutineCapabilityProfileProjection, RoutineCapabilityProfileReasonCode,
-        RoutineDeliveryConfig, RoutineDeliveryContractKind, RoutineDeliveryMode,
-        RoutineExecutionConfig, RoutineExecutionPosture, RoutineMetadataRecord, RoutineRegistry,
-        RoutineRetentionPolicy, RoutineRunLeaseState, RoutineRunMetadataRecord,
-        RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind, RoutineSilentPolicy,
-        RoutineTriggerKind, CRON_ROUTINE_PREVIEW_AUDIT_EVENT_COMPLETED,
+        validate_routine_prompt_self_contained, visible_routine_enabled,
+        CronRoutinePreviewAuditDecision, CronRoutinePreviewAuditInput,
+        CronRoutinePreviewAuditProjection, CronRoutinePreviewAuditReasonCode,
+        HeartbeatDeliveryDecision, HeartbeatDeliveryJournalProjection, HeartbeatDeliveryReasonCode,
+        RoutineApprovalGateState, RoutineApprovalMode, RoutineApprovalPolicy,
+        RoutineCapabilityProfileDecision, RoutineCapabilityProfileProjection,
+        RoutineCapabilityProfileReasonCode, RoutineDeliveryConfig, RoutineDeliveryContractKind,
+        RoutineDeliveryMode, RoutineExecutionConfig, RoutineExecutionPosture,
+        RoutineMetadataRecord, RoutineRegistry, RoutineRetentionPolicy, RoutineRunLeaseState,
+        RoutineRunMetadataRecord, RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind,
+        RoutineSilentPolicy, RoutineTriggerKind, CRON_ROUTINE_PREVIEW_AUDIT_EVENT_COMPLETED,
         CRON_ROUTINE_PREVIEW_AUDIT_EVENT_STARTED, CRON_ROUTINE_PREVIEW_AUDIT_REDACTION_LEVEL,
         CRON_ROUTINE_PREVIEW_AUDIT_SCHEMA_VERSION, HEARTBEAT_DELIVERY_EVENT_COMPLETED,
         HEARTBEAT_DELIVERY_EVENT_STARTED, HEARTBEAT_DELIVERY_REDACTION_LEVEL,
@@ -3811,6 +3828,17 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
         }
+    }
+
+    #[test]
+    fn visible_enabled_state_distinguishes_event_shadows_from_exhausted_schedules() {
+        let job = sample_cron_job("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+
+        assert!(visible_routine_enabled(&job, RoutineTriggerKind::Manual));
+        assert!(!visible_routine_enabled(&job, RoutineTriggerKind::Schedule));
+
+        let disabled_job = CronJobRecord { enabled: false, ..job };
+        assert!(!visible_routine_enabled(&disabled_job, RoutineTriggerKind::Manual));
     }
 
     #[test]

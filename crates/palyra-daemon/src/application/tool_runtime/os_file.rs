@@ -45,7 +45,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     agents::AgentResolveRequest,
-    application::tool_runtime::workspace_scope::run_launch_context_path_env,
+    application::tool_runtime::workspace_scope::{
+        run_launch_context_path_env, workspace_roots_with_run_launch_context,
+    },
     gateway::{GatewayRuntimeState, ToolRuntimeExecutionContext, OS_FILE_TOOL_NAME},
     tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
@@ -230,9 +232,12 @@ async fn resolve_os_file_policy(
         })?;
     let agent_workspace_roots =
         agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
-    let authoritative_workspace_roots = runtime_state
-        .managed_coding_workspace_root(context.run_id)
-        .map_or(agent_workspace_roots, |root| vec![root]);
+    let authoritative_workspace_roots = workspace_roots_with_run_launch_context(
+        runtime_state,
+        context.run_id,
+        agent_workspace_roots.as_slice(),
+    )
+    .await;
     let workspace_roots = authoritative_workspace_roots
         .iter()
         .filter_map(|root| canonicalize_existing_dir(root.as_path()).ok())

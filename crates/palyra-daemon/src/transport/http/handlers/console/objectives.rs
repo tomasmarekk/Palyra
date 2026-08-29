@@ -1068,7 +1068,10 @@ async fn load_objective_routine(
         "job_id": job.job_id,
         "name": job.name,
         "prompt": job.prompt,
-        "enabled": cron::visible_cron_job_enabled(&job),
+        "enabled": crate::routines::visible_routine_enabled(
+            &job,
+            objective.automation.trigger_kind,
+        ),
         "channel": job.channel,
         "session_key": job.session_key,
         "session_label": job.session_label,

@@ -2530,7 +2530,7 @@ fn routine_view_from_parts(job: &CronJobRecord, metadata: &RoutineMetadataRecord
         "session_key": job.session_key,
         "session_label": job.session_label,
         "workdir": job.workdir,
-        "enabled": cron::visible_cron_job_enabled(job),
+        "enabled": crate::routines::visible_routine_enabled(job, metadata.trigger_kind),
         "schedule_type": job.schedule_type.as_str(),
         "schedule_payload": serde_json::from_str::<Value>(job.schedule_payload_json.as_str()).unwrap_or_else(|_| json!({ "raw": job.schedule_payload_json })),
         "next_run_at_unix_ms": cron::visible_next_run_at_unix_ms(job),
