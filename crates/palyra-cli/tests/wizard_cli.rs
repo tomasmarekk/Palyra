@@ -279,6 +279,98 @@ fn setup_wizard_quickstart_emits_json_summary() -> Result<()> {
 }
 
 #[test]
+fn setup_wizard_overrides_select_the_guided_path_without_wizard_switch() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("implicit-wizard").join("palyra.toml");
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let ports = unused_loopback_ports(3)?;
+    let daemon_port = ports[0].to_string();
+    let grpc_port = ports[1].to_string();
+    let quic_port = ports[2].to_string();
+
+    let output = run_cli(
+        &workdir,
+        &[
+            "setup",
+            "--mode",
+            "local",
+            "--path",
+            &config_path_string,
+            "--flow",
+            "quickstart",
+            "--non-interactive",
+            "--accept-risk",
+            "--auth-method",
+            "api-key",
+            "--api-key-env",
+            "OPENAI_API_KEY",
+            "--daemon-port",
+            &daemon_port,
+            "--grpc-port",
+            &grpc_port,
+            "--quic-port",
+            &quic_port,
+            "--skip-health",
+            "--skip-channels",
+            "--skip-skills",
+            "--json",
+        ],
+        &[("OPENAI_API_KEY", "sk-test-implicit-wizard")],
+    )?;
+
+    assert!(
+        output.status.success(),
+        "setup overrides should run the guided path: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value =
+        serde_json::from_slice(&output.stdout).context("setup stdout should be wizard JSON")?;
+    assert_eq!(payload.get("status").and_then(Value::as_str), Some("next_step_required"));
+    assert_eq!(payload.get("flow").and_then(Value::as_str), Some("quickstart"));
+    Ok(())
+}
+
+#[test]
+fn setup_remote_client_flow_rejects_server_tls_overrides() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("remote-public-tls").join("palyra.toml");
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output = run_cli(
+        &workdir,
+        &[
+            "setup",
+            "--mode",
+            "remote",
+            "--path",
+            &config_path_string,
+            "--flow",
+            "remote",
+            "--deployment-profile",
+            "single-vm",
+            "--bind-profile",
+            "public-tls",
+            "--tls-scaffold",
+            "self-signed",
+            "--non-interactive",
+            "--accept-risk",
+            "--json",
+        ],
+        &[],
+    )?;
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("creates a client-side connection profile")
+            && stderr.contains("use `--flow manual`"),
+        "setup should explain the conflicting client/server intent: {stderr}"
+    );
+    assert!(!config_path.exists(), "validation failure must not write a config");
+    Ok(())
+}
+
+#[test]
 fn setup_wizard_non_interactive_missing_risk_ack_names_accept_risk_flag() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");

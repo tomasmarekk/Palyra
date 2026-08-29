@@ -1,5 +1,5 @@
-//! `palyra setup` entry point: plain init by default, or the guided
-//! operator wizard with `--wizard`.
+//! `palyra setup` entry point: plain init by default, or the guided operator
+//! wizard when requested explicitly or through wizard-specific overrides.
 //!
 //! Both paths finish by activating the resulting config/state paths and
 //! ensuring a bootstrap local profile exists.
@@ -23,9 +23,11 @@ pub(crate) fn run_setup(
     let requested_path = path.clone();
     let deployment_profile = wizard_options.deployment_profile;
     let json = wizard_options.json;
-    if !wizard {
+    let use_wizard = wizard || has_wizard_specific_overrides(&wizard_options);
+    if !use_wizard {
         commands::init::run_init(mode, deployment_profile, path, force, tls_scaffold, json)?;
     } else {
+        validate_setup_flow_overrides(&wizard_options)?;
         let wizard_options = WizardOverridesArg {
             flow: wizard_options.flow,
             non_interactive: wizard_options.non_interactive,
@@ -69,4 +71,45 @@ pub(crate) fn run_setup(
     app::update_active_profile_paths(Some(config_path.as_path()), state_root.as_deref())?;
     app::ensure_bootstrap_local_profile(config_path.as_path(), state_root.as_deref())?;
     Ok(())
+}
+
+fn validate_setup_flow_overrides(options: &SetupWizardOverridesArg) -> Result<()> {
+    if options.flow == Some(OnboardingFlowArg::Remote)
+        && (options.bind_profile.is_some()
+            || options.tls_cert_path.is_some()
+            || options.tls_key_path.is_some())
+    {
+        anyhow::bail!(
+            "invalid setup option combination: `palyra setup --flow remote` creates a client-side connection profile and cannot apply server gateway TLS options; use `--flow manual` with provisioned `--tls-cert-path` and `--tls-key-path` values for a server-side public TLS setup"
+        );
+    }
+    Ok(())
+}
+
+fn has_wizard_specific_overrides(options: &SetupWizardOverridesArg) -> bool {
+    options.flow.is_some()
+        || options.non_interactive
+        || options.accept_risk
+        || options.workspace_root.is_some()
+        || options.auth_method.is_some()
+        || options.api_key_env.is_some()
+        || options.api_key_stdin
+        || options.api_key_prompt
+        || options.bind_profile.is_some()
+        || options.daemon_port.is_some()
+        || options.grpc_port.is_some()
+        || options.quic_port.is_some()
+        || options.tls_cert_path.is_some()
+        || options.tls_key_path.is_some()
+        || options.remote_base_url.is_some()
+        || options.admin_token_env.is_some()
+        || options.admin_token_stdin
+        || options.admin_token_prompt
+        || options.remote_verification.is_some()
+        || options.pinned_server_cert_sha256.is_some()
+        || options.pinned_gateway_ca_sha256.is_some()
+        || options.ssh_target.is_some()
+        || options.skip_health
+        || options.skip_channels
+        || options.skip_skills
 }

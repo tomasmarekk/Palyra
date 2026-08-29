@@ -105,53 +105,13 @@ struct AcpDaemonControl {
 impl AcpDaemonControl {
     /// Sends one `console/v1/acp/command` request and unwraps its envelope.
     async fn command(&self, command: &str, params: Value) -> acp::Result<Value> {
-        // The `client` block restates the full handshake (scopes plus
-        // capabilities) on every command because the console ACP endpoint is
-        // stateless across requests.
-        let payload = json!({
-            "client": {
-                "protocol_version": 1,
-                "client_id": "palyra-cli-acp",
-                "transport": "stdio",
-                "owner_principal": self.principal.clone(),
-                "device_id": self.device_id.clone(),
-                "channel": self.channel.clone(),
-                "scopes": [
-                    "sessions:read",
-                    "sessions:write",
-                    "runs:read",
-                    "runs:write",
-                    "approvals:read",
-                    "approvals:write",
-                    "bindings:read",
-                    "bindings:write",
-                    "events:read",
-                    "events:sensitive"
-                ],
-                "capabilities": [
-                    "session_list",
-                    "session_load",
-                    "session_new",
-                    "session_replay",
-                    "run_control",
-                    "approval_bridge",
-                    "pending_prompts",
-                    "session_config",
-                    "session_fork",
-                    "session_compact",
-                    "session_explain",
-                    "conversation_bindings",
-                    "binding_repair",
-                    "sensitive_replay"
-                ]
-            },
-            "command": {
-                "request_id": format!("acp_req_{}", ulid::Ulid::generate()),
-                "command": command,
-                "params": params,
-                "idempotency_key": format!("acp_idem_{}", ulid::Ulid::generate())
-            }
-        });
+        let payload = build_daemon_acp_command_payload(
+            self.principal.as_str(),
+            self.device_id.as_str(),
+            self.channel.as_deref(),
+            command,
+            params,
+        );
         let client = self.client.lock().await;
         let response =
             client.post_json_value("console/v1/acp/command", &payload).await.map_err(|error| {
@@ -166,6 +126,61 @@ impl AcpDaemonControl {
             error.get("message").and_then(Value::as_str).unwrap_or("daemon ACP command failed");
         Err(acp::Error::new(-32603, format!("{code}: {message}")))
     }
+}
+
+/// Builds the stateless handshake and command envelope for the daemon-facing
+/// HTTP ACP endpoint.
+fn build_daemon_acp_command_payload(
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    command: &str,
+    params: Value,
+) -> Value {
+    json!({
+        "client": {
+            "protocol_version": 1,
+            "client_id": "palyra-cli-acp",
+            // The outer ACP client speaks stdio to this bridge, but this
+            // handshake describes the bridge's authenticated HTTP hop.
+            "transport": "http",
+            "owner_principal": principal,
+            "device_id": device_id,
+            "channel": channel,
+            "scopes": [
+                "sessions:read",
+                "sessions:write",
+                "runs:read",
+                "runs:write",
+                "approvals:read",
+                "approvals:write",
+                "bindings:read",
+                "bindings:write",
+                "events:read"
+            ],
+            "capabilities": [
+                "session_list",
+                "session_load",
+                "session_new",
+                "session_replay",
+                "run_control",
+                "approval_bridge",
+                "pending_prompts",
+                "session_config",
+                "session_fork",
+                "session_compact",
+                "session_explain",
+                "conversation_bindings",
+                "binding_repair"
+            ]
+        },
+        "command": {
+            "request_id": format!("acp_req_{}", ulid::Ulid::generate()),
+            "command": command,
+            "params": params,
+            "idempotency_key": format!("acp_idem_{}", ulid::Ulid::generate())
+        }
+    })
 }
 
 /// In-memory binding and active-run registry shared across ACP handlers.

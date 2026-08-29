@@ -3,6 +3,10 @@
 
 use clap::Subcommand;
 
+fn parse_workboard_priority(raw: &str) -> Result<i64, String> {
+    raw.parse::<i64>().map_err(|_| "priority must be a signed integer, for example 50".to_owned())
+}
+
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum TasksCommand {
@@ -81,7 +85,12 @@ pub enum WorkboardCommand {
         title: String,
         #[arg(long)]
         summary: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "INTEGER",
+            value_parser = parse_workboard_priority,
+            help = "Set a signed numeric scheduling priority (default: 0, example: 50)"
+        )]
         priority: Option<i64>,
         #[arg(long)]
         session_id: Option<String>,
@@ -119,7 +128,12 @@ pub enum WorkboardCommand {
         id: String,
         #[arg(long)]
         state: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "INTEGER",
+            value_parser = parse_workboard_priority,
+            help = "Set a signed numeric scheduling priority (example: 50)"
+        )]
         priority: Option<i64>,
         #[arg(long)]
         assigned_worker: Option<String>,

@@ -2,11 +2,12 @@
 //! option semantics, session listing fallbacks, and binding lookups.
 
 use super::{
-    acp, build_tool_permission_request, format_acp_verification_summary,
-    map_list_sessions_response, map_permission_outcome, AcpSessionDefaults, ActiveRunGuard,
-    AgentConnection, BridgeState, ClientBridgeRequest, PalyraAcpAgent, SessionBinding,
-    TokioAsyncReadCompat, TokioAsyncWriteCompat, PERMISSION_ALLOW_ALWAYS, PERMISSION_ALLOW_ONCE,
-    PERMISSION_REJECT_ALWAYS, PERMISSION_REJECT_ONCE,
+    acp, build_daemon_acp_command_payload, build_tool_permission_request,
+    format_acp_verification_summary, map_list_sessions_response, map_permission_outcome,
+    AcpSessionDefaults, ActiveRunGuard, AgentConnection, BridgeState, ClientBridgeRequest,
+    PalyraAcpAgent, SessionBinding, TokioAsyncReadCompat, TokioAsyncWriteCompat,
+    PERMISSION_ALLOW_ALWAYS, PERMISSION_ALLOW_ONCE, PERMISSION_REJECT_ALWAYS,
+    PERMISSION_REJECT_ONCE,
 };
 use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 use serde_json::json;
@@ -36,6 +37,31 @@ fn test_agent() -> PalyraAcpAgent {
         client_request_tx,
         PathBuf::from("."),
     )
+}
+
+#[test]
+fn daemon_command_payload_identifies_the_http_transport_hop() {
+    let payload = build_daemon_acp_command_payload(
+        "admin:test",
+        "device-test",
+        Some("cli"),
+        "session.list",
+        json!({"limit": 20}),
+    );
+
+    assert_eq!(payload.pointer("/client/transport"), Some(&json!("http")));
+    assert_eq!(payload.pointer("/client/owner_principal"), Some(&json!("admin:test")));
+    assert_eq!(payload.pointer("/command/command"), Some(&json!("session.list")));
+    let scopes = payload
+        .pointer("/client/scopes")
+        .and_then(serde_json::Value::as_array)
+        .expect("ACP scopes should be an array");
+    assert!(!scopes.contains(&json!("events:sensitive")));
+    let capabilities = payload
+        .pointer("/client/capabilities")
+        .and_then(serde_json::Value::as_array)
+        .expect("ACP capabilities should be an array");
+    assert!(!capabilities.contains(&json!("sensitive_replay")));
 }
 
 #[test]

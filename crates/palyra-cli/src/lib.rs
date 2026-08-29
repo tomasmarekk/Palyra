@@ -6338,7 +6338,9 @@ async fn prepare_agent_run_input(
             .await?
     {
         mark_interrupted_follow_up_origin(&mut input, interrupted_run_id.as_str());
-        session = resolve_agent_run_session(client, &input).await?;
+        session =
+            wait_for_interrupted_session_settlement(client, &input, interrupted_run_id.as_str())
+                .await?;
         reject_active_session_follow_up(&session).with_context(|| {
             format!(
                 "interrupted active run {interrupted_run_id} but the selected session still has an active run"
@@ -6346,6 +6348,37 @@ async fn prepare_agent_run_input(
         })?;
     }
     Ok(ResolvedAgentRunInput { session, request: input })
+}
+
+async fn wait_for_interrupted_session_settlement(
+    client: &mut client::runtime::GatewayRuntimeClient,
+    input: &AgentRunInput,
+    interrupted_run_id: &str,
+) -> Result<gateway_v1::SessionSummary> {
+    const SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let deadline = tokio::time::Instant::now() + SETTLEMENT_TIMEOUT;
+    loop {
+        let session = resolve_agent_run_session(client, input).await?;
+        if !session_still_tracks_interrupted_run(&session, interrupted_run_id) {
+            return Ok(session);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for interrupted run {interrupted_run_id} to reach a terminal state"
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+fn session_still_tracks_interrupted_run(
+    session: &gateway_v1::SessionSummary,
+    interrupted_run_id: &str,
+) -> bool {
+    is_active_session_follow_up(session)
+        && active_session_run_id(session).is_some_and(|run_id| run_id == interrupted_run_id)
 }
 
 async fn resolve_agent_run_session(
@@ -8392,6 +8425,23 @@ mod agent_stream_output_tests {
 
         assert_eq!(request.origin_kind.as_deref(), Some("cli_interrupt"));
         assert_eq!(request.origin_run_id.as_deref(), Some(interrupted_run_id));
+    }
+
+    #[test]
+    fn interrupted_follow_up_waits_only_for_the_cancelled_run() {
+        let active = gateway_v1::SessionSummary {
+            last_run_state: "in_progress".to_owned(),
+            last_run_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            }),
+            ..Default::default()
+        };
+        assert!(session_still_tracks_interrupted_run(&active, "01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+
+        let terminal =
+            gateway_v1::SessionSummary { last_run_state: "done".to_owned(), ..active.clone() };
+        assert!(!session_still_tracks_interrupted_run(&terminal, "01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(!session_still_tracks_interrupted_run(&active, "01ARZ3NDEKTSV4RRFFQ69G5FAW"));
     }
 
     #[test]

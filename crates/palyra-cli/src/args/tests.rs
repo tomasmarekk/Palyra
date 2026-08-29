@@ -704,6 +704,40 @@ fn parse_tasks_workboard_graph_controls() {
 }
 
 #[test]
+fn parse_tasks_workboard_priority_uses_documented_numeric_contract() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "tasks",
+        "workboard",
+        "create",
+        "--title",
+        "Investigate regression",
+        "--priority",
+        "50",
+    ]);
+    let Command::Tasks {
+        command: TasksCommand::Workboard { command: WorkboardCommand::Create { priority, .. } },
+    } = parsed.command
+    else {
+        panic!("expected tasks workboard create command");
+    };
+    assert_eq!(priority, Some(50));
+
+    let error = Cli::try_parse_from([
+        "palyra",
+        "tasks",
+        "workboard",
+        "create",
+        "--title",
+        "Investigate regression",
+        "--priority",
+        "normal",
+    ])
+    .expect_err("named priority should fail with the numeric contract");
+    assert!(error.to_string().contains("priority must be a signed integer, for example 50"));
+}
+
+#[test]
 fn parse_logs_with_follow() {
     let parsed = Cli::parse_from([
         "palyra",

@@ -380,6 +380,7 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     }
     if lower.contains("invalid")
         || lower.contains("must be")
+        || lower.contains("must not be")
         || lower.contains("cannot be")
         || lower.contains("cannot set")
         || lower.contains("message commands require ")
@@ -634,6 +635,10 @@ mod tests {
             classify_error(&anyhow!(
                 "QA scenario validation failed for invalid.yaml: unknown field `not_a_scenario`, expected one of `schema_version`, `id`, `authorization`, `token_budget`"
             )),
+            CliExitCode::Validation
+        );
+        assert_eq!(
+            classify_error(&anyhow!("profile name must not be a filesystem dot segment")),
             CliExitCode::Validation
         );
     }
