@@ -67,6 +67,7 @@ export function useDesktopCompanion(): DesktopCompanionState {
     }
   });
 
+  // Effect Events always read current state; restarting this effect would bypass the timer.
   useEffect(() => {
     let cancelled = false;
 
@@ -98,7 +99,7 @@ export function useDesktopCompanion(): DesktopCompanionState {
         window.clearTimeout(timerRef.current);
       }
     };
-  }, [refresh]);
+  }, []);
 
   return { snapshot, loading, error, previewMode, refresh };
 }

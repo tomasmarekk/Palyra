@@ -51,6 +51,7 @@ export function useDesktopSnapshot(): SnapshotState {
     }
   });
 
+  // Effect Events always read current state; restarting this effect would bypass the timer.
   useEffect(() => {
     let cancelled = false;
 
@@ -85,7 +86,7 @@ export function useDesktopSnapshot(): SnapshotState {
         window.clearTimeout(timerRef.current);
       }
     };
-  }, [refresh]);
+  }, []);
 
   return { snapshot, loading, error, previewMode, refresh };
 }
