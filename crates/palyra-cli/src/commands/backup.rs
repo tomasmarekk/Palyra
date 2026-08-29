@@ -147,81 +147,90 @@ fn run_backup_create(
         if selected.workspace { Some(resolve_workspace_root(workspace_root)?) } else { None };
 
     let generated_at_unix_ms = now_unix_ms_i64()?;
-    let build = build_metadata();
-    let file = fs::File::create(output_path.as_path())
-        .with_context(|| format!("failed to create backup archive {}", output_path.display()))?;
-    let mut writer = ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    let mut entries = Vec::new();
+    let manifest =
+        create_and_publish_backup_archive(output_path.as_path(), force, |file, staged_path| {
+            let build = build_metadata();
+            let mut writer = ZipWriter::new(file);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let excluded_paths = [output_path.as_path(), staged_path];
+            let mut entries = Vec::new();
 
-    if selected.config {
-        if let Some(config_path) = config_path.as_ref() {
-            let file_name =
-                config_path.file_name().and_then(|value| value.to_str()).unwrap_or("config.toml");
-            add_file_to_zip(
-                &mut writer,
-                options,
-                config_path.as_path(),
-                None,
-                format!("config/{file_name}").as_str(),
-                output_path.as_path(),
-                &mut entries,
-            )?;
-        }
-    }
-    if selected.state {
-        add_directory_to_zip(
-            &mut writer,
-            options,
-            state_root.as_path(),
-            "state",
-            output_path.as_path(),
-            &mut entries,
-        )?;
-    }
-    if let Some(workspace_root) = workspace_root.as_ref() {
-        add_directory_to_zip(
-            &mut writer,
-            options,
-            workspace_root.as_path(),
-            "workspace",
-            output_path.as_path(),
-            &mut entries,
-        )?;
-    }
-    if selected.support_bundle {
-        let support_bundle = build_embedded_support_bundle(generated_at_unix_ms)?;
-        let bytes = serde_json::to_vec_pretty(&support_bundle)
-            .context("failed to encode embedded support bundle")?;
-        add_bytes_to_zip(
-            &mut writer,
-            options,
-            "exports/support-bundle.json",
-            bytes.as_slice(),
-            "<generated:support-bundle>",
-            &mut entries,
-        )?;
-    }
+            if selected.config {
+                if let Some(config_path) = config_path.as_ref() {
+                    let file_name = config_path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("config.toml");
+                    add_file_to_zip(
+                        &mut writer,
+                        options,
+                        config_path.as_path(),
+                        None,
+                        format!("config/{file_name}").as_str(),
+                        excluded_paths.as_slice(),
+                        &mut entries,
+                    )?;
+                }
+            }
+            if selected.state {
+                add_directory_to_zip(
+                    &mut writer,
+                    options,
+                    state_root.as_path(),
+                    "state",
+                    excluded_paths.as_slice(),
+                    &mut entries,
+                )?;
+            }
+            if let Some(workspace_root) = workspace_root.as_ref() {
+                add_directory_to_zip(
+                    &mut writer,
+                    options,
+                    workspace_root.as_path(),
+                    "workspace",
+                    excluded_paths.as_slice(),
+                    &mut entries,
+                )?;
+            }
+            if selected.support_bundle {
+                let support_bundle = build_embedded_support_bundle(generated_at_unix_ms)?;
+                let bytes = serde_json::to_vec_pretty(&support_bundle)
+                    .context("failed to encode embedded support bundle")?;
+                add_bytes_to_zip(
+                    &mut writer,
+                    options,
+                    "exports/support-bundle.json",
+                    bytes.as_slice(),
+                    "<generated:support-bundle>",
+                    &mut entries,
+                )?;
+            }
 
-    let manifest = BackupManifest {
-        schema_version: 1,
-        generated_at_unix_ms,
-        created_by_version: build.version.to_owned(),
-        created_by_git_hash: build.git_hash.to_owned(),
-        config_path: config_path.as_ref().map(|value| value.display().to_string()),
-        state_root: state_root.display().to_string(),
-        install_root: None,
-        included_workspace: selected.workspace,
-        included_support_bundle: selected.support_bundle,
-        entries,
-    };
-    let manifest_bytes =
-        serde_json::to_vec_pretty(&manifest).context("failed to encode backup manifest")?;
-    writer
-        .start_file(BACKUP_MANIFEST_PATH, options)
-        .context("failed to start backup manifest entry")?;
-    writer.write_all(manifest_bytes.as_slice()).context("failed to write backup manifest")?;
-    writer.finish().context("failed to finalize backup archive")?;
+            let manifest = BackupManifest {
+                schema_version: 1,
+                generated_at_unix_ms,
+                created_by_version: build.version.to_owned(),
+                created_by_git_hash: build.git_hash.to_owned(),
+                config_path: config_path.as_ref().map(|value| value.display().to_string()),
+                state_root: state_root.display().to_string(),
+                install_root: None,
+                included_workspace: selected.workspace,
+                included_support_bundle: selected.support_bundle,
+                entries,
+            };
+            let manifest_bytes =
+                serde_json::to_vec_pretty(&manifest).context("failed to encode backup manifest")?;
+            writer
+                .start_file(BACKUP_MANIFEST_PATH, options)
+                .context("failed to start backup manifest entry")?;
+            writer
+                .write_all(manifest_bytes.as_slice())
+                .context("failed to write backup manifest")?;
+            let file = writer.finish().context("failed to finalize backup archive")?;
+            file.sync_all().context("failed to sync staged backup archive")?;
+            Ok(manifest)
+        })?;
 
     let report = BackupCreateReport {
         archive_path: output_path.display().to_string(),
@@ -260,7 +269,20 @@ fn run_backup_verify(archive: String, json: bool) -> Result<()> {
     if !metadata.is_file() {
         anyhow::bail!("backup archive path is not a regular file: {}", archive_path.display());
     }
-    let mut archive = BoundedZipArchive::open(archive_path.as_path())?;
+    let manifest = verify_backup_archive(archive_path.as_path())?;
+
+    let report = BackupVerifyReport {
+        archive_path: archive_path.display().to_string(),
+        generated_at_unix_ms: manifest.generated_at_unix_ms,
+        entry_count: manifest.entries.len(),
+        verified_entries: manifest.entries.len(),
+        ok: true,
+    };
+    emit_backup_verify_report(&report, json)
+}
+
+fn verify_backup_archive(archive_path: &Path) -> Result<BackupManifest> {
+    let mut archive = BoundedZipArchive::open(archive_path)?;
     let manifest = read_backup_manifest(&mut archive)?;
     validate_backup_membership(&manifest, archive.member_names())?;
 
@@ -298,15 +320,112 @@ fn run_backup_verify(archive: String, json: bool) -> Result<()> {
             );
         }
     }
+    Ok(manifest)
+}
 
-    let report = BackupVerifyReport {
-        archive_path: archive_path.display().to_string(),
-        generated_at_unix_ms: manifest.generated_at_unix_ms,
-        entry_count: manifest.entries.len(),
-        verified_entries: manifest.entries.len(),
-        ok: true,
+fn create_and_publish_backup_archive<F>(
+    output_path: &Path,
+    replace_existing: bool,
+    build_archive: F,
+) -> Result<BackupManifest>
+where
+    F: FnOnce(fs::File, &Path) -> Result<BackupManifest>,
+{
+    let file_name = output_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("backup archive output must have a valid file name"))?;
+    let parent = output_path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staged_path =
+        parent.join(format!(".{file_name}.{}.palyra-backup.tmp", ulid::Ulid::generate()));
+    let staged_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged_path.as_path())
+        .with_context(|| {
+            format!("failed to create staged backup archive {}", staged_path.display())
+        })?;
+
+    let publish_result = (|| -> Result<BackupManifest> {
+        let _built_manifest = build_archive(staged_file, staged_path.as_path())?;
+        let verified_manifest = verify_backup_archive(staged_path.as_path())
+            .context("staged backup archive failed verification")?;
+        publish_staged_backup(staged_path.as_path(), output_path, replace_existing)?;
+        sync_backup_directory(output_path)?;
+        Ok(verified_manifest)
+    })();
+    if publish_result.is_err() {
+        let _ = fs::remove_file(staged_path.as_path());
+    }
+    publish_result
+}
+
+fn publish_staged_backup(source: &Path, destination: &Path, replace_existing: bool) -> Result<()> {
+    if replace_existing {
+        return replace_backup_archive(source, destination);
+    }
+
+    fs::hard_link(source, destination).with_context(|| {
+        format!("failed to publish backup archive without replacing {}", destination.display())
+    })?;
+    fs::remove_file(source)
+        .with_context(|| format!("failed to remove staged backup {}", source.display()))
+}
+
+#[cfg(not(windows))]
+fn replace_backup_archive(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination).with_context(|| {
+        format!(
+            "failed to replace backup archive {} with {}",
+            destination.display(),
+            source.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn replace_backup_archive(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
-    emit_backup_verify_report(&report, json)
+
+    let source = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let destination =
+        destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let moved = unsafe {
+        // SAFETY: The owned vectors remain valid, nul-terminated UTF-16 paths
+        // for the call; both paths are staged and validated by the caller.
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to atomically replace backup archive");
+    }
+    Ok(())
+}
+
+fn sync_backup_directory(
+    #[cfg_attr(not(unix), allow(unused_variables))] output_path: &Path,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = output_path
+            .parent()
+            .filter(|value| !value.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent).and_then(|directory| directory.sync_all()).with_context(|| {
+            format!("failed to sync backup archive directory {}", parent.display())
+        })?;
+    }
+    Ok(())
 }
 
 fn build_embedded_support_bundle(generated_at_unix_ms: i64) -> Result<SupportBundle> {
@@ -420,7 +539,7 @@ fn add_directory_to_zip(
     options: SimpleFileOptions,
     source_root: &Path,
     archive_prefix: &str,
-    output_path: &Path,
+    excluded_paths: &[&Path],
     entries: &mut Vec<BackupEntry>,
 ) -> Result<()> {
     if !source_root.is_dir() {
@@ -438,7 +557,7 @@ fn add_directory_to_zip(
             let path = child.path();
             // Never archive the archive itself; the output file may live
             // inside the workspace tree being captured.
-            if path == output_path {
+            if excluded_paths.contains(&path.as_path()) {
                 continue;
             }
             let file_type = child
@@ -482,7 +601,7 @@ fn add_directory_to_zip(
                     path.as_path(),
                     Some(source_root.as_path()),
                     archive_path.as_str(),
-                    output_path,
+                    excluded_paths,
                     entries,
                 )?;
             }
@@ -549,7 +668,7 @@ fn add_file_to_zip(
     source_path: &Path,
     allowed_root: Option<&Path>,
     archive_path: &str,
-    output_path: &Path,
+    excluded_paths: &[&Path],
     entries: &mut Vec<BackupEntry>,
 ) -> Result<()> {
     let source_path = support::lifecycle::canonicalize_lossy(source_path)?;
@@ -558,7 +677,7 @@ fn add_file_to_zip(
             anyhow::bail!("backup source escapes the allowed root: {}", source_path.display());
         }
     }
-    if source_path == output_path {
+    if excluded_paths.contains(&source_path.as_path()) {
         return Ok(());
     }
     let bytes = fs::read(source_path.as_path())
@@ -870,7 +989,7 @@ mod tests {
             outside_file.as_path(),
             Some(allowed_root.as_path()),
             "state/secret.txt",
-            archive_path.as_path(),
+            &[archive_path.as_path()],
             &mut entries,
         )
         .expect_err("outside sources must be rejected");
@@ -906,7 +1025,7 @@ mod tests {
             options,
             source_root.as_path(),
             "state",
-            archive_path.as_path(),
+            &[archive_path.as_path()],
             &mut entries,
         )?;
 
@@ -952,7 +1071,7 @@ mod tests {
             options,
             source_root.as_path(),
             "state",
-            archive_path.as_path(),
+            &[archive_path.as_path()],
             &mut entries,
         )?;
 
@@ -997,6 +1116,31 @@ mod tests {
     }
 
     #[test]
+    fn staged_backup_failure_preserves_existing_destination() -> Result<()> {
+        let temp = tempdir()?;
+        let archive_path = temp.path().join("backup.zip");
+        let original = b"previous verified backup";
+        fs::write(archive_path.as_path(), original)?;
+
+        let error =
+            create_and_publish_backup_archive(archive_path.as_path(), true, |mut file, _| {
+                file.write_all(b"partial replacement")?;
+                anyhow::bail!("late backup source validation failed")
+            })
+            .expect_err("failed staging must not replace the existing archive");
+
+        assert!(error.to_string().contains("late backup source validation failed"));
+        assert_eq!(fs::read(archive_path.as_path())?, original);
+        let staged_survivors = fs::read_dir(temp.path())?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|entry| entry.file_name().to_string_lossy().contains("palyra-backup.tmp"))
+            .count();
+        assert_eq!(staged_survivors, 0, "failed staging files should be removed");
+        Ok(())
+    }
+
+    #[test]
     fn add_directory_to_zip_rejects_symlink_entries() -> Result<()> {
         let temp = tempdir()?;
         let source_root = temp.path().join("state");
@@ -1024,7 +1168,7 @@ mod tests {
             options,
             source_root.as_path(),
             "state",
-            archive_path.as_path(),
+            &[archive_path.as_path()],
             &mut entries,
         )
         .expect_err("symlink entries must be rejected");
