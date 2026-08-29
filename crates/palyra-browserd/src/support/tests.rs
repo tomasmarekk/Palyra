@@ -2352,6 +2352,24 @@ function markFiltered(){document.getElementById('filter-status').textContent='fi
         "observe visible text should reflect click side-effect from real DOM"
     );
 
+    let viewport = service
+        .set_viewport(Request::new(browser_v1::SetViewportRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            width: 375,
+            height: 812,
+            device_scale_factor: 2.0,
+            mobile: true,
+            timeout_ms: 3_000,
+        }))
+        .await
+        .expect("mobile viewport should execute")
+        .into_inner();
+    assert!(viewport.success, "mobile viewport should succeed: {}", viewport.error);
+    assert_eq!((viewport.width, viewport.height), (375, 812));
+    assert_eq!(viewport.device_scale_factor, 2.0);
+    assert!(viewport.mobile);
+
     let failed_click = service
         .click(Request::new(browser_v1::ClickRequest {
             v: 1,

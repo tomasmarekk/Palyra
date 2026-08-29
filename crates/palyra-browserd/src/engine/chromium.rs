@@ -7,10 +7,7 @@
 
 use crate::*;
 use headless_chrome::protocol::cdp::{types::Event, Browser, Emulation, Page};
-use headless_chrome::{
-    browser::tab::ModifierKey,
-    types::{Bounds, PrintToPdfOptions},
-};
+use headless_chrome::{browser::tab::ModifierKey, types::PrintToPdfOptions};
 
 /// Outcome of a Chromium DOM action (click, type, press, select, highlight, file input).
 ///
@@ -4404,28 +4401,20 @@ fn select_chromium_viewport_metric_pair(
         .or(layout)
 }
 
-fn chromium_mobile_viewport_reload_url(
+fn chromium_mobile_viewport_needs_css_fallback(
     mobile: bool,
     requested_width: u32,
     requested_height: u32,
     actual_width: u32,
     actual_height: u32,
-    current_url: &str,
-) -> Option<String> {
-    let current_url = current_url.trim();
-    if !mobile
-        || !chromium_viewport_metrics_mismatch(
+) -> bool {
+    mobile
+        && chromium_viewport_metrics_mismatch(
             requested_width,
             requested_height,
             actual_width,
             actual_height,
         )
-        || current_url.is_empty()
-        || current_url.eq_ignore_ascii_case("about:blank")
-    {
-        return None;
-    }
-    Some(current_url.to_owned())
 }
 
 fn chromium_u32_metric_option(value: &serde_json::Value, field: &str) -> Option<u32> {
@@ -6050,14 +6039,6 @@ pub(crate) async fn set_viewport_with_chromium(
         }
     };
     let result = run_chromium_blocking("chromium set viewport", move || {
-        // Window bounds (and SetVisibleSize below, deprecated in CDP) are
-        // best-effort; the authoritative sizing is SetDeviceMetricsOverride.
-        let _ = tab.set_bounds(Bounds::Normal {
-            left: None,
-            top: None,
-            width: Some(f64::from(width)),
-            height: Some(f64::from(height)),
-        });
         tab.call_method(Emulation::SetDeviceMetricsOverride {
             width,
             height,
@@ -6080,7 +6061,6 @@ pub(crate) async fn set_viewport_with_chromium(
             max_touch_points: chromium_touch_emulation_max_touch_points(mobile),
         })
         .map_err(|error| format!("failed to set Chromium touch emulation: {error}"))?;
-        let _ = tab.call_method(Emulation::SetVisibleSize { width, height });
         let read_viewport_metrics = || {
             let value = tab
                 .evaluate(
@@ -6104,22 +6084,31 @@ pub(crate) async fn set_viewport_with_chromium(
             ))
         };
         let mut metrics = read_viewport_metrics()?;
-        if let Some(reload_url) = chromium_mobile_viewport_reload_url(
-            mobile,
-            width,
-            height,
-            metrics.0,
-            metrics.1,
-            tab.get_url().as_str(),
+        if chromium_mobile_viewport_needs_css_fallback(
+            mobile, width, height, metrics.0, metrics.1,
         ) {
-            // Chromium applies the mobile layout viewport meta policy during
-            // navigation. Reload only when the first post-override measurement
-            // proves that the live document retained its desktop viewport.
-            tab.navigate_to(reload_url.as_str()).map_err(|error| {
-                format!("failed to reload Chromium page for mobile viewport: {error}")
-            })?;
-            tab.wait_until_navigated().map_err(|error| {
-                format!("Chromium mobile viewport reload timed out: {error}")
+            // Pages without an effective viewport meta policy retain Chromium's
+            // wide mobile layout viewport. Preserve touch emulation while using
+            // desktop device metrics so the requested CSS breakpoint remains
+            // authoritative and no document reload repeats page side effects.
+            tab.call_method(Emulation::SetDeviceMetricsOverride {
+                width,
+                height,
+                device_scale_factor,
+                mobile: false,
+                scale: None,
+                screen_width: Some(width),
+                screen_height: Some(height),
+                position_x: None,
+                position_y: None,
+                dont_set_visible_size: None,
+                screen_orientation: None,
+                viewport: None,
+                display_feature: None,
+                device_posture: None,
+            })
+            .map_err(|error| {
+                format!("failed to apply Chromium CSS viewport fallback: {error}")
             })?;
             metrics = read_viewport_metrics()?;
         }
@@ -6143,19 +6132,22 @@ pub(crate) async fn set_viewport_with_chromium(
             if let Some(session) = runtime.chromium_sessions.lock().await.get_mut(session_id) {
                 session.device_scale_factor = device_scale_factor;
             }
+            let metric_mismatch =
+                chromium_viewport_metrics_mismatch(width, height, actual_width, actual_height);
             ChromiumViewportOutcome {
-                success: true,
+                success: !metric_mismatch,
                 width: actual_width,
                 height: actual_height,
                 device_scale_factor: actual_device_scale_factor,
                 mobile,
-                metric_mismatch: chromium_viewport_metrics_mismatch(
-                    width,
-                    height,
-                    actual_width,
-                    actual_height,
-                ),
-                error: String::new(),
+                metric_mismatch,
+                error: if metric_mismatch {
+                    format!(
+                        "Chromium reported CSS viewport {actual_width}x{actual_height} after requesting {width}x{height}"
+                    )
+                } else {
+                    String::new()
+                },
             }
         }
         Err(error) => ChromiumViewportOutcome {
@@ -6205,7 +6197,7 @@ mod tests {
     use super::{
         chromium_cookie_delete_requests, chromium_element_capture_script,
         chromium_element_may_open_window, chromium_layout_metrics_from_cdp,
-        chromium_mobile_viewport_reload_url, chromium_network_log_headers,
+        chromium_mobile_viewport_needs_css_fallback, chromium_network_log_headers,
         chromium_observe_state_script, chromium_permission_origin,
         chromium_permission_origins_for_urls, chromium_permission_reset_request,
         chromium_permission_set_requests, chromium_read_document_cookies_script,
@@ -7180,39 +7172,15 @@ mod tests {
     }
 
     #[test]
-    fn chromium_mobile_viewport_reload_requires_live_mobile_mismatch() {
-        assert_eq!(
-            chromium_mobile_viewport_reload_url(
-                true,
-                375,
-                812,
-                980,
-                2122,
-                "http://127.0.0.1:8765/"
-            )
-            .as_deref(),
-            Some("http://127.0.0.1:8765/")
-        );
+    fn chromium_mobile_viewport_css_fallback_requires_live_mobile_mismatch() {
+        assert!(chromium_mobile_viewport_needs_css_fallback(true, 375, 812, 980, 2122));
         assert!(
-            chromium_mobile_viewport_reload_url(
-                false,
-                375,
-                812,
-                980,
-                2122,
-                "http://127.0.0.1:8765/"
-            )
-            .is_none(),
+            !chromium_mobile_viewport_needs_css_fallback(false, 375, 812, 980, 2122),
             "narrow desktop mode must not trigger a document reload"
         );
         assert!(
-            chromium_mobile_viewport_reload_url(true, 375, 812, 375, 797, "http://127.0.0.1:8765/")
-                .is_none(),
+            !chromium_mobile_viewport_needs_css_fallback(true, 375, 812, 375, 797),
             "usable mobile metrics must not reload"
-        );
-        assert!(
-            chromium_mobile_viewport_reload_url(true, 375, 812, 980, 2122, "about:blank").is_none(),
-            "blank tabs have no document worth reloading"
         );
     }
 

@@ -2494,7 +2494,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     )
                 }
             };
-        let outcome = if success && metric_mismatch {
+        let outcome = if metric_mismatch {
             "viewport_set_metric_mismatch"
         } else if success {
             "viewport_set"
