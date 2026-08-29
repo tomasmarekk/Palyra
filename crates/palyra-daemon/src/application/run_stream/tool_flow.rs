@@ -107,6 +107,7 @@ use crate::{
     },
     orchestrator::{RunLifecycleState, RunStateMachine},
     sandbox_runner::{ProcessProgressEvent, ProcessProgressSink},
+    self_healing::{WorkHeartbeatKind, WorkHeartbeatUpdate},
     tool_protocol::{build_tool_execution_outcome, denied_execution_outcome, ToolExecutionOutcome},
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
@@ -2630,7 +2631,14 @@ async fn send_process_progress_status_with_tape(
         common_v1::stream_status::StatusKind::InProgress,
         message.as_str(),
     )
-    .await
+    .await?;
+    runtime_state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
+        kind: WorkHeartbeatKind::Run,
+        object_id: run_id.to_owned(),
+        execution_generation: None,
+        summary: format!("run {run_id} process {proposal_id} is making progress"),
+    });
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]

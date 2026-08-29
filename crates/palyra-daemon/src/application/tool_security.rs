@@ -470,11 +470,35 @@ fn proposal_requires_approval(
     skill_gate_decision: Option<&ToolDecision>,
     effective_posture: ToolPostureState,
     backend_approval_required: bool,
+    host_access_approval_required: bool,
 ) -> bool {
     skill_gate_decision
         .map(|decision| decision.allowed && effective_posture == ToolPostureState::AskEachTime)
         .unwrap_or(effective_posture == ToolPostureState::AskEachTime)
         || backend_approval_required
+        || host_access_approval_required
+}
+
+fn tier_b_approved_roots_requires_host_access_approval(
+    runtime_state: &GatewayRuntimeState,
+    tool_name: &str,
+) -> bool {
+    let policy = &runtime_state.config.tool_call.process_runner;
+    tier_b_path_posture_requires_host_access_approval(
+        tool_name,
+        policy.tier,
+        crate::sandbox_runner::process_runner_effective_path_access_mode(policy),
+    )
+}
+
+fn tier_b_path_posture_requires_host_access_approval(
+    tool_name: &str,
+    tier: crate::sandbox_runner::SandboxProcessRunnerTier,
+    path_access_mode: crate::sandbox_runner::PathAccessMode,
+) -> bool {
+    matches!(tool_name, "palyra.process.run" | "palyra.exec.run")
+        && tier == crate::sandbox_runner::SandboxProcessRunnerTier::B
+        && path_access_mode == crate::sandbox_runner::PathAccessMode::ApprovedRoots
 }
 
 /// Formats an allowlist for denial reasons, making emptiness explicit.
@@ -645,12 +669,13 @@ pub(crate) async fn evaluate_tool_proposal_security(
         skill_gate_decision = evaluate_backend_capability_gate(tool_name, &backend_selection);
     }
     // Risk classification remains available for audit and operator surfaces, but it does not
-    // silently replace the resolved tool posture. Operators who want interactive mediation for
-    // process mutations can opt into `ask_each_time` at any supported posture scope.
+    // silently replace the resolved tool posture. The Tier-B approved-roots exception below is
+    // a concrete backend authority boundary: host processes cannot enforce syscall path scope.
     let proposal_approval_required = proposal_requires_approval(
         skill_gate_decision.as_ref(),
         effective_posture.effective_state,
         backend_selection.resolution.approval_required,
+        tier_b_approved_roots_requires_host_access_approval(runtime_state, tool_name),
     );
     let approval_subject_id =
         build_tool_approval_subject_id(tool_name, skill_context.as_ref(), input_json);
@@ -1005,7 +1030,8 @@ mod tests {
     use super::{
         annotate_tool_decision_with_backend_context, evaluate_backend_capability_gate,
         evaluate_delegation_scope_gate, execution_gate_pipeline_enabled_for_tool,
-        proposal_requires_approval, ToolProposalBackendSelection,
+        proposal_requires_approval, tier_b_path_posture_requires_host_access_approval,
+        ToolProposalBackendSelection,
     };
 
     fn networked_worker_selection() -> ToolProposalBackendSelection {
@@ -1101,8 +1127,39 @@ mod tests {
 
     #[test]
     fn always_allow_posture_does_not_infer_approval_from_mutation_risk() {
-        assert!(!proposal_requires_approval(None, ToolPostureState::AlwaysAllow, false));
-        assert!(proposal_requires_approval(None, ToolPostureState::AskEachTime, false));
+        assert!(!proposal_requires_approval(None, ToolPostureState::AlwaysAllow, false, false));
+        assert!(proposal_requires_approval(None, ToolPostureState::AskEachTime, false, false));
+    }
+
+    #[test]
+    fn approved_roots_host_access_overrides_always_allow_posture() {
+        assert!(proposal_requires_approval(None, ToolPostureState::AlwaysAllow, false, true));
+    }
+
+    #[test]
+    fn only_tier_b_approved_roots_process_runs_require_host_access_approval() {
+        use crate::sandbox_runner::{PathAccessMode, SandboxProcessRunnerTier};
+
+        assert!(tier_b_path_posture_requires_host_access_approval(
+            "palyra.process.run",
+            SandboxProcessRunnerTier::B,
+            PathAccessMode::ApprovedRoots,
+        ));
+        assert!(!tier_b_path_posture_requires_host_access_approval(
+            "palyra.process.run",
+            SandboxProcessRunnerTier::B,
+            PathAccessMode::WorkspaceOnly,
+        ));
+        assert!(!tier_b_path_posture_requires_host_access_approval(
+            "palyra.process.run",
+            SandboxProcessRunnerTier::C,
+            PathAccessMode::ApprovedRoots,
+        ));
+        assert!(!tier_b_path_posture_requires_host_access_approval(
+            "palyra.fs.read_file",
+            SandboxProcessRunnerTier::B,
+            PathAccessMode::ApprovedRoots,
+        ));
     }
 
     #[test]

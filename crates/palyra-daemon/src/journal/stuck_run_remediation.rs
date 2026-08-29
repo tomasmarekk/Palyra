@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use super::{
-    current_unix_ms, load_resume_tape_observations, next_orchestrator_tape_seq,
-    summarize_resume_tape_observations, JournalError, JournalStore,
+    current_unix_ms, load_resume_tape_observations, summarize_resume_tape_observations,
+    JournalError, JournalStore,
 };
 
 pub(super) const MIGRATION_83_SQL: &str = r#"
@@ -641,34 +641,9 @@ fn append_decision_event(
             decision.decided_at_unix_ms,
         ],
     )?;
-    let run_id = connection.query_row(
-        "SELECT run_ulid FROM stuck_run_incidents_v2 WHERE incident_ulid = ?1",
-        params![decision.incident_id],
-        |row| row.get::<_, String>(0),
-    )?;
-    let tape_sequence = next_orchestrator_tape_seq(connection, run_id.as_str())?;
-    connection.execute(
-        r#"
-            INSERT INTO orchestrator_tape (
-                run_ulid, seq, event_type, payload_json, created_at_unix_ms
-            ) VALUES (?1, ?2, 'stuck_run_remediation_decision', ?3, ?4)
-        "#,
-        params![
-            run_id,
-            tape_sequence,
-            json!({
-                "schema_version": 1,
-                "incident_id": decision.incident_id,
-                "policy": decision.policy,
-                "decision": decision.decision,
-                "reason_code": decision.reason_code,
-                "event_type": event_type,
-                "claim_epoch": claim_epoch,
-            })
-            .to_string(),
-            decision.decided_at_unix_ms,
-        ],
-    )?;
+    // The live run owner is the sole allocator of orchestrator tape sequence
+    // numbers. Watchdog observations remain in their dedicated append-only
+    // table so an out-of-band diagnostic cannot race the active tape writer.
     Ok(())
 }
 
@@ -865,7 +840,7 @@ mod tests {
             )
             .expect("decision tape count should load");
         assert_eq!(event_count, 2);
-        assert_eq!(tape_count, 2);
+        assert_eq!(tape_count, 0);
     }
 
     #[test]
