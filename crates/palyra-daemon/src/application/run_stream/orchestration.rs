@@ -7892,7 +7892,7 @@ fn terminal_tool_authorization_failure(result: &RunStreamToolResultForModel) -> 
 
     if is_noninteractive_cli_approval_denial(error) {
         return Some(format!(
-            "tool execution requires approval, but the noninteractive CLI cannot prompt for it: tool={} proposal_id={} error={}. Rerun in an interactive terminal, use --approval-mode allow-once for per-request approval, or use --allow-sensitive-tools only after reviewing the requested tool risk.",
+            "tool execution requires approval, but the noninteractive CLI cannot prompt for it: tool={} proposal_id={} error={}. Rerun in an interactive terminal, use --approval-mode allow-once for one reviewed request, or use --approval-mode allow-run for the reviewed current run. --allow-sensitive-tools only exposes sensitive tools and does not approve them.",
             result.tool_name,
             result.proposal_id,
             truncate_with_ellipsis(error.to_owned(), 512)
@@ -7900,7 +7900,7 @@ fn terminal_tool_authorization_failure(result: &RunStreamToolResultForModel) -> 
     }
     if is_cli_approval_mode_deny(error) {
         return Some(format!(
-            "tool execution was blocked by --approval-mode deny: tool={} proposal_id={} error={}. No approval prompt is pending and the denied tool action was not executed. Rerun in an interactive terminal, use --approval-mode allow-once for per-request approval, or use --allow-sensitive-tools only after reviewing the requested tool risk.",
+            "tool execution was blocked by --approval-mode deny: tool={} proposal_id={} error={}. No approval prompt is pending and the denied tool action was not executed. Rerun in an interactive terminal, use --approval-mode allow-once for one reviewed request, or use --approval-mode allow-run for the reviewed current run. --allow-sensitive-tools only exposes sensitive tools and does not approve them.",
             result.tool_name,
             result.proposal_id,
             truncate_with_ellipsis(error.to_owned(), 512)

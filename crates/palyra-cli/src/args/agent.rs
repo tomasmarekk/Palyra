@@ -78,7 +78,7 @@ pub enum AgentCommand {
         #[arg(
             long,
             default_value_t = false,
-            help = "Permit tools classified as sensitive for this run"
+            help = "Expose tools classified as sensitive; use --approval-mode to control approvals"
         )]
         allow_sensitive_tools: bool,
         #[arg(
@@ -133,7 +133,7 @@ pub enum AgentCommand {
         #[arg(
             long,
             default_value_t = false,
-            help = "Permit tools classified as sensitive for this session"
+            help = "Expose tools classified as sensitive; explicit safe-mode approvals still apply"
         )]
         allow_sensitive_tools: bool,
         #[arg(

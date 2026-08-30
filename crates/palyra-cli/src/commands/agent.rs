@@ -223,7 +223,7 @@ async fn run_agent_interactive_async(
 
     let mut last_run_id = None::<String>;
     let mut interactive_service_tier = None::<String>;
-    let mut input_rx = spawn_interactive_stdin_reader();
+    let mut input_rx = spawn_stdin_line_reader();
     let mut pending_prompts = VecDeque::<String>::new();
     loop {
         let prompt = match pending_prompts.pop_front() {
@@ -502,22 +502,6 @@ fn cli_launch_safe_path_env() -> serde_json::Map<String, serde_json::Value> {
     env
 }
 
-// Stdin reads block, so they run on a dedicated thread; the async loop can
-// then select between user input and run-stream events without stalling.
-fn spawn_interactive_stdin_reader() -> mpsc::UnboundedReceiver<Result<String, String>> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let line = line.map_err(|error| error.to_string());
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    rx
-}
-
 fn normalize_interactive_prompt_line(line: &str) -> Option<String> {
     let prompt = line.trim();
     (!prompt.is_empty()).then(|| prompt.to_owned())
@@ -534,16 +518,6 @@ async fn read_next_interactive_prompt(
         }
     }
     Ok(None)
-}
-
-async fn read_next_interactive_approval_line(
-    input_rx: &mut mpsc::UnboundedReceiver<Result<String, String>>,
-) -> Result<Option<String>> {
-    input_rx
-        .recv()
-        .await
-        .transpose()
-        .map_err(|error| anyhow!("failed to read interactive approval from stdin: {error}"))
 }
 
 fn interactive_interrupt_message(cancel_requested: bool, queued_prompt_count: usize) -> String {
@@ -852,20 +826,10 @@ async fn prompt_tool_approval_decision_from_interactive_input(
     }
 
     if !std::io::stdin().is_terminal() {
-        eprintln!("agent.approval.non_interactive_hint {}", approval_required_cli_hint());
-        return Ok(ToolApprovalDecision {
-            approved: false,
-            reason: "approval_required_non_interactive_cli".to_owned(),
-            decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
-            decision_scope_ttl_ms: 0,
-        });
+        return noninteractive_tool_approval_decision();
     }
 
-    eprintln!("{}", tool_approval_prompt_line(approval));
-    eprint!("{}", tool_approval_terminal_prompt_text());
-    std::io::stderr().flush().context("stderr flush failed")?;
-    let input = read_next_interactive_approval_line(input_rx).await?.unwrap_or_default();
-    Ok(tool_approval_decision_from_terminal_input(input.as_str()))
+    prompt_tool_approval_decision_from_terminal_input(approval, input_rx).await
 }
 
 fn redacted_identifier_presence(value: Option<&common_v1::CanonicalId>) -> &'static str {
@@ -927,16 +891,18 @@ mod tests {
         ensure_agent_run_approval_flags, interactive_interrupt_message,
         interactive_session_started_message, normalize_interactive_prompt_line,
         normalize_reasoning_effort_arg, normalize_service_tier_arg,
-        read_next_interactive_approval_line,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
-    use crate::tool_approval_decision_from_terminal_input;
+    use crate::{
+        read_tool_approval_input, tool_approval_decision_from_terminal_input, ToolApprovalInput,
+    };
     use serde_json::Value;
     use std::{
         ffi::OsString,
         fs,
         sync::{Mutex, OnceLock},
+        time::Duration,
     };
     use tokio::sync::mpsc;
 
@@ -1019,10 +985,12 @@ mod tests {
         tx.send(Ok(" \t ".to_owned())).expect("blank approval should enqueue");
         tx.send(Ok("yes".to_owned())).expect("following prompt should enqueue");
 
-        let input = read_next_interactive_approval_line(&mut rx)
+        let input = read_tool_approval_input(&mut rx, Duration::from_secs(1))
             .await
-            .expect("approval input should be readable")
-            .expect("approval input should remain open");
+            .expect("approval input should be readable");
+        let ToolApprovalInput::Line(input) = input else {
+            panic!("queued approval should remain available");
+        };
 
         assert!(!tool_approval_decision_from_terminal_input(input.as_str()).approved);
         assert_eq!(rx.try_recv(), Ok(Ok("yes".to_owned())));

@@ -2262,7 +2262,8 @@ fn terminal_tool_authorization_failure_stops_noninteractive_cli_denials() {
         .expect("noninteractive CLI approval denials should terminate the run");
     assert!(message.contains("noninteractive CLI"));
     assert!(message.contains("--approval-mode allow-once"));
-    assert!(message.contains("--allow-sensitive-tools"));
+    assert!(message.contains("--approval-mode allow-run"));
+    assert!(message.contains("--allow-sensitive-tools only exposes"));
     assert!(message.contains("toolu_noninteractive_01"));
 }
 
@@ -2286,6 +2287,8 @@ fn terminal_tool_authorization_failure_stops_cli_deny_mode() {
     assert!(message.contains("No approval prompt is pending"));
     assert!(message.contains("was not executed"));
     assert!(message.contains("--approval-mode allow-once"));
+    assert!(message.contains("--approval-mode allow-run"));
+    assert!(message.contains("--allow-sensitive-tools only exposes"));
     assert!(message.contains("toolu_deny_mode_01"));
 }
 

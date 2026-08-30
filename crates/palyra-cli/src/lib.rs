@@ -188,6 +188,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_stream::StreamExt;
 use tonic::Request;
@@ -996,7 +997,7 @@ fn apply_local_desktop_tool_defaults(
     set_value_at_path(
         document,
         "tool_call.process_runner.path_access_mode",
-        toml::Value::String("approved_roots".to_owned()),
+        toml::Value::String("workspace_only".to_owned()),
     )?;
     set_value_at_path(
         document,
@@ -5468,6 +5469,7 @@ where
     let mut completed = false;
     let mut cancelled = false;
     let mut approval_mode = resolved.request.approval_mode;
+    let mut approval_input_rx = None;
     loop {
         let event = match stream.next_event().await {
             Ok(Some(event)) => event,
@@ -5509,8 +5511,12 @@ where
         if let Some(common_v1::run_stream_event::Body::ToolApprovalRequest(approval)) =
             event.body.as_ref()
         {
-            let decision =
-                prompt_tool_approval_decision_with_mode_state(approval, &mut approval_mode)?;
+            let decision = prompt_tool_approval_decision_with_mode_state_async(
+                approval,
+                &mut approval_mode,
+                &mut approval_input_rx,
+            )
+            .await?;
             stream
                 .send_tool_approval_response(
                     session_id.ulid.as_str(),
@@ -6495,9 +6501,12 @@ struct ToolApprovalDecision {
     decision_scope_ttl_ms: i64,
 }
 
-const NONINTERACTIVE_APPROVAL_HINT: &str = "noninteractive CLI cannot prompt for an explicit safe-mode approval; rerun in an interactive terminal, use --approval-mode allow-once for one reviewed request, or use --approval-mode allow-run for the reviewed current run";
+const NONINTERACTIVE_APPROVAL_HINT: &str = "noninteractive CLI cannot prompt for an explicit safe-mode approval; rerun in an interactive terminal, use --approval-mode allow-once for one reviewed request, or use --approval-mode allow-run for the reviewed current run; --allow-sensitive-tools only exposes sensitive tools and does not approve them";
 const PROCESS_RUN_TOOL_NAME: &str = "palyra.process.run";
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
+const DEFAULT_TOOL_APPROVAL_PROMPT_TIMEOUT_SECONDS: u64 = 15 * 60;
+const TOOL_APPROVAL_CLIENT_DEADLINE_GRACE: Duration = Duration::from_secs(1);
+const MINIMUM_TOOL_APPROVAL_CLIENT_WAIT: Duration = Duration::from_millis(100);
 
 fn approval_required_cli_hint() -> &'static str {
     NONINTERACTIVE_APPROVAL_HINT
@@ -6508,7 +6517,9 @@ fn prompt_tool_approval_decision(
     mode: AgentApprovalMode,
 ) -> Result<ToolApprovalDecision> {
     match mode {
-        AgentApprovalMode::Prompt => prompt_tool_approval_decision_from_terminal(approval),
+        AgentApprovalMode::Prompt => {
+            anyhow::bail!("prompt approval requires asynchronous terminal input mediation")
+        }
         AgentApprovalMode::Deny => Ok(ToolApprovalDecision {
             approved: false,
             reason: "denied_by_cli_approval_mode_deny".to_owned(),
@@ -6520,7 +6531,7 @@ fn prompt_tool_approval_decision(
                 return Ok(ToolApprovalDecision {
                     approved: false,
                     reason: format!(
-                        "denied_by_cli_manual_safety_stop_{reason}; rerun with --approval-mode prompt for an interactive decision, or use --allow-sensitive-tools only after reviewing the requested source-control mutation"
+                        "denied_by_cli_manual_safety_stop_{reason}; rerun with --approval-mode prompt for an interactive decision, or use --approval-mode allow-run only after reviewing the requested source-control mutation"
                     ),
                     decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
                     decision_scope_ttl_ms: 0,
@@ -6680,28 +6691,109 @@ fn prompt_tool_approval_decision_with_mode_state(
     Ok(decision)
 }
 
-fn prompt_tool_approval_decision_from_terminal(
+async fn prompt_tool_approval_decision_with_mode_state_async(
     approval: &common_v1::ToolApprovalRequest,
+    mode: &mut AgentApprovalMode,
+    input_rx: &mut Option<mpsc::UnboundedReceiver<std::result::Result<String, String>>>,
 ) -> Result<ToolApprovalDecision> {
-    if !std::io::stdin().is_terminal() {
-        eprintln!("agent.approval.non_interactive_hint {}", approval_required_cli_hint());
-        return Ok(ToolApprovalDecision {
-            approved: false,
-            reason: "approval_required_non_interactive_cli".to_owned(),
-            decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
-            decision_scope_ttl_ms: 0,
-        });
+    if *mode != AgentApprovalMode::Prompt {
+        return prompt_tool_approval_decision_with_mode_state(approval, mode);
     }
+    if !std::io::stdin().is_terminal() {
+        return noninteractive_tool_approval_decision();
+    }
+    let input_rx = input_rx.get_or_insert_with(spawn_stdin_line_reader);
+    prompt_tool_approval_decision_from_terminal_input(approval, input_rx).await
+}
 
+// Stdin reads block, so the dedicated reader keeps the async executor free.
+// The unbounded channel is safe here because its only producer is a
+// human-paced terminal and each line is consumed by the active CLI session.
+fn spawn_stdin_line_reader() -> mpsc::UnboundedReceiver<std::result::Result<String, String>> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let line = line.map_err(|error| error.to_string());
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ToolApprovalInput {
+    Line(String),
+    Closed,
+    TimedOut,
+}
+
+fn tool_approval_client_wait_duration(approval: &common_v1::ToolApprovalRequest) -> Duration {
+    let timeout_seconds = approval
+        .prompt
+        .as_ref()
+        .map(|prompt| u64::from(prompt.timeout_seconds))
+        .filter(|timeout_seconds| *timeout_seconds > 0)
+        .unwrap_or(DEFAULT_TOOL_APPROVAL_PROMPT_TIMEOUT_SECONDS);
+    let server_timeout = Duration::from_secs(timeout_seconds);
+    let client_timeout = if server_timeout > TOOL_APPROVAL_CLIENT_DEADLINE_GRACE {
+        server_timeout - TOOL_APPROVAL_CLIENT_DEADLINE_GRACE
+    } else {
+        server_timeout / 2
+    };
+    client_timeout.max(MINIMUM_TOOL_APPROVAL_CLIENT_WAIT)
+}
+
+async fn read_tool_approval_input(
+    input_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
+    wait_duration: Duration,
+) -> Result<ToolApprovalInput> {
+    match tokio::time::timeout(wait_duration, input_rx.recv()).await {
+        Ok(Some(Ok(line))) => Ok(ToolApprovalInput::Line(line)),
+        Ok(Some(Err(error))) => Err(anyhow!("failed to read tool approval from stdin: {error}")),
+        Ok(None) => Ok(ToolApprovalInput::Closed),
+        Err(_) => Ok(ToolApprovalInput::TimedOut),
+    }
+}
+
+async fn prompt_tool_approval_decision_from_terminal_input(
+    approval: &common_v1::ToolApprovalRequest,
+    input_rx: &mut mpsc::UnboundedReceiver<std::result::Result<String, String>>,
+) -> Result<ToolApprovalDecision> {
     eprintln!("{}", tool_approval_prompt_line(approval));
     eprint!("{}", tool_approval_terminal_prompt_text());
     std::io::stderr().flush().context("stderr flush failed")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut input)
-        .context("failed to read tool approval decision from stdin")?;
-    Ok(tool_approval_decision_from_terminal_input(input.as_str()))
+    match read_tool_approval_input(input_rx, tool_approval_client_wait_duration(approval)).await? {
+        ToolApprovalInput::Line(input) => {
+            Ok(tool_approval_decision_from_terminal_input(input.as_str()))
+        }
+        ToolApprovalInput::Closed => Ok(tool_approval_decision_from_terminal_input("")),
+        ToolApprovalInput::TimedOut => {
+            eprintln!(
+                "agent.approval.timeout tool={} decision=deny reason=client_deadline",
+                safe_stream_label_for_output(approval.tool_name.as_str())
+            );
+            std::io::stderr().flush().context("stderr flush failed")?;
+            Ok(ToolApprovalDecision {
+                approved: false,
+                reason: "approval_response_timeout_cli".to_owned(),
+                decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+                decision_scope_ttl_ms: 0,
+            })
+        }
+    }
+}
+
+fn noninteractive_tool_approval_decision() -> Result<ToolApprovalDecision> {
+    eprintln!("agent.approval.non_interactive_hint {}", approval_required_cli_hint());
+    Ok(ToolApprovalDecision {
+        approved: false,
+        reason: "approval_required_non_interactive_cli".to_owned(),
+        decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
+        decision_scope_ttl_ms: 0,
+    })
 }
 
 fn tool_approval_decision_from_terminal_input(input: &str) -> ToolApprovalDecision {
@@ -8784,6 +8876,45 @@ mod agent_stream_output_tests {
     }
 
     #[test]
+    fn approval_prompt_client_deadline_precedes_server_timeout() {
+        let mut approval = approval_request();
+        approval.prompt = Some(common_v1::ApprovalPrompt {
+            timeout_seconds: 10,
+            ..common_v1::ApprovalPrompt::default()
+        });
+
+        assert_eq!(tool_approval_client_wait_duration(&approval), Duration::from_secs(9));
+
+        approval.prompt.as_mut().expect("prompt exists").timeout_seconds = 1;
+        assert_eq!(tool_approval_client_wait_duration(&approval), Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn approval_input_timeout_returns_without_blocking_stdin() {
+        let (_sender, mut receiver) =
+            mpsc::unbounded_channel::<std::result::Result<String, String>>();
+
+        let input = read_tool_approval_input(&mut receiver, Duration::ZERO)
+            .await
+            .expect("timeout should be represented as an approval input outcome");
+
+        assert_eq!(input, ToolApprovalInput::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn approval_input_preserves_a_ready_terminal_line() {
+        let (sender, mut receiver) =
+            mpsc::unbounded_channel::<std::result::Result<String, String>>();
+        sender.send(Ok("session".to_owned())).expect("test receiver is open");
+
+        let input = read_tool_approval_input(&mut receiver, Duration::from_secs(1))
+            .await
+            .expect("ready input should be received");
+
+        assert_eq!(input, ToolApprovalInput::Line("session".to_owned()));
+    }
+
+    #[test]
     fn approval_mode_allow_once_approves_current_request_only() {
         let decision =
             prompt_tool_approval_decision(&approval_request(), AgentApprovalMode::AllowOnce)
@@ -8850,6 +8981,8 @@ mod agent_stream_output_tests {
         assert!(!decision.approved);
         assert!(decision.reason.contains("manual_safety_stop_git_index_mutation"));
         assert!(decision.reason.contains("--approval-mode prompt"));
+        assert!(decision.reason.contains("--approval-mode allow-run"));
+        assert!(!decision.reason.contains("--allow-sensitive-tools"));
     }
 
     #[test]
@@ -15671,7 +15804,7 @@ mod init_command_tests {
         );
         assert_eq!(
             read_string(&document, "tool_call.process_runner.path_access_mode").as_deref(),
-            Some("approved_roots")
+            Some("workspace_only")
         );
         assert_eq!(
             read_integer(&document, "tool_call.process_runner.cpu_time_limit_ms"),
