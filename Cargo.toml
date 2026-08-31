@@ -83,7 +83,7 @@ toml = "1.1.2"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 ulid = "3.0.0"
-wasmtime = { version = "47.0.3", default-features = false, features = ["cranelift", "runtime", "wat"] }
+wasmtime = { version = "47.0.4", default-features = false, features = ["cranelift", "runtime", "wat"] }
 webbrowser = "1.2.1"
 windows-sys = "0.61.2"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
