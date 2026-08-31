@@ -1039,6 +1039,8 @@ pub(crate) async fn console_usage_insights_handler(
     })?;
     let provider_auth_observability =
         build_provider_auth_observability(&auth_payload, state.observability.as_ref());
+    let provider_auth_state =
+        provider_auth_observability.get("state").and_then(Value::as_str).unwrap_or("unknown");
     let provider_snapshot = &status_snapshot.model_provider;
     let provider_kind = provider_snapshot.kind.clone();
     // Fallback chain mirrors the model runtime's default-model resolution;
@@ -1126,7 +1128,7 @@ pub(crate) async fn console_usage_insights_handler(
         routing_decisions.as_slice(),
         budget_evaluations.as_slice(),
         model_mix.as_slice(),
-        model_provider_health_state(&status_snapshot.model_provider),
+        model_provider_health_state(&status_snapshot.model_provider, provider_auth_state),
     );
     // Alert persistence is best-effort: a failed upsert must not break the
     // insights read path. Each candidate gets a fresh id; the journal
@@ -1202,7 +1204,11 @@ pub(crate) async fn console_usage_insights_handler(
             estimate_only: pricing.iter().any(|entry| entry.precision != "exact"),
         },
         health: UsageInsightsHealthSummary {
-            provider_state: model_provider_health_state(&status_snapshot.model_provider).to_owned(),
+            provider_state: model_provider_health_state(
+                &status_snapshot.model_provider,
+                provider_auth_state,
+            )
+            .to_owned(),
             provider_kind,
             error_rate_bps: status_snapshot.model_provider.runtime_metrics.error_rate_bps,
             circuit_open: status_snapshot.model_provider.circuit_breaker.open,
@@ -1527,10 +1533,14 @@ fn default_usage_currency() -> String {
 /// distinctly so the console can prompt for setup rather than show "degraded".
 fn model_provider_health_state(
     snapshot: &crate::model_provider::ProviderStatusSnapshot,
+    provider_auth_state: &str,
 ) -> &'static str {
     if snapshot.circuit_breaker.open || snapshot.runtime_metrics.error_count > 0 {
         "degraded"
-    } else if snapshot.api_key_configured || snapshot.auth_profile_id.is_some() {
+    } else if snapshot.api_key_configured
+        || snapshot.auth_profile_id.is_some()
+        || provider_auth_state == "ok"
+    {
         "ok"
     } else {
         "missing_auth"
@@ -2047,7 +2057,7 @@ fn build_operator_provider_health_insight(
     let response_cache_hit_rate_bps =
         ratio_bps_u64(provider_snapshot.response_cache.hit_count, cache_total);
     let (state, severity, recommended_action) = if auth_state != "ok"
-        || model_provider_health_state(provider_snapshot) == "missing_auth"
+        || model_provider_health_state(provider_snapshot, auth_state) == "missing_auth"
     {
         (
             "blocking",

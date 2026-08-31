@@ -96,9 +96,25 @@ pub(crate) async fn console_onboarding_posture_handler(
     let configured_path = std::env::var("PALYRA_CONFIG").ok();
     let (document, _, config_path) =
         load_console_config_snapshot(configured_path.as_deref(), true)?;
+    let auth_status = state
+        .auth_runtime
+        .admin_status_snapshot(Arc::clone(&state.runtime))
+        .await
+        .map_err(runtime_status_response)?;
+    let usable_auth_profile_count = auth_status
+        .summary
+        .ok
+        .saturating_add(auth_status.summary.expiring)
+        .saturating_add(auth_status.summary.static_count);
     let deployment = build_deployment_posture_summary(&state);
     let variant = resolve_onboarding_variant(query.flow.as_deref(), deployment.mode.as_str())?;
-    let signals = collect_onboarding_signals(&state, &document, config_path, &deployment)?;
+    let signals = collect_onboarding_signals(
+        &state,
+        &document,
+        config_path,
+        &deployment,
+        usable_auth_profile_count > 0,
+    )?;
     let steps = build_onboarding_steps(variant, &signals);
     let counts = build_onboarding_counts(&steps);
     let recommended_step_id = steps
@@ -164,8 +180,56 @@ fn collect_onboarding_signals(
     document: &toml::Value,
     config_path: String,
     deployment: &control_plane::DeploymentPostureSummary,
+    usable_auth_profile_available: bool,
 ) -> Result<OnboardingSignals, Response> {
     let provider_snapshot = state.runtime.model_provider_status_snapshot();
+    let parsed_config: palyra_common::daemon_config_schema::RootFileConfig =
+        document.clone().try_into().map_err(|error| {
+            runtime_status_response(tonic::Status::invalid_argument(format!(
+                "failed to parse model-provider onboarding config: {error}"
+            )))
+        })?;
+    let config_posture =
+        palyra_common::daemon_config_schema::model_provider_config_posture(&parsed_config);
+    let provider_auth_configured = config_posture.credentials_configured
+        || provider_snapshot.api_key_configured
+        || provider_snapshot.auth_profile_id.is_some();
+    let provider_model_selected = config_posture.chat_model_id.is_some()
+        || provider_snapshot.model_id.is_some()
+        || provider_snapshot.openai_model.is_some()
+        || provider_snapshot.anthropic_model.is_some();
+    let runtime_provider_failed =
+        provider_snapshot.circuit_breaker.open || provider_snapshot.runtime_metrics.error_count > 0;
+    let configured_auth_usable = config_posture.credentials_configured
+        && (config_posture.auth_profile_id.is_none() || usable_auth_profile_available);
+    let provider_health_state = if runtime_provider_failed {
+        "degraded".to_owned()
+    } else if configured_auth_usable
+        && matches!(provider_snapshot.health.state.as_str(), "missing_auth" | "unknown")
+    {
+        "ok".to_owned()
+    } else {
+        provider_snapshot.health.state.clone()
+    };
+    let provider_health_message = if provider_health_state == "ok"
+        && provider_snapshot.health.state != "ok"
+    {
+        "the selected provider credential is configured and its auth profile is usable".to_owned()
+    } else {
+        provider_snapshot.health.message.clone()
+    };
+    let model_discovery_ready = !provider_snapshot.discovery.discovered_model_ids.is_empty()
+        || (provider_health_state == "ok" && config_posture.chat_model_id.is_some());
+    let model_discovery_message =
+        if provider_snapshot.discovery.discovered_model_ids.is_empty() && model_discovery_ready {
+            "the selected registry chat model is ready with a usable provider credential".to_owned()
+        } else {
+            provider_snapshot
+                .discovery
+                .message
+                .clone()
+                .unwrap_or_else(|| "provider has not published discovered model ids yet".to_owned())
+        };
     let connectors = state.channels.list().map_err(channel_platform_error_response)?;
     let connectors_value = serde_json::to_value(connectors).map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
@@ -186,18 +250,12 @@ fn collect_onboarding_signals(
         remote_verification_mode: remote_verification_mode(document),
         remote_posture_safe: deployment.warnings.is_empty(),
         deployment_warning: deployment.warnings.first().cloned(),
-        provider_auth_configured: provider_snapshot.api_key_configured
-            || provider_snapshot.auth_profile_id.is_some(),
-        provider_model_selected: provider_snapshot.model_id.is_some()
-            || provider_snapshot.openai_model.is_some()
-            || provider_snapshot.anthropic_model.is_some(),
-        provider_health_state: provider_snapshot.health.state,
-        provider_health_message: provider_snapshot.health.message,
-        model_discovery_ready: !provider_snapshot.discovery.discovered_model_ids.is_empty(),
-        model_discovery_message: provider_snapshot
-            .discovery
-            .message
-            .unwrap_or_else(|| "provider has not published discovered model ids yet".to_owned()),
+        provider_auth_configured,
+        provider_model_selected,
+        provider_health_state,
+        provider_health_message,
+        model_discovery_ready,
+        model_discovery_message,
         discord_enabled: connector_enabled(connectors_value.as_array(), "discord"),
     })
 }

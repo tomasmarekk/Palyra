@@ -7,7 +7,7 @@ use super::diagnostics::{
     authorize_console_session, build_connector_observability, build_page_info,
     build_provider_auth_observability, build_support_bundle_observability,
     collect_console_browser_diagnostics, collect_console_deployment_diagnostics,
-    redact_console_diagnostics_value,
+    load_console_config_snapshot, redact_console_diagnostics_value,
 };
 use super::usage::build_operator_insights_for_context;
 use crate::gateway::current_unix_ms;
@@ -112,6 +112,38 @@ pub(crate) async fn console_system_presence_handler(
         )))
     })?;
     redact_console_diagnostics_value(&mut auth_payload, None);
+    let configured_path = std::env::var("PALYRA_CONFIG").ok();
+    let (config_document, _, _) = load_console_config_snapshot(configured_path.as_deref(), true)?;
+    let parsed_config: palyra_common::daemon_config_schema::RootFileConfig =
+        config_document.try_into().map_err(|error| {
+            runtime_status_response(tonic::Status::invalid_argument(format!(
+                "failed to parse model-provider presence config: {error}"
+            )))
+        })?;
+    let config_posture =
+        palyra_common::daemon_config_schema::model_provider_config_posture(&parsed_config);
+    let auth_profiles_state = auth_profiles_presence_state(&auth_payload);
+    let config_posture_active =
+        config_posture.chat_model_id.is_some() || config_posture.credentials_configured;
+    let provider_kind = if config_posture_active {
+        config_posture.provider_kind.clone()
+    } else {
+        status_snapshot.model_provider.kind.clone()
+    };
+    let provider_auth_profile_id = config_posture
+        .auth_profile_id
+        .clone()
+        .or_else(|| status_snapshot.model_provider.auth_profile_id.clone());
+    let provider_credential_source = config_posture
+        .credential_source
+        .clone()
+        .or_else(|| status_snapshot.model_provider.credential_source.clone());
+    let provider_state = model_provider_presence_state(
+        &status_snapshot.model_provider,
+        config_posture.credentials_configured,
+        provider_auth_profile_id.is_some(),
+        auth_profiles_state,
+    );
 
     let browser_payload = collect_console_browser_diagnostics(&state).await;
     let media_payload = state.channels.media_snapshot().map_err(channel_platform_error_response)?;
@@ -142,14 +174,14 @@ pub(crate) async fn console_system_presence_handler(
                 "transport": status_snapshot.transport,
             },
             "model_provider": {
-                "state": model_provider_presence_state(&status_snapshot.model_provider),
-                "kind": status_snapshot.model_provider.kind,
-                "auth_profile_id": status_snapshot.model_provider.auth_profile_id,
-                "credential_source": status_snapshot.model_provider.credential_source,
+                "state": provider_state,
+                "kind": provider_kind,
+                "auth_profile_id": provider_auth_profile_id,
+                "credential_source": provider_credential_source,
                 "runtime_metrics": status_snapshot.model_provider.runtime_metrics,
             },
             "auth_profiles": {
-                "state": auth_profiles_presence_state(&auth_payload),
+                "state": auth_profiles_state,
                 "summary": auth_payload.get("summary").cloned().unwrap_or(Value::Null),
                 "refresh_metrics": auth_payload.get("refresh_metrics").cloned().unwrap_or(Value::Null),
             },
@@ -461,10 +493,18 @@ fn journal_event_actor_label(raw: i32) -> &'static str {
 
 fn model_provider_presence_state(
     snapshot: &crate::model_provider::ProviderStatusSnapshot,
+    config_credentials_configured: bool,
+    auth_profile_configured: bool,
+    auth_profiles_state: &str,
 ) -> &'static str {
     if snapshot.circuit_breaker.open || snapshot.runtime_metrics.error_count > 0 {
         "degraded"
-    } else if snapshot.api_key_configured || snapshot.auth_profile_id.is_some() {
+    } else if auth_profile_configured && auth_profiles_state != "ok" {
+        "degraded"
+    } else if config_credentials_configured
+        || snapshot.api_key_configured
+        || snapshot.auth_profile_id.is_some()
+    {
         "ready"
     } else {
         "missing_auth"
@@ -472,11 +512,14 @@ fn model_provider_presence_state(
 }
 
 fn auth_profiles_presence_state(payload: &Value) -> &'static str {
+    let total = payload.pointer("/summary/total").and_then(Value::as_u64).unwrap_or(0);
     let missing = payload.pointer("/summary/missing").and_then(Value::as_u64).unwrap_or(0);
     let expired = payload.pointer("/summary/expired").and_then(Value::as_u64).unwrap_or(0);
     let failures =
         payload.pointer("/refresh_metrics/failures").and_then(Value::as_u64).unwrap_or(0);
-    if missing > 0 || expired > 0 || failures > 0 {
+    if total == 0 {
+        "missing"
+    } else if missing > 0 || expired > 0 || failures > 0 {
         "degraded"
     } else {
         "ok"

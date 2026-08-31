@@ -1503,6 +1503,171 @@ pub struct FileModelProviderRegistryModel {
     pub known_limitations: Option<Vec<String>>,
 }
 
+/// Effective operator-selected chat provider posture derived from either the
+/// registry schema or its legacy flat-field compatibility surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderConfigPosture {
+    /// Protocol family for the selected chat provider.
+    pub provider_kind: String,
+    /// Enabled chat-model identifier selected as the registry or legacy default.
+    pub chat_model_id: Option<String>,
+    /// Auth profile bound to the selected provider, when applicable.
+    pub auth_profile_id: Option<String>,
+    /// Stable credential-source label without any credential material.
+    pub credential_source: Option<String>,
+    /// Whether the selected provider declares a usable credential reference.
+    pub credentials_configured: bool,
+}
+
+/// Resolves the active chat provider, model, and credential source from a
+/// parsed daemon config.
+///
+/// Registry defaults take precedence over legacy flat fields. A registry
+/// selection is considered usable only when its enabled chat model and
+/// enabled provider both exist.
+#[must_use]
+pub fn model_provider_config_posture(config: &RootFileConfig) -> ModelProviderConfigPosture {
+    let Some(model_provider) = config.model_provider.as_ref() else {
+        return ModelProviderConfigPosture {
+            provider_kind: "openai_compatible".to_owned(),
+            chat_model_id: None,
+            auth_profile_id: None,
+            credential_source: None,
+            credentials_configured: false,
+        };
+    };
+
+    let selected_registry_model =
+        model_provider.default_chat_model_id.as_deref().and_then(normalized_config_text).and_then(
+            |selected_model_id| {
+                model_provider.models.as_deref().unwrap_or_default().iter().find(|model| {
+                    model.enabled.unwrap_or(true)
+                        && model
+                            .role
+                            .as_deref()
+                            .and_then(normalized_config_text)
+                            .is_none_or(|role| role.eq_ignore_ascii_case("chat"))
+                        && model
+                            .model_id
+                            .as_deref()
+                            .and_then(normalized_config_text)
+                            .is_some_and(|model_id| model_id == selected_model_id)
+                })
+            },
+        );
+    let selected_registry_provider = selected_registry_model
+        .and_then(|model| model.provider_id.as_deref())
+        .and_then(normalized_config_text)
+        .and_then(|selected_provider_id| {
+            model_provider.providers.as_deref().unwrap_or_default().iter().find(|provider| {
+                provider.enabled.unwrap_or(true)
+                    && provider
+                        .provider_id
+                        .as_deref()
+                        .and_then(normalized_config_text)
+                        .is_some_and(|provider_id| provider_id == selected_provider_id)
+            })
+        });
+
+    if let (Some(model), Some(provider)) = (selected_registry_model, selected_registry_provider) {
+        let auth_profile_id =
+            provider.auth_profile_id.as_deref().and_then(normalized_config_text).map(str::to_owned);
+        let credential_source = model_provider_registry_credential_source(provider);
+        return ModelProviderConfigPosture {
+            provider_kind: provider
+                .kind
+                .as_deref()
+                .and_then(normalized_config_text)
+                .unwrap_or("openai_compatible")
+                .to_owned(),
+            chat_model_id: model
+                .model_id
+                .as_deref()
+                .and_then(normalized_config_text)
+                .map(str::to_owned),
+            auth_profile_id,
+            credentials_configured: credential_source.is_some(),
+            credential_source,
+        };
+    }
+
+    let provider_kind = model_provider
+        .kind
+        .as_deref()
+        .and_then(normalized_config_text)
+        .unwrap_or("openai_compatible")
+        .to_owned();
+    let chat_model_id = if provider_kind.eq_ignore_ascii_case("anthropic") {
+        model_provider.anthropic_model.as_deref()
+    } else {
+        model_provider.openai_model.as_deref()
+    }
+    .and_then(normalized_config_text)
+    .map(str::to_owned);
+    let auth_profile_id = model_provider
+        .auth_profile_id
+        .as_deref()
+        .and_then(normalized_config_text)
+        .map(str::to_owned);
+    let credential_source = legacy_model_provider_credential_source(model_provider);
+    ModelProviderConfigPosture {
+        provider_kind,
+        chat_model_id,
+        auth_profile_id,
+        credentials_configured: credential_source.is_some(),
+        credential_source,
+    }
+}
+
+fn model_provider_registry_credential_source(
+    provider: &FileModelProviderRegistryEntry,
+) -> Option<String> {
+    if provider.api_key.as_deref().and_then(normalized_config_text).is_some() {
+        Some("inline".to_owned())
+    } else if provider.api_key_secret_ref.is_some() {
+        Some("secret_ref".to_owned())
+    } else if provider.api_key_vault_ref.as_deref().and_then(normalized_config_text).is_some() {
+        Some("vault_ref".to_owned())
+    } else if provider.auth_profile_id.as_deref().and_then(normalized_config_text).is_some() {
+        Some("auth_profile".to_owned())
+    } else {
+        None
+    }
+}
+
+fn legacy_model_provider_credential_source(provider: &FileModelProviderConfig) -> Option<String> {
+    if provider.openai_api_key.as_deref().and_then(normalized_config_text).is_some()
+        || provider.anthropic_api_key.as_deref().and_then(normalized_config_text).is_some()
+    {
+        Some("inline".to_owned())
+    } else if provider.openai_api_key_secret_ref.is_some()
+        || provider.anthropic_api_key_secret_ref.is_some()
+    {
+        Some("secret_ref".to_owned())
+    } else if provider
+        .openai_api_key_vault_ref
+        .as_deref()
+        .and_then(normalized_config_text)
+        .is_some()
+        || provider
+            .anthropic_api_key_vault_ref
+            .as_deref()
+            .and_then(normalized_config_text)
+            .is_some()
+    {
+        Some("vault_ref".to_owned())
+    } else if provider.auth_profile_id.as_deref().and_then(normalized_config_text).is_some() {
+        Some("auth_profile".to_owned())
+    } else {
+        None
+    }
+}
+
+fn normalized_config_text(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// `[tool_call]`: tool allowlist, budgets, and tool-runtime sub-sections.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1736,7 +1901,8 @@ mod tests {
 
     use super::{
         config_schema_entries, is_secret_config_path, known_config_env_vars,
-        redact_secret_config_values, FileMcpCommandValue, RootFileConfig,
+        model_provider_config_posture, redact_secret_config_values, FileMcpCommandValue,
+        RootFileConfig,
     };
 
     #[test]
@@ -1987,6 +2153,59 @@ mod tests {
                 .source_kind(),
             "file"
         );
+    }
+
+    #[test]
+    fn model_provider_posture_resolves_registry_default_and_auth_profile() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+            [model_provider]
+            default_chat_model_id = "gpt-5.6-terra"
+
+            [[model_provider.providers]]
+            provider_id = "openai-primary"
+            kind = "openai_compatible"
+            enabled = true
+            auth_profile_id = "openai-oauth"
+
+            [[model_provider.models]]
+            model_id = "gpt-5.6-terra"
+            provider_id = "openai-primary"
+            role = "chat"
+            enabled = true
+            "#,
+        )
+        .expect("registry provider config should parse");
+
+        let posture = model_provider_config_posture(&parsed);
+
+        assert_eq!(posture.provider_kind, "openai_compatible");
+        assert_eq!(posture.chat_model_id.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(posture.auth_profile_id.as_deref(), Some("openai-oauth"));
+        assert_eq!(posture.credential_source.as_deref(), Some("auth_profile"));
+        assert!(posture.credentials_configured);
+    }
+
+    #[test]
+    fn model_provider_posture_rejects_dangling_registry_default() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+            [model_provider]
+            default_chat_model_id = "missing-model"
+
+            [[model_provider.providers]]
+            provider_id = "openai-primary"
+            kind = "openai_compatible"
+            auth_profile_id = "openai-oauth"
+            "#,
+        )
+        .expect("incomplete registry provider config should parse structurally");
+
+        let posture = model_provider_config_posture(&parsed);
+
+        assert!(posture.chat_model_id.is_none());
+        assert!(!posture.credentials_configured);
+        assert!(posture.auth_profile_id.is_none());
     }
 
     #[test]

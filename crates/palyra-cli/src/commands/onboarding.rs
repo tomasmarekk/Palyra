@@ -265,10 +265,10 @@ fn collect_onboarding_signals(
         Some("gateway posture still needs configuration review".to_owned())
     };
 
-    let provider_kind = get_string_at_path(document, "model_provider.kind")
-        .unwrap_or_else(|| "openai_compatible".to_owned());
-    let provider_auth_configured = model_auth_configured(document)?;
-    let chat_model = configured_chat_model(document)?;
+    let provider_posture = model_provider_config_posture(document)?;
+    let provider_kind = provider_posture.provider_kind;
+    let provider_auth_configured = provider_posture.credentials_configured;
+    let chat_model = provider_posture.chat_model_id;
     let provider_model_selected = chat_model.is_some();
     let provider_health_state =
         if provider_auth_configured { "configured".to_owned() } else { "missing_auth".to_owned() };
@@ -1448,24 +1448,15 @@ fn get_bool_at_path(document: &toml::Value, key: &str) -> Option<bool> {
     get_value_at_path(document, key).ok().and_then(|value| value.and_then(toml::Value::as_bool))
 }
 
-fn model_auth_configured(document: &toml::Value) -> Result<bool> {
-    Ok(get_string_at_path(document, "model_provider.openai_api_key").is_some()
-        || get_string_at_path(document, "model_provider.openai_api_key_vault_ref").is_some()
-        || get_value_at_path(document, "model_provider.openai_api_key_secret_ref")?.is_some()
-        || get_string_at_path(document, "model_provider.anthropic_api_key").is_some()
-        || get_string_at_path(document, "model_provider.anthropic_api_key_vault_ref").is_some()
-        || get_value_at_path(document, "model_provider.anthropic_api_key_secret_ref")?.is_some()
-        || get_string_at_path(document, "model_provider.auth_profile_id").is_some())
-}
-
-fn configured_chat_model(document: &toml::Value) -> Result<Option<String>> {
-    let provider_kind = get_string_at_path(document, "model_provider.kind")
-        .unwrap_or_else(|| "openai_compatible".to_owned());
-    if provider_kind == "anthropic" {
-        Ok(get_string_at_path(document, "model_provider.anthropic_model"))
-    } else {
-        Ok(get_string_at_path(document, "model_provider.openai_model"))
-    }
+fn model_provider_config_posture(
+    document: &toml::Value,
+) -> Result<palyra_common::daemon_config_schema::ModelProviderConfigPosture> {
+    let parsed: palyra_common::daemon_config_schema::RootFileConfig =
+        document
+            .clone()
+            .try_into()
+            .context("failed to parse config for model-provider onboarding check")?;
+    Ok(palyra_common::daemon_config_schema::model_provider_config_posture(&parsed))
 }
 
 fn remote_verification_mode(document: &toml::Value) -> Option<&'static str> {
@@ -2020,6 +2011,56 @@ anthropic_api_key = "sk-inline-minimax"
         assert!(memory_step.optional);
         assert_eq!(memory_step.verification_state.as_deref(), Some("degraded_hash_fallback"));
         assert!(memory_step.summary.contains("palyra memory index --until-complete"));
+
+        app::clear_root_context_for_tests();
+        Ok(())
+    }
+
+    #[test]
+    fn onboarding_signals_accept_registry_oauth_provider() -> Result<()> {
+        let _guard = app::test_env_lock_for_tests().lock().expect("env lock");
+        app::clear_root_context_for_tests();
+
+        let temp = tempdir()?;
+        let config_path = temp.path().join("config").join("palyra.toml");
+        let config = r#"
+[model_provider]
+default_chat_model_id = "gpt-5.6-terra"
+
+[[model_provider.providers]]
+provider_id = "openai-primary"
+kind = "openai_compatible"
+enabled = true
+auth_profile_id = "openai-oauth"
+
+[[model_provider.models]]
+model_id = "gpt-5.6-terra"
+provider_id = "openai-primary"
+role = "chat"
+enabled = true
+"#;
+        fs::create_dir_all(config_path.parent().expect("config parent"))?;
+        fs::write(config_path.as_path(), config)?;
+        let document: toml::Value = toml::from_str(config)?;
+
+        let signals = collect_onboarding_signals(
+            &document,
+            config_path.display().to_string(),
+            OnboardingVariant::Quickstart,
+        )?;
+        let steps = build_onboarding_steps(OnboardingVariant::Quickstart, &signals);
+        let provider_step =
+            steps.iter().find(|step| step.step_id == "provider_auth").expect("provider step");
+        let verification_step = steps
+            .iter()
+            .find(|step| step.step_id == "model_verification")
+            .expect("verification step");
+
+        assert!(signals.provider_auth_configured);
+        assert!(signals.provider_model_selected);
+        assert_eq!(signals.chat_model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(provider_step.status, control_plane::OnboardingStepStatus::Done);
+        assert_ne!(verification_step.status, control_plane::OnboardingStepStatus::Blocked);
 
         app::clear_root_context_for_tests();
         Ok(())
