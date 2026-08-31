@@ -336,21 +336,7 @@ fn install_windows_task(
     context: &GatewayServiceInstallContext<'_>,
 ) -> Result<(PathBuf, PathBuf, String)> {
     let wrapper_path = context.service_root.join("gateway-service.cmd");
-    let mut body = String::from("@echo off\r\nsetlocal\r\n");
-    if let Some(config_path) = context.config_path {
-        body.push_str(format!("set PALYRA_CONFIG={}\r\n", config_path.display()).as_str());
-    }
-    body.push_str(format!("set PALYRA_STATE_ROOT={}\r\n", context.state_root.display()).as_str());
-    body.push_str(format!("cd /d \"{}\"\r\n", context.working_directory.display()).as_str());
-    body.push_str(
-        format!(
-            "\"{}\" >> \"{}\" 2>> \"{}\"\r\n",
-            context.daemon_bin.display(),
-            context.stdout_log_path.display(),
-            context.stderr_log_path.display()
-        )
-        .as_str(),
-    );
+    let body = render_windows_task_wrapper(context);
     fs::write(wrapper_path.as_path(), body.as_bytes()).with_context(|| {
         format!("failed to write Windows gateway wrapper {}", wrapper_path.display())
     })?;
@@ -406,6 +392,49 @@ fn install_windows_task(
     // Scheduled tasks have no on-disk unit file, so the wrapper script serves
     // as both the wrapper and the definition path in the metadata.
     Ok((wrapper_path.clone(), wrapper_path, "schtasks".to_owned()))
+}
+
+#[cfg(windows)]
+fn render_windows_task_wrapper(context: &GatewayServiceInstallContext<'_>) -> String {
+    let mut body = String::from("@echo off\r\nsetlocal\r\n");
+    if let Some(config_path) = context.config_path {
+        body.push_str(
+            format!("set \"PALYRA_CONFIG={}\"\r\n", windows_cmd_compatible_path(config_path))
+                .as_str(),
+        );
+    }
+    body.push_str(
+        format!(
+            "set \"PALYRA_STATE_ROOT={}\"\r\n",
+            windows_cmd_compatible_path(context.state_root)
+        )
+        .as_str(),
+    );
+    body.push_str(
+        format!("pushd \"{}\"\r\n", windows_cmd_compatible_path(context.working_directory))
+            .as_str(),
+    );
+    body.push_str(
+        format!(
+            "\"{}\" >> \"{}\" 2>> \"{}\"\r\n",
+            windows_cmd_compatible_path(context.daemon_bin),
+            windows_cmd_compatible_path(context.stdout_log_path),
+            windows_cmd_compatible_path(context.stderr_log_path)
+        )
+        .as_str(),
+    );
+    body
+}
+
+#[cfg(windows)]
+fn windows_cmd_compatible_path(path: &Path) -> String {
+    // Rust canonicalization adds the verbatim prefix, but cmd.exe cannot use
+    // that syntax as its current directory and fails before launching palyrad.
+    let raw = path.to_string_lossy();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{unc}");
+    }
+    raw.strip_prefix(r"\\?\").unwrap_or(raw.as_ref()).to_owned()
 }
 
 #[cfg(windows)]
@@ -1028,7 +1057,7 @@ mod tests {
     #[cfg(windows)]
     use super::{
         decode_windows_process_output, is_schtasks_running_status, parse_schtasks_csv_row,
-        summarize_command_output,
+        render_windows_task_wrapper, summarize_command_output, GatewayServiceInstallContext,
     };
     use super::{
         default_service_name, load_service_metadata, query_gateway_service_status,
@@ -1039,6 +1068,8 @@ mod tests {
     use std::fs;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::path::Path;
     #[cfg(windows)]
     use std::process::Output;
     use tempfile::tempdir;
@@ -1146,6 +1177,33 @@ mod tests {
             !decoded.contains("non-UTF-8"),
             "Windows code-page fallback should decode non-UTF-8 process output: {decoded}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_task_wrapper_uses_cmd_compatible_canonical_paths() {
+        let service_root = Path::new(r"C:\Palyra\service");
+        let context = GatewayServiceInstallContext {
+            service_root,
+            service_name: "PalyraGateway",
+            daemon_bin: Path::new(r"\\?\C:\Program Files\Palyra\palyrad.exe"),
+            state_root: Path::new(r"\\?\C:\Users\operator\Palyra State"),
+            config_path: Some(Path::new(r"\\?\C:\Users\operator\Palyra State\palyra.toml")),
+            working_directory: Path::new(r"\\?\C:\Program Files\Palyra"),
+            stdout_log_path: Path::new(r"\\?\C:\Users\operator\Palyra State\stdout.log"),
+            stderr_log_path: Path::new(r"\\?\C:\Users\operator\Palyra State\stderr.log"),
+            start_now: true,
+        };
+
+        let wrapper = render_windows_task_wrapper(&context);
+
+        assert!(!wrapper.contains(r"\\?\"), "cmd wrapper must not retain verbatim path syntax");
+        assert!(
+            wrapper.contains(r#"set "PALYRA_CONFIG=C:\Users\operator\Palyra State\palyra.toml""#)
+        );
+        assert!(wrapper.contains(r#"set "PALYRA_STATE_ROOT=C:\Users\operator\Palyra State""#));
+        assert!(wrapper.contains(r#"pushd "C:\Program Files\Palyra""#));
+        assert!(wrapper.contains(r#""C:\Program Files\Palyra\palyrad.exe""#));
     }
 
     #[cfg(windows)]
