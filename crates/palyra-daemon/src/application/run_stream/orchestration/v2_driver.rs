@@ -2075,7 +2075,7 @@ mod production_wiring_tests {
         let delivery =
             flow_control.delivery().expect("terminal delivery scope should remain valid");
         let mut tape_seq = 0;
-        let transport_error = send_settled_final_status(
+        send_settled_final_status(
             &sender,
             &state,
             run_id.as_str(),
@@ -2086,8 +2086,7 @@ mod production_wiring_tests {
             &delivery,
         )
         .await
-        .expect_err("closed transport should reject terminal projection");
-        assert_eq!(transport_error.code(), tonic::Code::Cancelled);
+        .expect("closed observer should detach without rejecting durable terminal projection");
 
         let snapshot = state
             .orchestrator_run_status_snapshot(run_id.clone())

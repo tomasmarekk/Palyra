@@ -13085,7 +13085,7 @@ async fn preterminalized_failure_controls_late_completion_state() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn successful_run_finalization_cleans_resources_when_done_status_channel_closed() {
+async fn successful_run_finalization_ignores_closed_observer_and_cleans_resources() {
     let state = build_test_runtime_state(false);
     let session_id = Ulid::generate().to_string();
     let run_id = Ulid::generate().to_string();
@@ -13113,7 +13113,7 @@ async fn successful_run_finalization_cleans_resources_when_done_status_channel_c
     .await
     .expect("durable completion should survive a closed client channel");
 
-    assert_eq!(outcome, RunStreamPostProviderOutcome::CompletedDeliveryFailed);
+    assert_eq!(outcome, RunStreamPostProviderOutcome::Completed);
     assert_eq!(run_state.state(), RunLifecycleState::Done);
     assert!(
         state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
