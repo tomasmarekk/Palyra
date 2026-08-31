@@ -2,9 +2,9 @@
 //! retry/branch, transcript search/export, compaction, checkpoints, and background tasks.
 //!
 //! Mixes the gateway gRPC operator runtime (session resolution, runs) with the admin
-//! console HTTP API (queue, compaction, checkpoints, background tasks). Broad listing
-//! surfaces redact reusable identifiers and user-routing labels; the explicit resolver
-//! returns the selectors required by subsequent commands.
+//! console HTTP API (queue, compaction, checkpoints, background tasks). Session listings
+//! preserve reusable command selectors and pagination cursors while redacting user-routing
+//! labels and lineage.
 
 use crate::*;
 use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
@@ -80,8 +80,12 @@ pub(crate) async fn run_sessions_async(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
-                        "sessions": response.sessions.iter().map(session_to_json).collect::<Vec<_>>(),
-                        "next_after_session_key": redacted_text_json_or_null(
+                        "sessions": response
+                            .sessions
+                            .iter()
+                            .map(listed_session_to_json)
+                            .collect::<Vec<_>>(),
+                        "next_after_session_key": empty_to_json_or_null(
                             response.next_after_session_key.as_str()
                         ),
                         "include_archived": include_archived,
@@ -93,7 +97,7 @@ pub(crate) async fn run_sessions_async(
                         "{}",
                         serde_json::to_string(&json!({
                             "type": "session",
-                            "session": session_to_json(session),
+                            "session": listed_session_to_json(session),
                         }))?
                     );
                 }
@@ -101,21 +105,22 @@ pub(crate) async fn run_sessions_async(
                 println!(
                     "sessions.list count={} next_after={} include_archived={}",
                     response.sessions.len(),
-                    redacted_text_or_none(!response.next_after_session_key.trim().is_empty()),
+                    empty_to_none(response.next_after_session_key.as_str()),
                     include_archived
                 );
                 for session in &response.sessions {
                     output::print_text_line(
                         format!(
-                            "session title={} source={} preview={} key={} label={} updated_at_unix_ms={} last_run_state={} last_run_id={} archived_at_unix_ms={}",
+                            "session id={} title={} source={} preview={} key={} label={} updated_at_unix_ms={} last_run_state={} last_run_id={} archived_at_unix_ms={}",
+                            operational_canonical_id_text(&session.session_id),
                             session_title_for_output(session),
                             empty_to_none(session.title_source.as_str()),
                             empty_to_none(session.preview.as_str()),
-                            redacted_text_or_none(!session.session_key.trim().is_empty()),
+                            empty_to_none(session.session_key.as_str()),
                             redacted_text_or_none(!session.session_label.trim().is_empty()),
                             session.updated_at_unix_ms,
                             empty_to_none(session.last_run_state.as_str()),
-                            redacted_canonical_id_text(&session.last_run_id),
+                            operational_canonical_id_text(&session.last_run_id),
                             optional_unix_ms_text(session.archived_at_unix_ms)
                         )
                         .as_str(),
@@ -1297,6 +1302,26 @@ fn session_to_json(session: &gateway_v1::SessionSummary) -> Value {
     })
 }
 
+/// Builds a listing payload with the selectors needed for follow-up commands.
+///
+/// Human-authored labels and lineage remain redacted because they can contain routed
+/// user content. Canonical identifiers, keys, and run IDs are operational capabilities
+/// already scoped to the authenticated CLI principal.
+fn listed_session_to_json(session: &gateway_v1::SessionSummary) -> Value {
+    let mut payload = session_to_json(session);
+    let Some(fields) = payload.as_object_mut() else {
+        return payload;
+    };
+    fields
+        .insert("session_id".to_owned(), operational_canonical_id_json_value(&session.session_id));
+    fields.insert("session_key".to_owned(), empty_to_json_or_null(session.session_key.as_str()));
+    fields.insert(
+        "last_run_id".to_owned(),
+        operational_canonical_id_json_value(&session.last_run_id),
+    );
+    payload
+}
+
 /// Builds the explicit resolver payload with reusable ID/key selectors.
 ///
 /// Labels, lineage, and run identifiers remain redacted; only the two values
@@ -1798,7 +1823,7 @@ mod render_tests {
 mod tests {
     use super::{
         build_cleanup_session_request, build_resolve_session_request,
-        build_session_retry_agent_run_input, redacted_canonical_id_text,
+        build_session_retry_agent_run_input, listed_session_to_json, redacted_canonical_id_text,
         redacted_cleanup_warning_json, redacted_cleanup_warning_text, resolved_session_to_json,
         session_to_json, track_unique_session_label_match,
     };
@@ -1959,6 +1984,47 @@ mod tests {
             Some(REDACTED)
         );
         assert_eq!(payload.get("last_run_id").and_then(serde_json::Value::as_str), Some(REDACTED));
+    }
+
+    #[test]
+    fn listed_session_json_returns_follow_up_command_selectors() {
+        let session = gateway_v1::SessionSummary {
+            session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            }),
+            session_key: "onboarding-smoke".to_owned(),
+            session_label: "Sensitive user label".to_owned(),
+            parent_session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            }),
+            last_run_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            }),
+            ..Default::default()
+        };
+
+        let payload = listed_session_to_json(&session);
+
+        assert_eq!(
+            payload.get("session_id").and_then(serde_json::Value::as_str),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        assert_eq!(
+            payload.get("session_key").and_then(serde_json::Value::as_str),
+            Some("onboarding-smoke")
+        );
+        assert_eq!(
+            payload.get("last_run_id").and_then(serde_json::Value::as_str),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAX")
+        );
+        assert_eq!(
+            payload.get("session_label").and_then(serde_json::Value::as_str),
+            Some(REDACTED)
+        );
+        assert_eq!(
+            payload.get("parent_session_id").and_then(serde_json::Value::as_str),
+            Some(REDACTED)
+        );
     }
 
     #[test]
