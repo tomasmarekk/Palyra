@@ -4995,12 +4995,23 @@ pub(crate) async fn click_with_chromium(
                         format!("failed to initialize Chromium download capture: {error}")
                     })?;
             }
-            element.click().map_err(|error| {
+            // `Element::click` waits on an IntersectionObserver before dispatch and can consume
+            // the entire CDP timeout on otherwise actionable elements on Windows. A synchronous
+            // scroll plus the JS-reported midpoint preserves real mouse input without that wait.
+            element
+                .call_js_fn(
+                    "function() { this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); return true; }",
+                    Vec::new(),
+                    false,
+                )
+                .and_then(|_| element.get_js_midpoint())
+                .and_then(|midpoint| tab_for_attempt.click_point(midpoint))
+                .map_err(|error| {
                 format!(
                     "failed to click selector '{}' through Chromium input dispatch: {error}",
                     selector_for_attempt
                 )
-            })?;
+                })?;
             Ok(ClickAttempt::Clicked { download_like, may_open_window })
         })
         .await;
@@ -5110,7 +5121,7 @@ fn chromium_element_may_open_window(attributes: Option<&[String]>) -> bool {
     ["target", "formtarget"].iter().any(|attribute| {
         chromium_element_attribute(attributes, attribute)
             .is_some_and(|value| value.eq_ignore_ascii_case("_blank"))
-    }) || chromium_element_has_attribute(attributes, "onclick")
+    })
 }
 
 async fn chromium_sync_session_tabs_after_click(
@@ -6263,10 +6274,13 @@ mod tests {
         for attributes in [
             vec!["target".to_owned(), "_blank".to_owned()],
             vec!["formtarget".to_owned(), "_BLANK".to_owned()],
-            vec!["onclick".to_owned(), "login()".to_owned()],
         ] {
             assert!(chromium_element_may_open_window(Some(attributes.as_slice())));
         }
+        // An inline handler is not evidence of a popup. Treating every such button as one makes
+        // ordinary same-tab clicks wait through the full popup synchronization budget.
+        let inline_handler = vec!["onclick".to_owned(), "save()".to_owned()];
+        assert!(!chromium_element_may_open_window(Some(inline_handler.as_slice())));
         let same_tab = vec!["target".to_owned(), "_self".to_owned()];
         assert!(!chromium_element_may_open_window(Some(same_tab.as_slice())));
         assert!(!chromium_element_may_open_window(None));
