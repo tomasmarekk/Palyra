@@ -1653,7 +1653,12 @@ fn build_patch_plan(
                 let output_path = normalize_relative_path_display(&relative);
                 let (target, target_root_index) =
                     resolve_existing_path(canonical_roots, &relative, path)?;
-                let before_bytes = read_file_capped(target.as_path(), path, limits.max_file_bytes)?;
+                // Planning is transactional, so a later operation must observe earlier writes from
+                // the same request even though none of them have reached the filesystem yet.
+                let before_bytes = match latest_planned_write_bytes(actions.as_slice(), &target) {
+                    Some(bytes) => bytes.to_vec(),
+                    None => read_file_capped(target.as_path(), path, limits.max_file_bytes)?,
+                };
                 let after_bytes =
                     replace_exact_line_bytes(path, before_bytes.as_slice(), old, new)?;
                 ensure_file_size(path, after_bytes.len(), limits.max_file_bytes)?;
@@ -1771,6 +1776,19 @@ fn build_patch_plan(
     }
 
     Ok(PatchPlan { actions, file_attestations, no_op_attestations })
+}
+
+fn latest_planned_write_bytes<'a>(actions: &'a [PlannedAction], target: &Path) -> Option<&'a [u8]> {
+    for action in actions.iter().rev() {
+        match action {
+            PlannedAction::Write { path, bytes, .. } if path == target => {
+                return Some(bytes.as_slice());
+            }
+            PlannedAction::Delete { path, .. } if path == target => return None,
+            PlannedAction::Write { .. } | PlannedAction::Delete { .. } => {}
+        }
+    }
+    None
 }
 
 fn parse_relative_patch_path(raw: &str) -> Result<PathBuf, WorkspacePatchError> {
@@ -2907,6 +2925,47 @@ mod tests {
         assert_eq!(attestation.operation, "line_replace");
         assert!(attestation.before_sha256.is_some());
         assert!(attestation.after_sha256.is_some());
+    }
+
+    #[test]
+    fn apply_workspace_patch_composes_repeated_line_replacements_for_one_file() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::write(
+            workspace.join("package.json"),
+            "{\n  \"name\": \"old-name\",\n  \"version\": \"0.1.0\"\n}\n",
+        )
+        .expect("seed file should exist");
+
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Replace Line: package.json\n",
+            "-  \"name\": \"old-name\",\n",
+            "+  \"name\": \"new-name\",\n",
+            "*** Replace Line: package.json\n",
+            "-  \"version\": \"0.1.0\"\n",
+            "+  \"version\": \"0.2.0\"\n",
+            "*** End Patch\n",
+        );
+        let outcome = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("both line replacements should apply");
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("package.json")).expect("patched file should read"),
+            "{\n  \"name\": \"new-name\",\n  \"version\": \"0.2.0\"\n}\n"
+        );
+        let attestations = outcome
+            .files_touched
+            .iter()
+            .filter(|attestation| attestation.path == "package.json")
+            .collect::<Vec<_>>();
+        assert_eq!(attestations.len(), 2);
+        assert_eq!(attestations[0].after_sha256, attestations[1].before_sha256);
     }
 
     #[test]
