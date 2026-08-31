@@ -40,7 +40,7 @@ use tokio::{
     time::{interval, interval_at, Instant as TokioInstant, MissedTickBehavior},
 };
 use tonic::{Code, Status, Streaming};
-use tracing::{debug, warn, Instrument};
+use tracing::{warn, Instrument};
 use ulid::Ulid;
 
 #[cfg(test)]
@@ -196,7 +196,6 @@ use super::{
     tape::{
         maybe_compact_context_after_tool_results, send_model_token_with_tape,
         send_settled_final_status, send_status_with_tape, status_tape_payload,
-        RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
     },
 };
 
@@ -3554,21 +3553,7 @@ async fn send_terminal_agent_loop_progress_status(
     tape_seq: &mut i64,
     phase: &str,
 ) -> Result<(), Status> {
-    match send_agent_loop_progress_status(sender, runtime_state, run_id, tape_seq, phase).await {
-        Ok(()) => Ok(()),
-        Err(error) if is_run_stream_response_channel_closed(&error) => {
-            debug!(
-                run_id,
-                phase, "skipping terminal agent loop progress status after client stream closed"
-            );
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-pub(super) fn is_run_stream_response_channel_closed(error: &Status) -> bool {
-    error.code() == Code::Cancelled && error.message() == RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE
+    send_agent_loop_progress_status(sender, runtime_state, run_id, tape_seq, phase).await
 }
 
 #[allow(clippy::result_large_err)]

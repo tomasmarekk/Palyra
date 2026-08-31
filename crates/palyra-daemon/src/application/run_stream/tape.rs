@@ -39,14 +39,6 @@ use crate::{
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
-/// Status message used when the client side of the run stream has dropped.
-///
-/// Paired with `Code::Cancelled` so callers can classify this exact condition
-/// (see `is_run_stream_response_channel_closed` in `orchestration`); do not
-/// reuse the text for other cancellation causes.
-pub(crate) const RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE: &str =
-    "run stream response channel closed";
-
 /// Result of the once-per-run context compaction attempted after a tool-result batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolResultCompactionOutcome {
@@ -385,13 +377,24 @@ pub(crate) async fn append_runtime_decision_tape_event(
     Ok(())
 }
 
+/// Best-effort delivery to the currently attached run-stream observer.
+///
+/// Durable run state, tape rows, and explicit cancellation own the run
+/// lifecycle. Dropping one CLI or UI stream therefore detaches that observer
+/// without converting an otherwise healthy background run into a failure.
+pub(crate) async fn deliver_run_stream_observation(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    event: common_v1::RunStreamEvent,
+) -> bool {
+    sender.send(Ok(event)).await.is_ok()
+}
+
 /// Appends a status event to the durable tape, then sends the matching wire event.
 ///
 /// # Errors
 ///
-/// Returns the journal error before delivery when persistence fails, or
-/// `Status::cancelled` with [`RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE`] when
-/// the client stream has dropped after the event became durable.
+/// Returns the journal error before delivery when persistence fails. A
+/// detached wire observer does not affect the authoritative run lifecycle.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn send_status_with_tape(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
@@ -412,8 +415,9 @@ pub(crate) async fn send_status_with_tape(
 /// send is deadline-bounded; durable settlement remains authoritative.
 ///
 /// # Errors
-/// Returns `cancelled` when the client stream is closed, `deadline_exceeded`
-/// when the protected delivery scope expires, or a fault-injection error.
+/// Returns `deadline_exceeded` when the protected delivery scope expires, or
+/// a fault-injection error. A closed observer is treated as a successful
+/// detach because durable settlement is already authoritative.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_settled_final_status(
@@ -436,7 +440,7 @@ pub(crate) async fn send_settled_final_status(
     .await
     {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE)),
+        Ok(Err(_)) => Ok(()),
         Err(_) => {
             runtime_state.record_run_stream_terminal_delivery_timeout();
             Err(Status::deadline_exceeded("run stream terminal delivery timed out"))
@@ -467,10 +471,7 @@ async fn send_status_with_tape_boundary(
     if final_status {
         apply_final_delivery_fault(runtime_state, run_id)?;
     }
-    sender
-        .send(Ok(event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
+    let _delivered = deliver_run_stream_observation(sender, event).await;
     Ok(())
 }
 
@@ -510,8 +511,8 @@ fn apply_final_delivery_fault(
 ///
 /// # Errors
 ///
-/// Returns `Status::cancelled` when the client stream has dropped, or any
-/// journal/compaction error from the tape and compaction paths.
+/// Returns any journal/compaction error from the tape and compaction paths.
+/// A detached wire observer does not stop token persistence or generation.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_model_token_with_tape(
@@ -528,10 +529,6 @@ pub(crate) async fn send_model_token_with_tape(
 ) -> Result<(), Status> {
     let safe_token = redact_run_stream_text(token);
     let event = model_token_event(run_id.to_owned(), safe_token.clone(), is_final);
-    sender
-        .send(Ok(event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
     if !is_final && *token_tape_events >= MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN {
         if !*compaction_emitted {
             compact_model_token_tape(runtime_state, request_context, session_id, run_id, tape_seq)
@@ -547,6 +544,7 @@ pub(crate) async fn send_model_token_with_tape(
             .await?;
             *compaction_emitted = true;
         }
+        let _delivered = deliver_run_stream_observation(sender, event).await;
         return Ok(());
     }
     runtime_state
@@ -559,6 +557,7 @@ pub(crate) async fn send_model_token_with_tape(
         .await?;
     *tape_seq += 1;
     *token_tape_events += 1;
+    let _delivered = deliver_run_stream_observation(sender, event).await;
     Ok(())
 }
 
@@ -940,8 +939,8 @@ pub(crate) async fn append_tool_approval_response_tape_event(
 ///
 /// # Errors
 ///
-/// Returns `Status::cancelled` when the client stream has dropped, or the
-/// journal error when the tape append fails.
+/// Returns the journal error when the tape append fails. A detached wire
+/// observer does not stop proposal processing.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_proposal_with_tape(
@@ -961,10 +960,6 @@ pub(crate) async fn send_tool_proposal_with_tape(
         input_json.to_vec(),
         approval_required,
     );
-    sender
-        .send(Ok(event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
     append_tool_proposal_tape_event(
         runtime_state,
         run_id,
@@ -974,15 +969,18 @@ pub(crate) async fn send_tool_proposal_with_tape(
         input_json,
         approval_required,
     )
-    .await
+    .await?;
+    let _delivered = deliver_run_stream_observation(sender, event).await;
+    Ok(())
 }
 
 /// Sends a tool-approval-request event to the client and appends the tape row.
 ///
 /// # Errors
 ///
-/// Returns `Status::cancelled` when the client stream has dropped, or the
-/// journal error when the tape append fails.
+/// Returns the journal error when the tape append fails. The durable approval
+/// record remains available to other operator surfaces after one observer
+/// detaches.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_approval_request_with_tape(
@@ -1008,10 +1006,6 @@ pub(crate) async fn send_tool_approval_request_with_tape(
         request_summary.to_owned(),
         prompt,
     );
-    sender
-        .send(Ok(event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
     append_tool_approval_request_tape_event(
         runtime_state,
         run_id,
@@ -1024,15 +1018,17 @@ pub(crate) async fn send_tool_approval_request_with_tape(
         request_summary,
         prompt,
     )
-    .await
+    .await?;
+    let _delivered = deliver_run_stream_observation(sender, event).await;
+    Ok(())
 }
 
 /// Sends a tool-approval-response event to the client and appends the tape row.
 ///
 /// # Errors
 ///
-/// Returns `Status::cancelled` when the client stream has dropped, or the
-/// journal error when the tape append fails.
+/// Returns the journal error when the tape append fails. A detached wire
+/// observer does not alter the recorded approval outcome.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_approval_response_with_tape(
@@ -1056,10 +1052,6 @@ pub(crate) async fn send_tool_approval_response_with_tape(
         decision_scope,
         decision_scope_ttl_ms,
     );
-    sender
-        .send(Ok(event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
     append_tool_approval_response_tape_event(
         runtime_state,
         run_id,
@@ -1071,15 +1063,17 @@ pub(crate) async fn send_tool_approval_response_with_tape(
         decision_scope,
         decision_scope_ttl_ms,
     )
-    .await
+    .await?;
+    let _delivered = deliver_run_stream_observation(sender, event).await;
+    Ok(())
 }
 
 /// Sends a tool-decision (allow/deny) event to the client and appends the tape row.
 ///
 /// # Errors
 ///
-/// Returns `Status::cancelled` when the client stream has dropped, or the
-/// journal error when the tape append fails.
+/// Returns the journal error when the tape append fails. A detached wire
+/// observer does not alter the durable decision.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_decision_with_tape(
@@ -1102,10 +1096,6 @@ pub(crate) async fn send_tool_decision_with_tape(
         approval_required,
         policy_enforced,
     );
-    sender
-        .send(Ok(event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
     append_tool_decision_tape_event(
         runtime_state,
         run_id,
@@ -1118,7 +1108,9 @@ pub(crate) async fn send_tool_decision_with_tape(
         approval_required,
         policy_enforced,
     )
-    .await
+    .await?;
+    let _delivered = deliver_run_stream_observation(sender, event).await;
+    Ok(())
 }
 
 /// Appends one redacted tool-result tape event without wire delivery.
@@ -1215,8 +1207,8 @@ pub(crate) async fn append_mcp_transport_invocation_tape_event(
 ///
 /// # Errors
 ///
-/// Returns `Status::cancelled` when the client stream has dropped, or the
-/// journal error when the tape append fails.
+/// Returns the journal error when the tape append fails. A detached wire
+/// observer does not alter the durable result.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_result_with_tape(
@@ -1246,10 +1238,6 @@ pub(crate) async fn send_tool_result_with_tape(
         safe_output_json,
         safe_error,
     );
-    sender
-        .send(Ok(event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),
@@ -1259,6 +1247,7 @@ pub(crate) async fn send_tool_result_with_tape(
         })
         .await?;
     *tape_seq += 1;
+    let _delivered = deliver_run_stream_observation(sender, event).await;
     Ok(())
 }
 
@@ -1306,8 +1295,8 @@ pub(crate) async fn append_tool_attestation_tape_event(
 ///
 /// # Errors
 ///
-/// Returns `Status::cancelled` when the client stream has dropped, or the
-/// journal error when the tape append fails.
+/// Returns the journal error when the tape append fails. A detached wire
+/// observer does not alter the durable attestation.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_attestation_with_tape(
@@ -1333,10 +1322,6 @@ pub(crate) async fn send_tool_attestation_with_tape(
         timed_out,
         executor.to_owned(),
     );
-    sender
-        .send(Ok(event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),
@@ -1355,6 +1340,7 @@ pub(crate) async fn send_tool_attestation_with_tape(
         })
         .await?;
     *tape_seq += 1;
+    let _delivered = deliver_run_stream_observation(sender, event).await;
     Ok(())
 }
 
@@ -1633,14 +1619,20 @@ mod tests {
         MCP_TRANSPORT_INVOCATION_EVENT_SCHEMA_VERSION,
     };
     use serde_json::Value;
+    use tokio::sync::mpsc;
 
     use super::{
-        mcp_transport_invocation_tape_append_request, redact_run_stream_text,
-        redacted_run_stream_output_json, should_attempt_tool_result_compaction,
-        status_tape_payload, tool_result_tape_payload, ToolResultCompactionOutcome,
+        deliver_run_stream_observation, mcp_transport_invocation_tape_append_request,
+        redact_run_stream_text, redacted_run_stream_output_json, send_status_with_tape,
+        should_attempt_tool_result_compaction, status_event, status_tape_payload,
+        tool_result_tape_payload, ToolResultCompactionOutcome,
     };
     use crate::{
-        gateway::CANCELLED_REASON, transport::grpc::proto::palyra::common::v1 as common_v1,
+        gateway::{
+            runtime::tests::{start_test_orchestrator_run, test_runtime_state},
+            CANCELLED_REASON,
+        },
+        transport::grpc::proto::palyra::common::v1 as common_v1,
     };
 
     #[test]
@@ -1648,6 +1640,48 @@ mod tests {
         assert!(!should_attempt_tool_result_compaction(0, false));
         assert!(should_attempt_tool_result_compaction(1, false));
         assert!(!should_attempt_tool_result_compaction(1, true));
+    }
+
+    #[tokio::test]
+    async fn detached_run_stream_observer_does_not_become_a_run_error() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let event = status_event(
+            "run_detached_observer".to_owned(),
+            common_v1::stream_status::StatusKind::InProgress,
+            "background work continues".to_owned(),
+        );
+
+        assert!(!deliver_run_stream_observation(&sender, event).await);
+    }
+
+    #[tokio::test]
+    async fn detached_observer_does_not_block_durable_run_progress() {
+        let state = test_runtime_state();
+        let run_id = "run_detached_durable_progress";
+        start_test_orchestrator_run(&state, "session_detached_durable_progress", run_id);
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let mut tape_seq = 0;
+
+        send_status_with_tape(
+            &sender,
+            &state,
+            run_id,
+            &mut tape_seq,
+            common_v1::stream_status::StatusKind::InProgress,
+            "background work continues",
+        )
+        .await
+        .expect("detaching one observer must not fail the daemon-owned run");
+
+        let tape = state
+            .orchestrator_tape_snapshot(run_id.to_owned(), None, None)
+            .await
+            .expect("durable run tape should remain available");
+        assert_eq!(tape_seq, 1);
+        assert_eq!(tape.events.len(), 1);
+        assert_eq!(tape.events[0].event_type, "status");
     }
 
     #[test]

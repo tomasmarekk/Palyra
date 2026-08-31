@@ -11,31 +11,30 @@ use super::{
     final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
     followup_timeout_recovery_prompt, incomplete_final_answer_without_tools,
     incomplete_terminal_final_answer, incomplete_terminal_outcome_message, is_browser_tool_name,
-    is_run_stream_response_channel_closed, length_recovery_prompt,
-    narrow_routine_tool_catalog_policy, normalized_provider_stream_from_output_v2,
-    normalized_tool_output_evidence, phase_heartbeat_interval, provider_error_partial_summary,
-    provider_model_override_for_routing, provider_output_needs_tool_repair_audit,
-    provider_request_deadline_timeout, provider_request_timeout_message,
-    provider_request_timeout_status, provider_status_recovery_decision_payload,
-    provider_timeout_termination_reason, provider_turn_anomaly_from_response_failure,
-    provider_turn_anomaly_from_status, provider_waiting_status_message,
-    repeated_tool_failure_signature, revoke_inherited_tool_approvals_after_steering,
-    run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
-    run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
-    run_progress_attempt_from_tool_result, run_runtime_path_terminal_reason,
-    run_stream_agent_harness_selection_mode, run_stream_harness_cancelled_tape_events,
-    run_stream_harness_cleanup_payload, run_stream_harness_selection_payload,
-    run_stream_harness_started_payload, run_stream_harness_terminal_event,
-    run_stream_harness_terminal_from_outcome, run_stream_harness_terminal_from_state,
-    run_stream_harness_terminal_payload, seed_orchestration_test_run,
-    selected_v2_shadow_route_semantics, shadow_catalog_matches_selected_v2_route,
-    should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
-    tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
-    tool_followup_timeout_context, tool_followup_timeout_partial_summary,
-    tool_result_to_provider_message, truncated_final_answer_without_tools,
-    ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
-    RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
-    RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
+    length_recovery_prompt, narrow_routine_tool_catalog_policy,
+    normalized_provider_stream_from_output_v2, normalized_tool_output_evidence,
+    phase_heartbeat_interval, provider_error_partial_summary, provider_model_override_for_routing,
+    provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
+    provider_request_timeout_message, provider_request_timeout_status,
+    provider_status_recovery_decision_payload, provider_timeout_termination_reason,
+    provider_turn_anomaly_from_response_failure, provider_turn_anomaly_from_status,
+    provider_waiting_status_message, repeated_tool_failure_signature,
+    revoke_inherited_tool_approvals_after_steering, run_loop_phase_timeout_message,
+    run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
+    run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
+    run_runtime_path_terminal_reason, run_stream_agent_harness_selection_mode,
+    run_stream_harness_cancelled_tape_events, run_stream_harness_cleanup_payload,
+    run_stream_harness_selection_payload, run_stream_harness_started_payload,
+    run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
+    run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
+    seed_orchestration_test_run, selected_v2_shadow_route_semantics,
+    shadow_catalog_matches_selected_v2_route, should_emit_budget_exhausted_partial_summary,
+    terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
+    tool_catalog_snapshot_phase_timeout, tool_followup_timeout_context,
+    tool_followup_timeout_partial_summary, tool_result_to_provider_message,
+    truncated_final_answer_without_tools, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
+    RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
+    RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
     RunStreamProviderRequestOutcome, RunStreamToolResultForModel, ToolCatalogPolicySnapshot,
     CODEX_MANAGED_RUNTIME_ID, HARNESS_SELECTION_EVENT, MAX_LENGTH_RECOVERY_ATTEMPTS,
     RUNTIME_SELECTED_METADATA_EVENT, RUN_STREAM_HARNESS_RUNTIME_POLICY,
@@ -59,7 +58,6 @@ use crate::application::agent_harness_lifecycle::{
 use crate::application::provider_turn_recovery::ProviderTurnAnomaly;
 use crate::application::run_stream::{
     cancellation::transition_run_stream_to_cancelled, flow_control::RunStreamFlowControl,
-    tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
 };
 use crate::config::{AgentHarnessConfig, AgentHarnessRegistryConfig};
 use crate::gateway::{tests::build_test_runtime_state, RequestContext, ToolApprovalOutcome};
@@ -1184,32 +1182,6 @@ fn runtime_path_terminal_reason_is_stable_for_success_failure_cancel_and_timeout
         ),
         "run_stream.status.permission_denied"
     );
-    assert_eq!(
-        run_runtime_path_terminal_reason(
-            RunLifecycleState::Done,
-            &Err(Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE)),
-        ),
-        "runtime.terminal.completed"
-    );
-    assert_eq!(
-        run_runtime_path_terminal_reason(
-            RunLifecycleState::Failed,
-            &Err(Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE)),
-        ),
-        "runtime.terminal.failed"
-    );
-}
-
-#[test]
-fn run_stream_response_channel_closed_status_is_classified_narrowly() {
-    let closed = Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE);
-    assert!(is_run_stream_response_channel_closed(&closed));
-
-    let different_cancel = Status::cancelled("caller cancelled before final answer");
-    assert!(!is_run_stream_response_channel_closed(&different_cancel));
-
-    let internal = Status::new(Code::Internal, RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE);
-    assert!(!is_run_stream_response_channel_closed(&internal));
 }
 
 #[test]

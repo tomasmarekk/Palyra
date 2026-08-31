@@ -122,15 +122,16 @@ use super::{
         RunStreamFlowControl, PROCESS_PROGRESS_BACKPRESSURE_REASON_CODE,
         PROCESS_PROGRESS_BACKPRESSURE_TAPE_EVENT,
     },
-    orchestration::{is_run_stream_response_channel_closed, RunStreamHarnessLifecycle},
+    orchestration::RunStreamHarnessLifecycle,
     tape::{
-        append_mcp_transport_invocation_tape_event, mcp_transport_invocation_tape_append_request,
-        redact_run_stream_text, redacted_run_stream_output_json, send_status_with_tape,
+        append_mcp_transport_invocation_tape_event, deliver_run_stream_observation,
+        mcp_transport_invocation_tape_append_request, redact_run_stream_text,
+        redacted_run_stream_output_json, send_status_with_tape,
         send_tool_approval_request_with_tape, send_tool_approval_response_with_tape,
         send_tool_attestation_with_tape, send_tool_decision_with_tape,
         send_tool_proposal_with_tape, send_tool_result_with_tape, tool_attestation_event,
         tool_attestation_tape_payload, tool_result_event, tool_result_tape_payload,
-        ToolAttestationTapePayload, RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
+        ToolAttestationTapePayload,
     },
 };
 
@@ -2568,12 +2569,7 @@ async fn resolve_run_stream_tool_approval_outcome(
 }
 
 fn approval_request_failure_reason(error: &Status) -> String {
-    let reason_code = if is_run_stream_response_channel_closed(error) {
-        "approval_request_dispatch_error"
-    } else {
-        "approval_request_tape_error"
-    };
-    format!("{reason_code}: {}", error.message())
+    format!("approval_request_tape_error: {}", error.message())
 }
 
 fn tool_execution_timeout(runtime_state: &GatewayRuntimeState, tool_name: &str) -> Duration {
@@ -3701,10 +3697,7 @@ async fn send_committed_run_stream_tool_outcome(
         redacted_run_stream_output_json(outcome.output_json.as_slice()),
         redact_run_stream_text(outcome.error.as_str()),
     );
-    sender
-        .send(Ok(result_event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
+    let _result_delivered = deliver_run_stream_observation(sender, result_event).await;
     let attestation_event = tool_attestation_event(
         run_id.to_owned(),
         proposal_id.to_owned(),
@@ -3714,10 +3707,8 @@ async fn send_committed_run_stream_tool_outcome(
         outcome.attestation.timed_out,
         outcome.attestation.executor.clone(),
     );
-    sender
-        .send(Ok(attestation_event))
-        .await
-        .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))
+    let _attestation_delivered = deliver_run_stream_observation(sender, attestation_event).await;
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -5237,8 +5228,7 @@ mod tests {
         tool_side_effect_cleanup_outcome_request, workspace_spill_policy_grants_sensitivity,
         workspace_spill_unavailable_projection, OrchestratorTapeAppendRequest,
         ParallelToolExecutionTaskOutcome, RunStreamPreparedToolExecution, ToolParallelism,
-        RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE, TOOL_RESULT_PROJECTION_POLICY_EVENT,
-        TOOL_RESULT_REPLAY_SAFETY_EVENT,
+        TOOL_RESULT_PROJECTION_POLICY_EVENT, TOOL_RESULT_REPLAY_SAFETY_EVENT,
     };
     use crate::application::tool_governance::{
         build_tool_call_signature, evaluate_before_tool_decision_pipeline, BeforeToolDecisionInput,
@@ -5297,13 +5287,9 @@ mod tests {
     }
 
     #[test]
-    fn approval_request_failure_reason_distinguishes_dispatch_from_tape_errors() {
-        let dispatch = approval_request_failure_reason(&Status::cancelled(
-            RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
-        ));
+    fn approval_request_failure_reason_reports_durable_record_errors() {
         let tape = approval_request_failure_reason(&Status::internal("tape append failed"));
 
-        assert!(dispatch.starts_with("approval_request_dispatch_error:"));
         assert!(tape.starts_with("approval_request_tape_error:"));
     }
 

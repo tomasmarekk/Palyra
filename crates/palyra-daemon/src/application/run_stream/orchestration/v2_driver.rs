@@ -45,8 +45,8 @@ use crate::{
             },
             flow_control::RunStreamFlowControl,
             tape::{
-                redact_run_stream_text, tool_result_event, tool_result_tape_payload,
-                RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE,
+                deliver_run_stream_observation, redact_run_stream_text, tool_result_event,
+                tool_result_tape_payload,
             },
             tool_flow::{RunStreamLiveToolHost, RunStreamRetainedToolProposal},
         },
@@ -580,8 +580,9 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
         &'a self,
     ) -> HarnessFuture<'a, Result<(), RuntimeErrorEnvelopeV1>> {
         Box::pin(async move {
-            self.sender
-                .send(Ok(common_v1::RunStreamEvent {
+            let _delivered = deliver_run_stream_observation(
+                &self.sender,
+                common_v1::RunStreamEvent {
                     v: CANONICAL_PROTOCOL_MAJOR,
                     run_id: Some(common_v1::CanonicalId { ulid: self.run_id.clone() }),
                     body: Some(common_v1::run_stream_event::Body::Status(
@@ -590,11 +591,10 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                             message: RUNTIME_KERNEL_V2_PROVIDER_EFFECT_STARTED_MESSAGE.to_owned(),
                         },
                     )),
-                }))
-                .await
-                .map_err(|_| {
-                    self.kernel_failure("runtime.provider_call.start_observation_unavailable")
-                })
+                },
+            )
+            .await;
+            Ok(())
         })
     }
 
@@ -1037,16 +1037,17 @@ impl ProductionAttemptCallbacks for RunStreamV2Callbacks {
                     reason_code,
                 });
             }
-            self.sender
-                .send(Ok(tool_result_event(
+            let _delivered = deliver_run_stream_observation(
+                &self.sender,
+                tool_result_event(
                     self.run_id.clone(),
                     proposal_id,
                     false,
                     b"{}".to_vec(),
                     reason_code,
-                )))
-                .await
-                .map_err(|_| self.kernel_failure("runtime.tool.denial_projection_closed"))?;
+                ),
+            )
+            .await;
             Ok(())
         })
     }
@@ -1766,10 +1767,7 @@ impl V2DeferredReplyProjection {
         sender: &tokio::sync::mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     ) -> Result<(), Status> {
         for event in &self.wire_events {
-            sender
-                .send(Ok(event.clone()))
-                .await
-                .map_err(|_| Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
+            let _delivered = deliver_run_stream_observation(sender, event.clone()).await;
         }
         Ok(())
     }
