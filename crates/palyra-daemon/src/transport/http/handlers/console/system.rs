@@ -497,9 +497,10 @@ fn model_provider_presence_state(
     auth_profile_configured: bool,
     auth_profiles_state: &str,
 ) -> &'static str {
-    if snapshot.circuit_breaker.open || snapshot.runtime_metrics.error_count > 0 {
-        "degraded"
-    } else if auth_profile_configured && auth_profiles_state != "ok" {
+    if snapshot.circuit_breaker.open
+        || snapshot.runtime_metrics.error_count > 0
+        || (auth_profile_configured && auth_profiles_state != "ok")
+    {
         "degraded"
     } else if config_credentials_configured
         || snapshot.api_key_configured
