@@ -28,7 +28,8 @@ use std::{
 };
 
 use palyra_safety::{
-    redact_text_for_export, SafetyContentKind, SafetyFindingCategory, SafetySourceKind, TrustLabel,
+    export_range_contains_secret_material, redact_text_for_export, SafetyContentKind,
+    SafetyFindingCategory, SafetySourceKind, TrustLabel,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2167,12 +2168,34 @@ fn read_workspace_file_chunk(
             let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
             let redaction_reasons = secret_redaction_reason_codes(&redaction);
             if redacted {
-                let visible_text = if chunk_start == 0 && chunk_end == snapshot.len() {
-                    redaction.redacted_text
+                if chunk_start == 0 && chunk_end == snapshot.len() {
+                    (
+                        Some(redaction.redacted_text),
+                        None,
+                        None,
+                        false,
+                        false,
+                        true,
+                        redaction_reasons,
+                    )
+                } else if export_range_contains_secret_material(full_text, chunk_start..chunk_end) {
+                    (
+                        Some("[REDACTED_SECRET]".to_owned()),
+                        None,
+                        None,
+                        false,
+                        false,
+                        true,
+                        redaction_reasons,
+                    )
                 } else {
-                    "[REDACTED_SECRET]".to_owned()
-                };
-                (Some(visible_text), None, None, false, false, true, redaction_reasons)
+                    match std::str::from_utf8(buffer) {
+                        Ok(text) => {
+                            (Some(text.to_owned()), None, None, false, false, false, Vec::new())
+                        }
+                        Err(_) => (None, None, None, true, true, false, Vec::new()),
+                    }
+                }
             } else {
                 match std::str::from_utf8(buffer) {
                     Ok(text) => {
@@ -3691,6 +3714,59 @@ mod tests {
             assert_eq!(output.bytes_base64, None);
             assert_eq!(output.bytes_base64_prefix, None);
         }
+    }
+
+    #[test]
+    fn read_workspace_file_returns_authoritative_lines_unrelated_to_a_secret() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let contents = "PASSWORD=CorrectHorseBatteryStaple123!\n\
+                        function showSettings() {\n\
+                        render('/settings');\n\
+                        }\n";
+        fs::write(tempdir.path().join("app.js"), contents).expect("workspace file should exist");
+        let input = WorkspaceReadFileInput {
+            path: "app.js".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: Some(2),
+            line_count: Some(3),
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("unrelated source lines should remain readable");
+
+        assert!(!output.redacted);
+        assert_eq!(
+            output.text.as_deref(),
+            Some("function showSettings() {\nrender('/settings');\n}\n")
+        );
+        assert_eq!(output.text_authoritative, None);
+        assert_eq!(output.redaction_notice, None);
+    }
+
+    #[test]
+    fn read_workspace_file_preserves_benign_mock_login_fixture_values() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let contents = "const sessionKey = \"s057.mock-session\";\n\
+                        if (username === \"demo\" && password === \"demo\") {\n\
+                        localStorage.setItem(sessionKey, \"demo/demo\");\n\
+                        }\n";
+        fs::write(tempdir.path().join("app.js"), contents).expect("workspace file should exist");
+        let input = WorkspaceReadFileInput {
+            path: "app.js".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: None,
+            line_count: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("mock login source should remain readable");
+
+        assert!(!output.redacted, "unexpected redaction: {output:?}");
+        assert_eq!(output.text.as_deref(), Some(contents));
     }
 
     #[test]

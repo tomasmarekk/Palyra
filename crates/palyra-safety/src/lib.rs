@@ -895,6 +895,27 @@ pub fn redact_text_for_export(
     ExportRedactionOutcome { redacted_text, redacted, scan }
 }
 
+/// Returns whether a requested byte range overlaps a line containing secret
+/// material that export redaction would withhold.
+///
+/// Ranges are intentionally line-granular: callers may safely release
+/// unrelated lines from a larger document without allowing small adjacent
+/// reads to reconstruct a redacted assignment, token, or private-key block.
+#[must_use]
+pub fn export_range_contains_secret_material(
+    text: &str,
+    requested_range: std::ops::Range<usize>,
+) -> bool {
+    if requested_range.start >= requested_range.end || requested_range.start >= text.len() {
+        return false;
+    }
+    let requested_end = requested_range.end.min(text.len());
+    redact_sensitive_material_with_ranges(text)
+        .1
+        .into_iter()
+        .any(|redacted| redacted.start < requested_end && redacted.end > requested_range.start)
+}
+
 fn combine_trust_labels(labels: impl IntoIterator<Item = TrustLabel>) -> TrustLabel {
     let mut saw_trusted = false;
     let mut saw_external = false;
@@ -1194,6 +1215,7 @@ fn comparison_value_requires_redaction(classification: &str, value: &str) -> boo
     if literal.is_empty()
         || is_obvious_placeholder_secret_value(literal)
         || is_explicit_test_credential_placeholder_value(literal)
+        || is_benign_mock_credential_fixture_value(literal)
     {
         return false;
     }
@@ -2270,15 +2292,15 @@ fn generic_key_assignment_value_looks_secret(key: &str, value: &str) -> bool {
         return false;
     }
     let lowered = normalized.to_ascii_lowercase();
-    if looks_like_segmented_auth_secret_value(lowered.as_str()) {
-        return true;
-    }
     if (assignment_key_describes_application_identifier(key)
         && looks_like_application_identifier(lowered.as_str()))
         || looks_like_parser_fixture_value(lowered.as_str())
         || looks_like_palyra_e2e_fixture_marker(lowered.as_str())
     {
         return false;
+    }
+    if looks_like_segmented_auth_secret_value(lowered.as_str()) {
+        return true;
     }
     if quoted_string_literals(value).iter().any(|literal| {
         let literal = literal.trim();
@@ -2296,9 +2318,19 @@ fn generic_key_assignment_value_looks_secret(key: &str, value: &str) -> bool {
 }
 
 fn assignment_key_describes_application_identifier(key: &str) -> bool {
-    ["cache", "filter", "fixture", "identifier", "namespace", "route", "state", "storage"]
-        .iter()
-        .any(|component| key.contains(component))
+    [
+        "cache",
+        "filter",
+        "fixture",
+        "identifier",
+        "namespace",
+        "route",
+        "session",
+        "state",
+        "storage",
+    ]
+    .iter()
+    .any(|component| key.contains(component))
 }
 
 fn looks_like_segmented_auth_secret_value(value: &str) -> bool {
@@ -2387,7 +2419,7 @@ fn looks_like_scenario_application_identifier(value: &str) -> bool {
     !digits.is_empty()
         && digits.chars().all(|ch| ch.is_ascii_digit())
         && label.len() <= 48
-        && label.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && label.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
         && (label.contains("auth")
             || label.contains("fixture")
             || label.contains("mock")
@@ -2554,24 +2586,35 @@ fn sanitize_external_markers(input: &str) -> String {
 /// Applies all export redaction passes line by line, preserving original line
 /// endings.
 fn redact_sensitive_material(input: &str) -> String {
+    redact_sensitive_material_with_ranges(input).0
+}
+
+fn redact_sensitive_material_with_ranges(input: &str) -> (String, Vec<std::ops::Range<usize>>) {
     let mut output = String::new();
+    let mut redacted_ranges = Vec::new();
     let mut in_private_key_block = false;
+    let mut segment_start = 0_usize;
     for segment in input.split_inclusive('\n') {
         let (line, line_ending) = split_line_ending(segment);
+        let segment_end = segment_start.saturating_add(segment.len());
         let lowered = line.to_ascii_lowercase();
         if lowered.contains("-----begin ") && lowered.contains("private key-----") {
             output.push_str(REDACTED_SECRET);
             output.push_str(line_ending);
+            redacted_ranges.push(segment_start..segment_end);
             in_private_key_block = true;
+            segment_start = segment_end;
             continue;
         }
         // Lines inside a PEM block are dropped entirely; an unterminated
         // block redacts to end of input (fail closed: over-redact rather
         // than leak a partial key).
         if in_private_key_block {
+            redacted_ranges.push(segment_start..segment_end);
             if lowered.contains("-----end ") && lowered.contains("private key-----") {
                 in_private_key_block = false;
             }
+            segment_start = segment_end;
             continue;
         }
 
@@ -2590,10 +2633,14 @@ fn redact_sensitive_material(input: &str) -> String {
         });
         redacted_line = redact_bearer_token(redacted_line);
         redacted_line = redact_secret_like_markers(redacted_line.as_str());
+        if redacted_line != line {
+            redacted_ranges.push(segment_start..segment_end);
+        }
         output.push_str(redacted_line.as_str());
         output.push_str(line_ending);
+        segment_start = segment_end;
     }
-    output
+    (output, redacted_ranges)
 }
 
 fn split_line_ending(segment: &str) -> (&str, &str) {
@@ -2887,9 +2934,10 @@ impl EnumLabel for SafetyAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        inspect_text, is_vault_reference_value, merge_scan_results, redact_text_for_export,
-        sanitize_visible_assistant_text, transform_text_for_prompt, ExportRedactionOutcome,
-        SafetyAction, SafetyContentKind, SafetyPhase, SafetySeverity, SafetySourceKind, TrustLabel,
+        export_range_contains_secret_material, inspect_text, is_vault_reference_value,
+        merge_scan_results, redact_text_for_export, sanitize_visible_assistant_text,
+        transform_text_for_prompt, ExportRedactionOutcome, SafetyAction, SafetyContentKind,
+        SafetyPhase, SafetySeverity, SafetySourceKind, TrustLabel,
     };
 
     #[test]
@@ -3984,8 +4032,14 @@ mod tests {
     }
 
     #[test]
-    fn mock_login_fixture_password_comparison_is_redacted() {
-        let source = "const sessionKey = \"s058.mockSession\";\n\
+    fn mock_login_fixture_credentials_remain_authoritative() {
+        assert!(super::assignment_key_describes_application_identifier("sessionkey"));
+        assert!(super::looks_like_application_identifier("s057.mock-session"));
+        assert!(!super::generic_key_assignment_value_looks_secret(
+            "sessionkey",
+            "\"s057.mock-session\""
+        ));
+        let source = "const sessionKey = \"s057.mock-session\";\n\
                       const credentials = { username: \"demo\", password: \"demo/demo\" };\n\
                       if (username === \"demo\" && password === \"demo\") {\n\
                       sessionStorage.setItem(sessionKey, JSON.stringify(credentials));\n\
@@ -3997,14 +4051,35 @@ mod tests {
             TrustLabel::TrustedLocal,
         );
 
-        assert!(outcome.redacted);
+        assert!(!outcome.redacted, "mock fixture was redacted as {:?}", outcome.redacted_text);
+        assert_eq!(outcome.redacted_text, source);
         assert!(outcome.redacted_text.contains("demo/demo"));
-        assert!(outcome.redacted_text.contains("password === \"[REDACTED_SECRET]\""));
-        assert!(outcome
+        assert!(outcome.redacted_text.contains("password === \"demo\""));
+        assert!(!outcome
             .scan
             .finding_codes()
             .iter()
             .any(|code| code == "secret_leak.assignment.password"));
+    }
+
+    #[test]
+    fn export_range_secret_detection_is_line_local_and_covers_private_key_blocks() {
+        let source = "PASSWORD=CorrectHorseBatteryStaple123!\n\
+                      const route = '/settings';\n\
+                      -----BEGIN PRIVATE KEY-----\n\
+                      private-key-body\n\
+                      -----END PRIVATE KEY-----\n\
+                      render(route);\n";
+        let route_start = source.find("const route").expect("route line should exist");
+        let route_end = route_start + "const route = '/settings';\n".len();
+        let password_start = source.find("CorrectHorse").expect("password should exist");
+        let key_body_start = source.find("private-key-body").expect("key body should exist");
+        let render_start = source.find("render(route)").expect("render line should exist");
+
+        assert!(!export_range_contains_secret_material(source, route_start..route_end));
+        assert!(export_range_contains_secret_material(source, password_start..password_start + 1));
+        assert!(export_range_contains_secret_material(source, key_body_start..key_body_start + 1));
+        assert!(!export_range_contains_secret_material(source, render_start..source.len()));
     }
 
     #[test]
