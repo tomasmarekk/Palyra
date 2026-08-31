@@ -2390,7 +2390,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 "url",
                 json!({
                     "type":"string",
-                    "description":"Target URL. file:// URLs are supported only for regular files inside active agent workspace roots or run-launch workspace roots; after opening one, use palyra.browser.observe for DOM/text evidence instead of treating a filesystem read as browser validation."
+                    "description":"Target URL. Use file:///workspace/<workspace-relative-path> for a regular file under the first active agent workspace root; absolute file:// URLs remain limited to regular files inside authorized active agent workspace roots. After opening one, use palyra.browser.observe for DOM/text evidence instead of treating a filesystem read as browser validation."
                 }),
             ));
             properties.push((
@@ -3295,6 +3295,7 @@ mod tests {
             .expect("browser url description should be visible to models");
         assert!(!url_description.contains("allow_private_targets=true"));
         assert!(url_description.contains("file:// URLs"));
+        assert!(url_description.contains("file:///workspace/<workspace-relative-path>"));
         assert!(url_description.contains("active agent workspace roots"));
         let private_target_description = navigate
             .input_schema

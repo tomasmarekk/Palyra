@@ -485,7 +485,28 @@ fn default_browser_session_persistence_id(agent_session_id: &str) -> String {
     format!("{PREFIX}{}", hex::encode(digest.finalize()))
 }
 
-/// Confines `file://` navigation targets to the run's browser-readable workspace roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserNavigationUrl {
+    model_url: String,
+    transport_url: String,
+}
+
+impl BrowserNavigationUrl {
+    fn same_destination(&self, other: &Self) -> bool {
+        self.transport_url == other.transport_url
+    }
+
+    fn project_response_url(&self, response_url: &str) -> String {
+        if browser_navigation_response_matches_transport(response_url, self.transport_url.as_str())
+        {
+            return self.model_url.clone();
+        }
+        redact_url(response_url)
+    }
+}
+
+/// Confines `file://` navigation targets to the run's browser-readable workspace roots and
+/// resolves the portable `file:///workspace/...` alias for browserd transport.
 ///
 /// Non-file URLs pass through untouched. The target must canonicalize to a
 /// regular file inside one of the resolved workspace roots, which blocks
@@ -494,16 +515,53 @@ fn default_browser_session_persistence_id(agent_session_id: &str) -> String {
 /// # Errors
 /// Returns a tool-facing message when the URL is malformed, the target does
 /// not resolve to a regular file, or it lies outside every workspace root.
-async fn validate_browser_file_url_workspace_scope(
+async fn resolve_browser_navigation_url(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
     url: &str,
-) -> Result<(), String> {
+) -> Result<BrowserNavigationUrl, String> {
+    let url = url.trim();
     if !browser_url_uses_file_scheme(url) {
-        return Ok(());
+        return Ok(BrowserNavigationUrl {
+            model_url: url.to_owned(),
+            transport_url: url.to_owned(),
+        });
     }
-    let parsed = Url::parse(url.trim()).map_err(|error| format!("invalid file URL: {error}"))?;
-    let file_path = browser_file_url_to_path(&parsed)?;
+    let parsed = Url::parse(url).map_err(|error| format!("invalid file URL: {error}"))?;
+    validate_browser_file_url_shape(&parsed)?;
+    let canonical_roots =
+        resolve_browser_read_workspace_roots(runtime_state, context, BROWSER_NAVIGATE_TOOL_NAME)
+            .await?;
+    resolve_browser_file_navigation_url(&parsed, canonical_roots.as_slice())
+}
+
+fn resolve_browser_file_navigation_url(
+    parsed: &Url,
+    canonical_roots: &[PathBuf],
+) -> Result<BrowserNavigationUrl, String> {
+    validate_browser_file_url_shape(parsed)?;
+    let transport_candidate = if let Some(relative_url) =
+        browser_workspace_alias_relative_url(parsed)
+    {
+        let workspace_root = canonical_roots.first().ok_or_else(|| {
+            "palyra.browser.navigate agent has no accessible workspace roots".to_owned()
+        })?;
+        let workspace_url = Url::from_directory_path(workspace_root).map_err(|()| {
+            "palyra.browser.navigate workspace root cannot be represented as a file URL".to_owned()
+        })?;
+        // Prefixing with `./` prevents a colon in the relative payload from
+        // being interpreted as a new URL scheme. Canonical scope validation
+        // below remains authoritative for encoded separators and traversal.
+        let mut resolved =
+            workspace_url.join(format!("./{relative_url}").as_str()).map_err(|error| {
+                format!("palyra.browser.navigate workspace file URL is invalid: {error}")
+            })?;
+        resolved.set_fragment(parsed.fragment());
+        resolved
+    } else {
+        parsed.clone()
+    };
+    let file_path = browser_file_url_to_path(&transport_candidate)?;
     let canonical_target = fs::canonicalize(file_path.as_path()).map_err(|error| {
         format!("palyra.browser.navigate failed to resolve file URL target: {error}")
     })?;
@@ -513,15 +571,50 @@ async fn validate_browser_file_url_workspace_scope(
     if !metadata.is_file() {
         return Err("palyra.browser.navigate file URL target is not a regular file".to_owned());
     }
-
-    let canonical_roots =
-        resolve_browser_read_workspace_roots(runtime_state, context, BROWSER_NAVIGATE_TOOL_NAME)
-            .await?;
     validate_browser_file_url_path_scope(
-        url,
+        parsed.as_str(),
         canonical_target.as_path(),
-        canonical_roots.as_slice(),
-    )
+        canonical_roots,
+    )?;
+
+    let mut canonical_url = Url::from_file_path(canonical_target.as_path()).map_err(|()| {
+        "palyra.browser.navigate canonical target cannot be represented as a file URL".to_owned()
+    })?;
+    canonical_url.set_fragment(parsed.fragment());
+    Ok(BrowserNavigationUrl {
+        model_url: parsed.to_string(),
+        transport_url: canonical_url.to_string(),
+    })
+}
+
+fn browser_workspace_alias_relative_url(parsed: &Url) -> Option<&str> {
+    if parsed.host_str().is_some() {
+        return None;
+    }
+    parsed.path().strip_prefix("/workspace/")
+}
+
+fn browser_navigation_response_matches_transport(response_url: &str, transport_url: &str) -> bool {
+    if response_url == transport_url {
+        return true;
+    }
+    let Ok(parsed) = Url::parse(response_url) else {
+        return false;
+    };
+    if parsed.scheme() != "file" || validate_browser_file_url_shape(&parsed).is_err() {
+        return false;
+    }
+    let Ok(path) = browser_file_url_to_path(&parsed) else {
+        return false;
+    };
+    let Ok(canonical_target) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(mut canonical_url) = Url::from_file_path(canonical_target) else {
+        return false;
+    };
+    canonical_url.set_fragment(parsed.fragment());
+    canonical_url.as_str() == transport_url
 }
 
 fn validate_browser_file_url_path_scope(
@@ -537,15 +630,20 @@ fn validate_browser_file_url_path_scope(
     ))
 }
 
-/// Converts a `file://` URL to a local path, rejecting embedded credentials
-/// and query strings so nothing can be smuggled past the path checks.
-fn browser_file_url_to_path(parsed: &Url) -> Result<PathBuf, String> {
+/// Rejects embedded credentials and query strings so nothing can be smuggled
+/// past the path checks.
+fn validate_browser_file_url_shape(parsed: &Url) -> Result<(), String> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("palyra.browser.navigate file URL credentials are not allowed".to_owned());
     }
     if parsed.query().is_some() {
         return Err("palyra.browser.navigate file URL query strings are not allowed".to_owned());
     }
+    Ok(())
+}
+
+fn browser_file_url_to_path(parsed: &Url) -> Result<PathBuf, String> {
+    validate_browser_file_url_shape(parsed)?;
     parsed.to_file_path().map_err(|_| "palyra.browser.navigate file URL path is invalid".to_owned())
 }
 
@@ -1823,25 +1921,27 @@ pub(crate) async fn execute_browser_tool(
                     "palyra.browser.navigate requires non-empty string field 'url'".to_owned(),
                 );
             }
-            if let Err(error) =
-                validate_browser_file_url_workspace_scope(runtime_state, context, url).await
-            {
-                return browser_tool_execution_outcome(
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    error,
-                );
-            }
+            let navigation_url =
+                match resolve_browser_navigation_url(runtime_state, context, url).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return browser_tool_execution_outcome(
+                            proposal_id,
+                            input_json,
+                            false,
+                            b"{}".to_vec(),
+                            error,
+                        );
+                    }
+                };
             let allow_private_targets = browser_private_target_flag_for_validated_url(
-                url,
+                navigation_url.transport_url.as_str(),
                 browser_private_targets_requested(&payload),
             );
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
-                url: url.to_owned(),
+                url: navigation_url.transport_url.clone(),
                 timeout_ms: payload.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0),
                 allow_redirects: payload
                     .get("allow_redirects")
@@ -1865,9 +1965,11 @@ pub(crate) async fn execute_browser_tool(
             match client.navigate(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
+                    let final_url =
+                        navigation_url.project_response_url(response.final_url.as_str());
                     let output = json!({
                         "success": response.success,
-                        "final_url": response.final_url,
+                        "final_url": final_url,
                         "status_code": response.status_code,
                         "title": response.title,
                         "body_bytes": response.body_bytes,
@@ -2003,12 +2105,42 @@ pub(crate) async fn execute_browser_tool(
                     );
                 }
             };
-            if current_url != expected_url {
+            let expected_navigation_url =
+                match resolve_browser_navigation_url(runtime_state, context, expected_url.as_str())
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return browser_tool_execution_outcome(
+                            proposal_id,
+                            input_json,
+                            false,
+                            b"{}".to_vec(),
+                            error,
+                        );
+                    }
+                };
+            let current_navigation_url =
+                match resolve_browser_navigation_url(runtime_state, context, current_url.as_str())
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return browser_tool_execution_outcome(
+                            proposal_id,
+                            input_json,
+                            false,
+                            b"{}".to_vec(),
+                            error,
+                        );
+                    }
+                };
+            if !current_navigation_url.same_destination(&expected_navigation_url) {
                 let output = json!({
                     "success": false,
                     "session_id": session_id,
-                    "expected_url": redact_url(expected_url.as_str()),
-                    "active_url": redact_url(current_url.as_str()),
+                    "expected_url": expected_navigation_url.model_url,
+                    "active_url": current_navigation_url.model_url,
                     "error": "active_tab_url_mismatch",
                 });
                 return browser_tool_execution_outcome(
@@ -2020,30 +2152,15 @@ pub(crate) async fn execute_browser_tool(
                         .to_owned(),
                 );
             }
-            if let Err(error) = validate_browser_file_url_workspace_scope(
-                runtime_state,
-                context,
-                current_url.as_str(),
-            )
-            .await
-            {
-                return browser_tool_execution_outcome(
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    error,
-                );
-            }
             let allow_private_targets = browser_reload_private_target_flag_for_validated_url(
-                current_url.as_str(),
+                current_navigation_url.transport_url.as_str(),
                 &payload,
             );
-            let requested_url = redact_url(current_url.as_str());
+            let requested_url = expected_navigation_url.model_url.clone();
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
-                url: current_url,
+                url: current_navigation_url.transport_url,
                 timeout_ms: payload.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0),
                 allow_redirects: payload
                     .get("allow_redirects")
@@ -2067,11 +2184,13 @@ pub(crate) async fn execute_browser_tool(
             match client.navigate(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
+                    let final_url =
+                        expected_navigation_url.project_response_url(response.final_url.as_str());
                     let output = json!({
                         "success": response.success,
                         "reloaded": response.success,
                         "requested_url": requested_url,
-                        "final_url": response.final_url,
+                        "final_url": final_url,
                         "status_code": response.status_code,
                         "title": response.title,
                         "body_bytes": response.body_bytes,
@@ -4162,25 +4281,27 @@ pub(crate) async fn execute_browser_tool(
                 }
             };
             let url = payload.get("url").and_then(Value::as_str).map(str::trim).unwrap_or_default();
-            if let Err(error) =
-                validate_browser_file_url_workspace_scope(runtime_state, context, url).await
-            {
-                return browser_tool_execution_outcome(
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    error,
-                );
-            }
+            let navigation_url =
+                match resolve_browser_navigation_url(runtime_state, context, url).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return browser_tool_execution_outcome(
+                            proposal_id,
+                            input_json,
+                            false,
+                            b"{}".to_vec(),
+                            error,
+                        );
+                    }
+                };
             let allow_private_targets = browser_private_target_flag_for_validated_url(
-                url,
+                navigation_url.transport_url.as_str(),
                 browser_private_targets_requested(&payload),
             );
             let mut request = Request::new(browser_v1::OpenTabRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
-                url: url.to_owned(),
+                url: navigation_url.transport_url.clone(),
                 activate: payload.get("activate").and_then(Value::as_bool).unwrap_or(true),
                 timeout_ms: payload.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0),
                 allow_redirects: payload
@@ -4205,9 +4326,13 @@ pub(crate) async fn execute_browser_tool(
             match client.open_tab(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
+                    let tab = response.tab.map(|mut tab| {
+                        tab.url = navigation_url.project_response_url(tab.url.as_str());
+                        browser_tab_to_json(tab)
+                    });
                     let output = json!({
                         "success": response.success,
-                        "tab": response.tab.map(browser_tab_to_json),
+                        "tab": tab,
                         "navigated": response.navigated,
                         "status_code": response.status_code,
                         "error": response.error,
@@ -6006,11 +6131,12 @@ mod tests {
         canonical_file_path_is_inside_workspace_roots, default_browser_session_persistence_id,
         evaluate_browser_rescue_trigger, filter_browser_network_log_entries_since,
         normalize_browser_press_key_input, parse_browser_download_artifact_id,
-        parse_browser_observe_string_array, resolve_browser_output_path,
-        resolve_browser_upload_path, validate_browser_file_url_path_scope,
-        validate_browser_workspace_relative_path, write_browser_output_file,
-        BrowserRescueTriggerKind, BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER,
-        BROWSER_COOKIE_VALUE_WITHHELD, BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
+        parse_browser_observe_string_array, resolve_browser_file_navigation_url,
+        resolve_browser_output_path, resolve_browser_upload_path,
+        validate_browser_file_url_path_scope, validate_browser_workspace_relative_path,
+        write_browser_output_file, BrowserRescueTriggerKind, BrowserRuntimeCapabilities,
+        BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
+        BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -7452,6 +7578,70 @@ mod tests {
             sibling_target.as_path(),
             &[canonical_workspace]
         ));
+    }
+
+    #[test]
+    fn browser_workspace_file_alias_resolves_portably_and_preserves_public_url() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        let nested = workspace.join("nested");
+        std::fs::create_dir_all(nested.as_path()).expect("workspace should be created");
+        let fixture = nested.join("index.html");
+        std::fs::write(fixture.as_path(), "<main>fixture</main>")
+            .expect("fixture should be written");
+        let canonical_workspace = workspace.canonicalize().expect("workspace should canonicalize");
+        let alias = reqwest::Url::parse("file:///workspace/nested/index.html#result")
+            .expect("workspace alias should parse");
+
+        let resolved =
+            resolve_browser_file_navigation_url(&alias, std::slice::from_ref(&canonical_workspace))
+                .expect("workspace alias should resolve beneath the first root");
+        let transport = reqwest::Url::parse(resolved.transport_url.as_str())
+            .expect("transport URL should parse");
+        let transport_path = browser_file_url_to_path(&transport)
+            .expect("transport URL should resolve to a local path")
+            .canonicalize()
+            .expect("transport target should canonicalize");
+        let mut absolute = reqwest::Url::from_file_path(fixture.as_path())
+            .expect("absolute fixture URL should be built");
+        absolute.set_fragment(Some("result"));
+        let absolute = resolve_browser_file_navigation_url(
+            &absolute,
+            std::slice::from_ref(&canonical_workspace),
+        )
+        .expect("absolute fixture URL should resolve");
+
+        assert_eq!(transport_path, fixture.canonicalize().expect("fixture should canonicalize"));
+        assert_eq!(resolved.model_url, "file:///workspace/nested/index.html#result");
+        assert!(resolved.same_destination(&absolute));
+        assert_eq!(
+            resolved.project_response_url(resolved.transport_url.as_str()),
+            "file:///workspace/nested/index.html#result"
+        );
+    }
+
+    #[test]
+    fn browser_workspace_file_alias_cannot_traverse_outside_first_root() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should be created");
+        std::fs::create_dir_all(outside.as_path()).expect("outside should be created");
+        std::fs::write(outside.join("secret.html"), "secret").expect("sibling should be written");
+        let canonical_workspace = workspace.canonicalize().expect("workspace should canonicalize");
+        let alias = reqwest::Url::parse("file:///workspace/%2e%2e/outside/secret.html")
+            .expect("encoded traversal alias should parse");
+
+        let error =
+            resolve_browser_file_navigation_url(&alias, std::slice::from_ref(&canonical_workspace))
+                .expect_err("workspace alias traversal must remain outside authority");
+
+        assert!(
+            error.contains("active agent workspace roots")
+                || error.contains("failed to resolve file URL target")
+                || error.contains("file URL path is invalid"),
+            "{error}"
+        );
     }
 
     #[cfg(windows)]
