@@ -3024,9 +3024,14 @@ async fn grpc_route_message_does_not_reuse_cached_tool_approval_from_run_stream(
             "args": ["route-approval-cache"]
         }),
     )?;
+    let seed_final_response =
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":"approval cache seed complete"}}]}"#
+            .to_owned();
     let (openai_base_url, _request_count, server_handle) = spawn_scripted_openai_server(vec![
         ScriptedOpenAiResponse::immediate(200, response_body.clone()),
         ScriptedOpenAiResponse::immediate(200, response_body.clone()),
+        // Closing the observer must not cancel the durable seed run, so reserve its terminal turn.
+        ScriptedOpenAiResponse::immediate(200, seed_final_response),
         ScriptedOpenAiResponse::immediate(200, response_body),
     ])?;
     let (child, admin_port, grpc_port, journal_db_path, config_path) =
