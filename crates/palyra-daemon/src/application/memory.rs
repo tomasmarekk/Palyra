@@ -940,11 +940,11 @@ fn lifecycle_significant_terms(content_text: &str) -> Vec<String> {
 }
 
 /// Decides whether an existing item is the prior value a correction
-/// supersedes. Only corrections conflict, only against prior
-/// corrections/preferences, the caller's replacement terms must actually
-/// reference the existing content, and the texts must share enough
-/// significant terms -- all of which keeps unrelated notes from being
-/// overwritten.
+/// supersedes. Only corrections conflict, the caller's replacement terms
+/// must actually reference the existing content, and the texts must share
+/// enough significant terms -- all of which keeps unrelated notes from
+/// being overwritten. Untagged legacy facts remain eligible so corrections
+/// can replace memories written before structured categories existed.
 fn lifecycle_conflict_matches(
     category: MemoryWriteCategory,
     replaces_terms: &[String],
@@ -957,7 +957,9 @@ fn lifecycle_conflict_matches(
     }
     if !matches!(
         existing_category,
-        MemoryWriteCategory::Correction | MemoryWriteCategory::Preference
+        MemoryWriteCategory::Correction
+            | MemoryWriteCategory::Preference
+            | MemoryWriteCategory::Fact
     ) {
         return false;
     }
@@ -2106,6 +2108,18 @@ mod tests {
             "Browser test project should use TypeScript and Playwright with concise reports.",
             MemoryWriteCategory::Preference,
             "Project preference: for this browser test project use TypeScript, Vitest, and concise reports.",
+        ));
+    }
+
+    #[test]
+    fn correction_conflict_matches_explicitly_replaced_legacy_fact() {
+        let replacement_terms = vec!["Vitest".to_owned()];
+        assert!(lifecycle_conflict_matches(
+            MemoryWriteCategory::Correction,
+            replacement_terms.as_slice(),
+            "Pro E2E testy preferujeme Playwright.",
+            MemoryWriteCategory::Fact,
+            "Pro E2E testy preferujeme Vitest.",
         ));
     }
 

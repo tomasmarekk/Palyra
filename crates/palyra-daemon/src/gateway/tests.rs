@@ -18357,6 +18357,50 @@ async fn memory_retain_tool_replaces_near_duplicate_preference_content() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_retain_tool_correction_replaces_legacy_untagged_fact() {
+    let state = build_test_runtime_state(false);
+    let context = admin_routines_tool_test_context();
+    let legacy_memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FB8";
+    state
+        .ingest_memory_item(MemoryItemCreateRequest {
+            memory_id: legacy_memory_id.to_owned(),
+            principal: context.principal.to_owned(),
+            channel: None,
+            session_id: None,
+            source: MemorySource::Manual,
+            content_text: "Pro E2E testy preferujeme Vitest.".to_owned(),
+            tags: Vec::new(),
+            confidence: Some(0.9),
+            ttl_unix_ms: None,
+        })
+        .await
+        .expect("legacy untagged memory should ingest");
+
+    let correction = br#"{"content_text":"Pro E2E testy preferujeme Playwright.","category":"correction","replaces_terms":["Vitest"],"scope":"principal","confidence":0.9}"#;
+    let updated =
+        execute_memory_retain_tool(&state, context, "01ARZ3NDEKTSV4RRFFQ69G5FB9", correction).await;
+    assert!(updated.success, "correction retain should succeed: {}", updated.error);
+    let payload = parse_tool_output_json(&updated);
+    assert_eq!(payload.get("status").and_then(Value::as_str), Some("merged"));
+    assert_eq!(payload.get("matched_memory_id").and_then(Value::as_str), Some(legacy_memory_id));
+
+    let (items, _) = state
+        .list_memory_items(
+            None,
+            Some(10),
+            context.principal.to_owned(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("principal memories should list");
+    assert_eq!(items.len(), 1, "correction should replace the legacy fact in place");
+    assert_eq!(items[0].content_text, "Pro E2E testy preferujeme Playwright.");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn memory_retain_tool_principal_scope_does_not_replace_channel_scoped_duplicate() {
     let state = build_test_runtime_state(false);
     let context = admin_routines_tool_test_context();
