@@ -1245,8 +1245,14 @@ async fn navigate_with_guards_does_not_replay_cookie_header_to_same_host_redirec
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn chromium_navigation_policy_preflight_is_unauthenticated() {
-    let (url, handle) = spawn_cookie_capture_http_server("127.0.0.1");
+async fn chromium_navigation_policy_preflight_does_not_issue_http_request() {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("policy-validation listener should bind");
+    listener.set_nonblocking(true).expect("policy-validation listener should become nonblocking");
+    let url = format!(
+        "http://{}/policy-validation",
+        listener.local_addr().expect("listener address should resolve")
+    );
     let params = super::ChromiumNavigateParams {
         raw_url: url,
         timeout_ms: 2_000,
@@ -1257,12 +1263,11 @@ async fn chromium_navigation_policy_preflight_is_unauthenticated() {
     };
 
     let outcome = super::chromium_navigation_policy_preflight(&params).await;
-    let request = handle.join().expect("preflight server should exit");
 
     assert!(outcome.success, "Chromium policy preflight should succeed: {}", outcome.error);
     assert!(
-        !request.to_ascii_lowercase().contains("cookie:"),
-        "Chromium policy preflight must leave cookie authority to Chromium: {request}"
+        listener.accept().is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
+        "Chromium policy validation must not connect before the real navigation"
     );
 }
 
@@ -3202,6 +3207,129 @@ function exportCsv(){
     assert!(String::from_utf8_lossy(fetched.content.as_slice()).contains("Grace Hopper"));
 
     drop(handle);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_service_chromium_captures_http_download_without_refetch() {
+    let Some(chromium_path) = resolve_chromium_path_for_tests() else {
+        return;
+    };
+    let _guard = chromium_integration_test_guard().await;
+    let expected_content = b"name,score\nalice,9\n";
+    // This fixture serves exactly one page request and one file request. A hidden
+    // host-side refetch therefore makes the action fail instead of masking the duplicate.
+    let (url, handle, request_count) =
+        spawn_download_fixture_http_server("/report.csv", "text/csv", expected_content);
+    let runtime = Arc::new(
+        browser_runtime_state_for_tests(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: None,
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 256 * 1024,
+            max_response_bytes: 256 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Chromium,
+            chromium_path: Some(chromium_path),
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("chromium runtime should initialize"),
+    );
+    let service = BrowserServiceImpl { runtime };
+    let created = create_session_with_retry_for_chromium_test(
+        &service,
+        browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: true,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        },
+        3,
+    )
+    .await
+    .expect("create_session should succeed for Chromium HTTP download mode");
+    let session_id = created.session_id.expect("session id should exist");
+
+    let navigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url,
+            timeout_ms: 8_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("navigate should execute")
+        .into_inner();
+    assert!(navigate.success, "Chromium navigation should succeed: {}", navigate.error);
+
+    let click = service
+        .click(Request::new(browser_v1::ClickRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            selector: "#download-link".to_owned(),
+            max_retries: 1,
+            timeout_ms: 3_000,
+            capture_failure_screenshot: true,
+            max_failure_screenshot_bytes: 16 * 1024,
+        }))
+        .await
+        .expect("click should execute")
+        .into_inner();
+    assert!(
+        click.success,
+        "HTTP download click should succeed: {} (requests={})",
+        click.error,
+        request_count.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    let artifact = click.artifact.unwrap_or_else(|| {
+        panic!(
+            "HTTP download should return artifact metadata (error={}, action_log={:?}, requests={})",
+            click.error,
+            click.action_log,
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    });
+    assert_eq!(artifact.file_name, "report.csv");
+    assert_eq!(artifact.mime_type, "text/csv");
+    assert!(!artifact.quarantined);
+
+    let mut get_request = Request::new(browser_v1::GetDownloadArtifactRequest {
+        v: 1,
+        session_id: Some(session_id),
+        artifact_id: artifact.artifact_id,
+        max_bytes: DOWNLOAD_MAX_FILE_BYTES,
+    });
+    insert_principal(&mut get_request, "user:ops");
+    let fetched = service
+        .get_download_artifact(get_request)
+        .await
+        .expect("get_download_artifact should execute")
+        .into_inner();
+    assert!(fetched.success, "HTTP artifact fetch should succeed: {}", fetched.error);
+    assert_eq!(fetched.content, expected_content);
+
+    handle.join().expect("the exactly-two-request fixture should finish");
+    assert_eq!(
+        request_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one navigation plus one click must produce exactly two relevant requests"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7682,7 +7810,7 @@ async fn browser_service_download_allowlist_and_quarantine_artifacts() {
         .map(|value| value.ulid.clone())
         .expect("session id should be present");
 
-    let (allowlist_url, allowlist_handle) =
+    let (allowlist_url, allowlist_handle, _) =
         spawn_download_fixture_http_server("/report.csv", "text/csv", b"name,score\nalice,9\n");
     let navigate_allowlist = service
         .navigate(Request::new(browser_v1::NavigateRequest {
@@ -7719,7 +7847,7 @@ async fn browser_service_download_allowlist_and_quarantine_artifacts() {
     assert_eq!(allowlisted_artifact.file_name, "report.csv");
     allowlist_handle.join().expect("allowlist server thread should exit");
 
-    let (quarantine_url, quarantine_handle) = spawn_download_fixture_http_server(
+    let (quarantine_url, quarantine_handle, _) = spawn_download_fixture_http_server(
         "/payload.exe",
         "application/octet-stream",
         b"MZ\x90\x00suspicious",
@@ -9040,18 +9168,34 @@ fn spawn_download_fixture_http_server(
     file_path: &str,
     file_content_type: &str,
     file_body: &[u8],
-) -> (String, thread::JoinHandle<()>) {
+) -> (String, thread::JoinHandle<()>, Arc<std::sync::atomic::AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     let address = listener.local_addr().expect("listener local address should resolve");
     let file_path = file_path.to_owned();
     let file_content_type = file_content_type.to_owned();
     let file_body = file_body.to_vec();
+    let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_request_count = Arc::clone(&request_count);
     let handle = thread::spawn(move || {
-        for _ in 0..2 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut page_seen = false;
+        let mut file_seen = false;
+        while !page_seen || !file_seen {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "download fixture should receive the page and file requests"
+            );
             let (mut stream, _) = listener.accept().expect("listener should accept request");
             let request = read_http_request(&mut stream);
+            if request.trim().is_empty() {
+                continue;
+            }
             let path = http_request_path(request.as_str());
             if path == "/" {
+                if !page_seen {
+                    page_seen = true;
+                    server_request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 let body = format!(
                         "<!doctype html><html><body><a id=\"download-link\" href=\"{file_path}\" download>Download</a></body></html>"
                     );
@@ -9064,9 +9208,18 @@ fn spawn_download_fixture_http_server(
                 continue;
             }
             if path == file_path {
+                if !file_seen {
+                    file_seen = true;
+                    server_request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let file_name = file_path
+                    .rsplit('/')
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("download.bin");
                 let headers = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: {file_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        file_body.len()
+                        "HTTP/1.1 200 OK\r\nContent-Type: {file_content_type}\r\nContent-Disposition: attachment; filename=\"{file_name}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        file_body.len(),
                     );
                 stream
                     .write_all(headers.as_bytes())
@@ -9082,7 +9235,7 @@ fn spawn_download_fixture_http_server(
             stream.flush().expect("server should flush fallback response");
         }
     });
-    (format!("http://{address}/"), handle)
+    (format!("http://{address}/"), handle, request_count)
 }
 
 fn spawn_attachment_fixture_http_server(

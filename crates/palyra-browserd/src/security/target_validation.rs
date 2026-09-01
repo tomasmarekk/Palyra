@@ -252,12 +252,28 @@ pub(crate) fn validate_target_url_parts_blocking(
         validate_local_file_url_target(url, allow_private_targets)?;
         return Ok(());
     }
-    // Immediately-invoked closure keeps `?` local so the metrics observation
-    // below runs on the failure path too.
+    validate_http_target_url_blocking(url, allow_private_targets).map(|_| ())
+}
+
+/// Validates an HTTP(S) URL with blocking DNS and returns the exact addresses to pin.
+///
+/// # Errors
+/// Returns the policy or resolution failure reason.
+pub(crate) fn validate_http_target_url_blocking(
+    url: &Url,
+    allow_private_targets: bool,
+) -> Result<ValidatedTargetUrl, String> {
     let result = (|| {
         let (host, port) = extract_target_host_port(url)?;
         let resolved = resolve_host_addresses_blocking(host, port)?;
-        enforce_resolved_host_policy(host, resolved, allow_private_targets)
+        let resolved_addresses = resolved.addresses.clone();
+        enforce_resolved_host_policy(host, resolved, allow_private_targets)?;
+        let resolved_socket_addrs = resolved_addresses
+            .into_iter()
+            .map(|address| SocketAddr::new(address, port))
+            .collect::<Vec<_>>();
+        let host = if host.parse::<IpAddr>().is_ok() { None } else { Some(host.to_owned()) };
+        Ok(ValidatedTargetUrl { host, resolved_socket_addrs })
     })();
     maybe_log_dns_validation_metrics();
     result
@@ -1033,6 +1049,26 @@ pub(crate) fn build_pinned_http_client(
 ) -> Result<reqwest::Client, reqwest::Error> {
     let mut client_builder = reqwest::Client::builder()
         .redirect(Policy::none())
+        .no_proxy()
+        .timeout(Duration::from_millis(timeout_ms.max(1)));
+    if let Some(host) = validated_target.host.as_ref() {
+        client_builder = client_builder
+            .resolve_to_addrs(host.as_str(), validated_target.resolved_socket_addrs.as_slice());
+    }
+    client_builder.build()
+}
+
+/// Builds a blocking reqwest client locked to the validated target.
+///
+/// # Errors
+/// Returns the underlying client construction error.
+pub(crate) fn build_pinned_blocking_http_client(
+    timeout_ms: u64,
+    validated_target: &ValidatedTargetUrl,
+) -> Result<reqwest::blocking::Client, reqwest::Error> {
+    let mut client_builder = reqwest::blocking::Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
         .timeout(Duration::from_millis(timeout_ms.max(1)));
     if let Some(host) = validated_target.host.as_ref() {
         client_builder = client_builder

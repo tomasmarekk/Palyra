@@ -249,26 +249,35 @@ async fn store_chromium_captured_downloads(
         chromium_drain_client_downloads(runtime, session_id, active_tab_id.as_str()).await?;
     let mut first_record = None;
     for download in downloads {
-        let mime_type = sniff_download_mime_type(
-            (!download.mime_type.trim().is_empty()).then_some(download.mime_type.as_str()),
-            download.file_name.as_str(),
-            download.content.as_slice(),
-        );
-        let record = store_generated_artifact(
-            runtime,
-            session_id,
-            profile_id,
-            download.source_url.as_str(),
-            download.file_name.as_str(),
-            mime_type.as_str(),
-            download.content.as_slice(),
-        )
-        .await?;
+        let record = store_chromium_download(runtime, session_id, profile_id, &download).await?;
         if first_record.is_none() {
             first_record = Some(record);
         }
     }
     Ok(first_record)
+}
+
+async fn store_chromium_download(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    profile_id: Option<&str>,
+    download: &ChromiumClientDownload,
+) -> Result<DownloadArtifactRecord, String> {
+    let mime_type = sniff_download_mime_type(
+        (!download.mime_type.trim().is_empty()).then_some(download.mime_type.as_str()),
+        download.file_name.as_str(),
+        download.content.as_slice(),
+    );
+    store_generated_artifact(
+        runtime,
+        session_id,
+        profile_id,
+        download.source_url.as_str(),
+        download.file_name.as_str(),
+        mime_type.as_str(),
+        download.content.as_slice(),
+    )
+    .await
 }
 
 /// Which sections an observe response should include.
@@ -1651,7 +1660,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             request_timeout_ms(payload.timeout_ms, context.budget.max_action_timeout_ms);
         let max_attempts = payload.max_retries.clamp(0, 16).saturating_add(1);
         let started_at_unix_ms = current_unix_ms();
-        let (success, outcome, error, attempts) = match self.runtime.engine_mode {
+        let (success, outcome, error, attempts, native_download) = match self.runtime.engine_mode {
             BrowserEngineMode::Simulated => {
                 let started_at = Instant::now();
                 let mut attempts = 0_u32;
@@ -1688,7 +1697,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     let sleep_ms = DEFAULT_ACTION_RETRY_INTERVAL_MS.min(remaining_ms.max(1));
                     tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 }
-                (success, outcome, error, attempts)
+                (success, outcome, error, attempts, None)
             }
             BrowserEngineMode::Chromium => {
                 let result = click_with_chromium(
@@ -1700,17 +1709,50 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     context.allow_downloads,
                 )
                 .await;
-                (result.success, result.outcome, result.error, result.attempts)
+                (
+                    result.action.success,
+                    result.action.outcome,
+                    result.action.error,
+                    result.action.attempts,
+                    result.download,
+                )
             }
         };
         let mut success = success;
         let mut outcome = outcome;
         let mut error = error;
         let mut artifact = None;
+        if success {
+            if let Some(download) = native_download.as_ref() {
+                match store_chromium_download(
+                    self.runtime.as_ref(),
+                    session_id.as_str(),
+                    if context.private_profile { None } else { context.profile_id.as_deref() },
+                    download,
+                )
+                .await
+                {
+                    Ok(record) => {
+                        outcome = if record.quarantined {
+                            "download_quarantined".to_owned()
+                        } else {
+                            "download_allowed".to_owned()
+                        };
+                        artifact = Some(download_artifact_to_proto(&record));
+                    }
+                    Err(download_error) => {
+                        success = false;
+                        outcome = "download_failed".to_owned();
+                        error = download_error;
+                    }
+                }
+            }
+        }
         // The click script rotates the page-side blob capture generation
         // immediately before activating the selected element, so this drain
         // cannot return entries produced by earlier or unrelated actions.
         if success
+            && artifact.is_none()
             && context.allow_downloads
             && matches!(self.runtime.engine_mode, BrowserEngineMode::Chromium)
         {
@@ -1737,7 +1779,11 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 }
             }
         }
-        if success && outcome == "download_allowed" && artifact.is_none() {
+        if success
+            && outcome == "download_allowed"
+            && artifact.is_none()
+            && matches!(self.runtime.engine_mode, BrowserEngineMode::Simulated)
+        {
             match capture_download_artifact_for_click(
                 self.runtime.as_ref(),
                 session_id.as_str(),

@@ -8,6 +8,7 @@
 use crate::*;
 use headless_chrome::protocol::cdp::{types::Event, Browser, Emulation, Page};
 use headless_chrome::{browser::tab::ModifierKey, types::PrintToPdfOptions};
+use std::io::Read as _;
 
 /// Outcome of a Chromium DOM action (click, type, press, select, highlight, file input).
 ///
@@ -19,6 +20,33 @@ pub(crate) struct ChromiumActionOutcome {
     pub(crate) error: String,
     pub(crate) attempts: u32,
 }
+
+/// Outcome of a Chromium click plus bytes captured from its original download response.
+#[derive(Debug)]
+pub(crate) struct ChromiumClickOutcome {
+    pub(crate) action: ChromiumActionOutcome,
+    pub(crate) download: Option<ChromiumClientDownload>,
+}
+
+struct ChromiumNativeDownloadCapture {
+    tab_target_id: String,
+    timeout_ms: u64,
+    request_seen: Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<std::sync::Mutex<Option<Result<ChromiumClientDownload, String>>>>,
+}
+
+#[derive(Clone)]
+struct ChromiumDownloadCaptureRegistration {
+    source_url: String,
+    suggested_file_name: String,
+    timeout_ms: u64,
+    request_seen: Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<std::sync::Mutex<Option<Result<ChromiumClientDownload, String>>>>,
+}
+
+static CHROMIUM_DOWNLOAD_CAPTURES: LazyLock<
+    std::sync::Mutex<HashMap<String, ChromiumDownloadCaptureRegistration>>,
+> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Scroll positions reported by the page after a Chromium scroll action.
 #[derive(Debug)]
@@ -184,23 +212,63 @@ pub(crate) struct ChromiumNavigateParams {
     pub(crate) max_response_bytes: u64,
 }
 
-/// Runs the duplicate Chromium policy fetch without browser session credentials.
+/// Validates the initial Chromium target without issuing an HTTP request.
 ///
-/// Chromium remains the sole cookie authority for the subsequent real
-/// navigation, so this guard must never accept or attach a cookie header.
+/// Redirect and response enforcement remain attached to Chromium's real
+/// request path, keeping one visible navigation to one top-level request.
 pub(crate) async fn chromium_navigation_policy_preflight(
     params: &ChromiumNavigateParams,
 ) -> NavigateOutcome {
-    navigate_with_guards(
-        params.raw_url.as_str(),
-        params.timeout_ms,
-        params.allow_redirects,
-        params.max_redirects,
-        params.allow_private_targets,
-        params.max_response_bytes,
-        None,
-    )
-    .await
+    let started_at = Instant::now();
+    let target = match Url::parse(params.raw_url.as_str()) {
+        Ok(target) => target,
+        Err(error) => {
+            return NavigateOutcome {
+                success: false,
+                final_url: String::new(),
+                status_code: 0,
+                title: String::new(),
+                page_body: String::new(),
+                body_bytes: 0,
+                latency_ms: started_at.elapsed().as_millis() as u64,
+                error: format!("invalid URL: {error}"),
+                network_log: Vec::new(),
+                cookie_updates: Vec::new(),
+            };
+        }
+    };
+    let validation =
+        if target.scheme() == "file" || params.raw_url.eq_ignore_ascii_case("about:blank") {
+            validate_target_url_blocking(params.raw_url.as_str(), params.allow_private_targets)
+        } else {
+            validate_target_url(&target, params.allow_private_targets).await.map(|_| ())
+        };
+    if let Err(error) = validation {
+        return NavigateOutcome {
+            success: false,
+            final_url: target.to_string(),
+            status_code: 0,
+            title: String::new(),
+            page_body: String::new(),
+            body_bytes: 0,
+            latency_ms: started_at.elapsed().as_millis() as u64,
+            error,
+            network_log: Vec::new(),
+            cookie_updates: Vec::new(),
+        };
+    }
+    NavigateOutcome {
+        success: true,
+        final_url: target.to_string(),
+        status_code: 0,
+        title: String::new(),
+        page_body: String::new(),
+        body_bytes: 0,
+        latency_ms: started_at.elapsed().as_millis() as u64,
+        error: String::new(),
+        network_log: Vec::new(),
+        cookie_updates: Vec::new(),
+    }
 }
 
 fn clamp_chromium_snapshot(
@@ -1995,14 +2063,47 @@ fn configure_chromium_tab(
             let request_url = intercepted.params.request.url.as_str();
             let allow_private_targets = request_policy
                 .authorize_tab_request_url(request_tab_target_id.as_str(), request_url);
-            if validate_target_url_blocking(request_url, allow_private_targets).is_ok() {
-                RequestPausedDecision::Continue(None)
-            } else {
-                RequestPausedDecision::Fail(Fetch::FailRequest {
+            let capture = CHROMIUM_DOWNLOAD_CAPTURES
+                .lock()
+                .ok()
+                .and_then(|captures| captures.get(request_tab_target_id.as_str()).cloned())
+                .filter(|capture| capture.source_url == request_url);
+            if let Some(capture) =
+                capture.filter(|_| intercepted.params.response_status_code.is_none())
+            {
+                capture.request_seen.store(true, Ordering::SeqCst);
+                let capture_result = fetch_chromium_intercepted_download(
+                    &intercepted.params,
+                    allow_private_targets,
+                    &request_policy,
+                    request_tab_target_id.as_str(),
+                    &capture,
+                );
+                return match capture_result {
+                    Ok((download, fulfill)) => {
+                        if let Ok(mut guard) = capture.state.lock() {
+                            *guard = Some(Ok(download));
+                        }
+                        RequestPausedDecision::Fulfill(fulfill)
+                    }
+                    Err(error) => {
+                        if let Ok(mut guard) = capture.state.lock() {
+                            *guard = Some(Err(error));
+                        }
+                        RequestPausedDecision::Fail(Fetch::FailRequest {
+                            request_id: intercepted.params.request_id,
+                            error_reason: Network::ErrorReason::BlockedByClient,
+                        })
+                    }
+                };
+            }
+            if validate_target_url_blocking(request_url, allow_private_targets).is_err() {
+                return RequestPausedDecision::Fail(Fetch::FailRequest {
                     request_id: intercepted.params.request_id,
                     error_reason: Network::ErrorReason::BlockedByClient,
-                })
+                });
             }
+            RequestPausedDecision::Continue(None)
         });
     tab.enable_request_interception(request_interceptor).map_err(|error| {
         format!("failed to register Chromium request interception callback: {error}")
@@ -2055,6 +2156,221 @@ fn configure_chromium_tab(
         hooks.resilience_profile,
     )?;
     Ok(())
+}
+
+// Fetch pauses this request before Chromium reaches the network. Reusing the browser's headers
+// through a pinned host client lets one response both satisfy Chromium and become the artifact.
+fn fetch_chromium_intercepted_download(
+    paused: &Fetch::events::RequestPausedEventParams,
+    allow_private_targets: bool,
+    private_target_policy: &ChromiumPrivateTargetPolicy,
+    tab_target_id: &str,
+    capture: &ChromiumDownloadCaptureRegistration,
+) -> Result<(ChromiumClientDownload, Fetch::FulfillRequest), String> {
+    if !paused.request.method.eq_ignore_ascii_case("GET") {
+        return Err(format!("unsupported Chromium download method '{}'", paused.request.method));
+    }
+    let mut current_url = Url::parse(capture.source_url.as_str())
+        .map_err(|error| format!("invalid Chromium download URL: {error}"))?;
+    let mut request_headers = chromium_download_request_headers(&paused.request.headers)?;
+    let mut redirects = 0_u32;
+    let mut current_allow_private_targets = allow_private_targets;
+    let response = loop {
+        let validated_target =
+            validate_http_target_url_blocking(&current_url, current_allow_private_targets)?;
+        let client = build_pinned_blocking_http_client(capture.timeout_ms, &validated_target)
+            .map_err(|error| format!("failed to build Chromium download HTTP client: {error}"))?;
+        let response = client
+            .get(current_url.clone())
+            .headers(request_headers.clone())
+            .send()
+            .map_err(|error| format!("Chromium download request failed: {error}"))?;
+        if !response.status().is_redirection() {
+            break response;
+        }
+        if redirects >= 3 {
+            return Err("Chromium download redirect limit exceeded (3)".to_owned());
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| "Chromium download redirect missing Location header".to_owned())?
+            .to_str()
+            .map_err(|_| "Chromium download redirect Location is invalid UTF-8".to_owned())?;
+        let next_url = current_url
+            .join(location)
+            .map_err(|error| format!("invalid Chromium download redirect target: {error}"))?;
+        if current_url.origin() != next_url.origin() {
+            remove_cross_origin_download_headers(&mut request_headers);
+        }
+        current_allow_private_targets =
+            private_target_policy.allows_tab_request_target(tab_target_id, next_url.as_str());
+        current_url = next_url;
+        redirects = redirects.saturating_add(1);
+    };
+    if !response.status().is_success() {
+        return Err(format!(
+            "Chromium download request returned HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    let response_code = u32::from(response.status().as_u16());
+    let content_disposition = response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let mime_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or_default().trim().to_owned())
+        .unwrap_or_default();
+    let content_length = response.content_length();
+    if matches!(content_length, Some(length) if length > DOWNLOAD_MAX_FILE_BYTES) {
+        return Err(format!(
+            "Chromium download exceeds max file bytes ({} > {})",
+            content_length.unwrap_or_default(),
+            DOWNLOAD_MAX_FILE_BYTES
+        ));
+    }
+    let mut response_headers = chromium_download_response_headers(response.headers());
+    let mut response = response;
+    let mut content = Vec::with_capacity(
+        content_length
+            .map(|length| length.min(DOWNLOAD_MAX_FILE_BYTES) as usize)
+            .unwrap_or_default(),
+    );
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = response
+            .read(&mut chunk)
+            .map_err(|error| format!("failed to read Chromium download response: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        let next_len = content.len().saturating_add(read);
+        if next_len as u64 > DOWNLOAD_MAX_FILE_BYTES {
+            return Err(format!(
+                "Chromium download exceeds max file bytes ({next_len} > {DOWNLOAD_MAX_FILE_BYTES})"
+            ));
+        }
+        content.extend_from_slice(&chunk[..read]);
+    }
+    response_headers.push(Fetch::HeaderEntry {
+        name: "Content-Length".to_owned(),
+        value: content.len().to_string(),
+    });
+    let file_name = content_disposition
+        .as_deref()
+        .and_then(content_disposition_attachment_file_name)
+        .unwrap_or_else(|| sanitize_download_file_name(capture.suggested_file_name.as_str()));
+    let body = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
+    Ok((
+        ChromiumClientDownload {
+            source_url: current_url.to_string(),
+            file_name,
+            mime_type,
+            content,
+        },
+        Fetch::FulfillRequest {
+            request_id: paused.request_id.clone(),
+            response_code,
+            response_headers: Some(response_headers),
+            binary_response_headers: None,
+            body: Some(body),
+            response_phrase: None,
+        },
+    ))
+}
+
+fn chromium_download_request_headers(
+    headers: &Network::Headers,
+) -> Result<reqwest::header::HeaderMap, String> {
+    let mut output = reqwest::header::HeaderMap::new();
+    let Some(object) = headers.0.as_ref().and_then(serde_json::Value::as_object) else {
+        output.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("identity"),
+        );
+        return Ok(output);
+    };
+    for (name, value) in object {
+        if chromium_download_hop_by_hop_header(name)
+            || name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.starts_with(':')
+        {
+            continue;
+        }
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| format!("invalid Chromium download request header name: {error}"))?;
+        let value = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
+        let value = reqwest::header::HeaderValue::from_str(value.as_str())
+            .map_err(|error| format!("invalid Chromium download request header value: {error}"))?;
+        output.append(name, value);
+    }
+    output.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+    Ok(output)
+}
+
+fn chromium_download_response_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<Fetch::HeaderEntry> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            !chromium_download_hop_by_hop_header(name.as_str())
+                && !name.as_str().eq_ignore_ascii_case("content-length")
+                && !name.as_str().eq_ignore_ascii_case("content-encoding")
+        })
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| Fetch::HeaderEntry {
+                name: name.as_str().to_owned(),
+                value: value.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn chromium_download_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn remove_cross_origin_download_headers(headers: &mut reqwest::header::HeaderMap) {
+    let sensitive_names = headers
+        .keys()
+        .filter(|name| chromium_download_sensitive_header(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in sensitive_names {
+        headers.remove(name);
+    }
+}
+
+fn chromium_download_sensitive_header(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    normalized == "authorization"
+        || normalized == "proxy-authorization"
+        || normalized == "cookie"
+        || normalized.contains("api-key")
+        || normalized.contains("apikey")
+        || normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("credential")
 }
 
 fn chromium_network_log_entry_from_response(
@@ -4143,6 +4459,41 @@ fn chromium_restore_local_storage_script(
     ))
 }
 
+fn chromium_restore_local_storage_on_navigation_script(
+    origin: &str,
+    entries: &HashMap<String, String>,
+) -> Result<String, String> {
+    let origin_json = serde_json::to_string(origin)
+        .map_err(|error| format!("failed to encode localStorage restore origin: {error}"))?;
+    let entries_json = serde_json::to_string(entries)
+        .map_err(|error| format!("failed to encode localStorage restore entries: {error}"))?;
+    Ok(format!(
+        r#"
+(() => {{
+  if (window.location.origin !== {origin_json}) {{
+    return;
+  }}
+  const entries = {entries_json};
+  try {{
+    const storage = window.localStorage;
+    if (!storage) {{
+      return;
+    }}
+    storage.clear();
+    Object.keys(entries).forEach((key) => {{
+      const value = entries[key];
+      if (typeof value === "string") {{
+        storage.setItem(key, value);
+      }}
+    }});
+  }} catch (_) {{
+    // The host observes the resulting bounded storage snapshot after navigation.
+  }}
+}})()
+"#
+    ))
+}
+
 fn parse_chromium_local_storage_snapshot(
     value: serde_json::Value,
 ) -> Result<ChromiumLocalStorageSnapshot, String> {
@@ -4548,6 +4899,23 @@ pub(crate) async fn chromium_refresh_tab_snapshot(
     session_id: &str,
     tab_id: &str,
 ) -> Result<(), String> {
+    chromium_refresh_tab_snapshot_inner(runtime, session_id, tab_id, true).await
+}
+
+async fn chromium_refresh_tab_snapshot_without_network_log(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+) -> Result<(), String> {
+    chromium_refresh_tab_snapshot_inner(runtime, session_id, tab_id, false).await
+}
+
+async fn chromium_refresh_tab_snapshot_inner(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+    retain_network_log: bool,
+) -> Result<(), String> {
     enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     let _ = chromium_install_page_diagnostics(runtime, session_id, tab_id).await;
     let snapshot = chromium_observe_snapshot(runtime, session_id, tab_id).await?;
@@ -4606,12 +4974,14 @@ pub(crate) async fn chromium_refresh_tab_snapshot(
         DEFAULT_MAX_CONSOLE_LOG_ENTRIES,
         DEFAULT_MAX_CONSOLE_LOG_BYTES,
     );
-    append_network_log_entries(
-        tab,
-        network_log.as_slice(),
-        max_network_log_entries,
-        max_network_log_bytes,
-    );
+    if retain_network_log {
+        append_network_log_entries(
+            tab,
+            network_log.as_slice(),
+            max_network_log_entries,
+            max_network_log_bytes,
+        );
+    }
     Ok(())
 }
 
@@ -4789,20 +5159,58 @@ pub(crate) async fn navigate_tab_with_chromium(
     } else {
         None
     };
+    let _ = chromium_drain_pending_network_log(runtime, session_id, tab_id).await;
+    let navigation_started = Instant::now();
     let storage_entries_by_origin = {
         let sessions = runtime.sessions.lock().await;
         sessions.get(session_id).map(|session| session.storage_entries.clone()).unwrap_or_default()
     };
     let target_url = outcome.final_url.clone();
+    let chromium_target_url = target_url.clone();
     let chromium_timeout_ms = params.timeout_ms;
     let chromium_snapshot = run_chromium_blocking("chromium navigate", move || {
         tab.set_default_timeout(Duration::from_millis(chromium_timeout_ms.max(1)));
-        tab.navigate_to(target_url.as_str())
-            .map_err(|error| format!("failed to issue Chromium navigation command: {error}"))?;
+        let storage_restore_identifier = url_origin_key(chromium_target_url.as_str())
+            .and_then(|origin| {
+                storage_entries_by_origin
+                    .get(origin.as_str())
+                    .filter(|entries| !entries.is_empty())
+                    .map(|entries| (origin, entries))
+            })
+            .map(|(origin, entries)| {
+                let script =
+                    chromium_restore_local_storage_on_navigation_script(origin.as_str(), entries)?;
+                tab.call_method(Page::AddScriptToEvaluateOnNewDocument {
+                    source: script,
+                    world_name: None,
+                    include_command_line_api: None,
+                    run_immediately: None,
+                })
+                .map(|result| result.identifier)
+                .map_err(|error| {
+                    format!(
+                        "failed to register one-shot localStorage restore for {origin}: {error}"
+                    )
+                })
+            })
+            .transpose()?;
+        if let Err(error) = tab.navigate_to(chromium_target_url.as_str()) {
+            if let Some(identifier) = storage_restore_identifier {
+                let _ = tab.call_method(Page::RemoveScriptToEvaluateOnNewDocument { identifier });
+            }
+            return Err(format!("failed to issue Chromium navigation command: {error}"));
+        }
         let mut warnings = Vec::new();
-        if let Err(error) = tab.wait_until_navigated() {
+        let navigation_wait = tab.wait_until_navigated();
+        if let Some(identifier) = storage_restore_identifier {
+            let _ = tab.call_method(Page::RemoveScriptToEvaluateOnNewDocument { identifier });
+        }
+        if let Err(error) = navigation_wait {
             let page_url = tab.get_url();
-            if !chromium_timeout_snapshot_url_is_usable(page_url.as_str(), target_url.as_str()) {
+            if !chromium_timeout_snapshot_url_is_usable(
+                page_url.as_str(),
+                chromium_target_url.as_str(),
+            ) {
                 return Err(format!("Chromium navigation timeout or failure: {error}"));
             }
             warnings.push(format!(
@@ -4825,46 +5233,7 @@ pub(crate) async fn navigate_tab_with_chromium(
             false,
         )
         .ok();
-        let mut page_url = tab.get_url();
-        if let Some(origin) = url_origin_key(page_url.as_str()) {
-            if let Some(entries) =
-                storage_entries_by_origin.get(origin.as_str()).filter(|entries| !entries.is_empty())
-            {
-                // Restored storage is only visible to scripts that run after
-                // the write, so restore then reload (see
-                // restore_chromium_tab_live_state for the same dance).
-                let script = chromium_restore_local_storage_script(entries)?;
-                let raw_value = tab
-                    .evaluate(script.as_str(), false)
-                    .map_err(|error| {
-                        format!("failed to restore Chromium localStorage for {origin}: {error}")
-                    })?
-                    .value
-                    .unwrap_or_else(|| serde_json::Value::String("{}".to_owned()));
-                parse_chromium_local_storage_restore_status(decode_chromium_json_script_value(
-                    raw_value,
-                ))
-                .map_err(|error| format!("{error} for {origin}"))?;
-                tab.navigate_to(page_url.as_str()).map_err(|error| {
-                    format!("failed to reload Chromium page after localStorage restore: {error}")
-                })?;
-                if let Err(error) = tab.wait_until_navigated() {
-                    let reloaded_url = tab.get_url();
-                    if !chromium_timeout_snapshot_url_is_usable(
-                        reloaded_url.as_str(),
-                        page_url.as_str(),
-                    ) {
-                        return Err(format!(
-                            "Chromium reload after localStorage restore timed out: {error}"
-                        ));
-                    }
-                    warnings.push(format!(
-                        "Chromium reload wait timed out after page URL reached {reloaded_url}: {error}"
-                    ));
-                }
-                page_url = tab.get_url();
-            }
-        }
+        let page_url = tab.get_url();
         let page_body = tab.get_content().map_err(|error| {
             format!("failed to read Chromium page HTML after navigation: {error}")
         })?;
@@ -4888,6 +5257,8 @@ pub(crate) async fn navigate_tab_with_chromium(
             return outcome;
         }
     };
+    let navigation_network_log =
+        chromium_drain_pending_network_log(runtime, session_id, tab_id).await.unwrap_or_default();
     if let Err(error) = enforce_chromium_remote_ip_guard(runtime, session_id).await {
         outcome.success = false;
         outcome.error = error;
@@ -4910,6 +5281,31 @@ pub(crate) async fn navigate_tab_with_chromium(
     outcome.title = snapshot.title;
     outcome.page_body = page_body;
     outcome.body_bytes = body_bytes;
+    outcome.latency_ms = navigation_started.elapsed().as_millis() as u64;
+    outcome.network_log = navigation_network_log;
+    let final_url_for_log = normalize_url_with_redaction(outcome.final_url.as_str());
+    outcome.status_code = outcome
+        .network_log
+        .iter()
+        .rev()
+        .find(|entry| entry.request_url == final_url_for_log)
+        .map(|entry| entry.status_code)
+        .unwrap_or_else(|| if outcome.final_url.starts_with("file:") { 200 } else { 0 });
+    let redirected =
+        !chromium_timeout_snapshot_url_is_usable(outcome.final_url.as_str(), target_url.as_str());
+    let observed_redirects =
+        outcome.network_log.iter().filter(|entry| (300..400).contains(&entry.status_code)).count()
+            as u32;
+    if !params.allow_redirects && redirected {
+        outcome.success = false;
+        outcome.error = "redirect response blocked by policy".to_owned();
+    } else if observed_redirects > params.max_redirects.clamp(1, 10) {
+        outcome.success = false;
+        outcome.error = format!("redirect limit exceeded ({})", params.max_redirects.clamp(1, 10));
+    } else if outcome.status_code >= 400 {
+        outcome.success = false;
+        outcome.error = format!("navigation returned HTTP {}", outcome.status_code);
+    }
     if outcome.error.is_empty() && !navigation_warnings.is_empty() {
         outcome.error = navigation_warnings.join("; ");
     }
@@ -4920,7 +5316,10 @@ pub(crate) async fn navigate_tab_with_chromium(
         return outcome;
     }
     let _ = chromium_install_page_diagnostics(runtime, session_id, tab_id).await;
-    let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id).await;
+    // Refresh storage, cookies, and page diagnostics, but discard the page-side
+    // copy of this navigation log. The CDP copy is returned to the service and
+    // persisted there exactly once.
+    let _ = chromium_refresh_tab_snapshot_without_network_log(runtime, session_id, tab_id).await;
     outcome
 }
 
@@ -4929,6 +5328,69 @@ fn chromium_timeout_snapshot_url_is_usable(page_url: &str, target_url: &str) -> 
         return true;
     }
     page_url.strip_prefix(target_url).is_some_and(|suffix| suffix.starts_with('#'))
+}
+
+fn begin_chromium_native_download_capture(
+    tab: &Arc<HeadlessTab>,
+    source_url: String,
+    suggested_file_name: String,
+    timeout_ms: u64,
+) -> Result<ChromiumNativeDownloadCapture, String> {
+    let state = Arc::new(std::sync::Mutex::new(None));
+    let request_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tab_target_id = tab.get_target_id().to_string();
+    CHROMIUM_DOWNLOAD_CAPTURES
+        .lock()
+        .map_err(|_| "failed to register Chromium download capture".to_owned())?
+        .insert(
+            tab_target_id.clone(),
+            ChromiumDownloadCaptureRegistration {
+                source_url: source_url.clone(),
+                suggested_file_name,
+                timeout_ms: timeout_ms.max(1),
+                request_seen: Arc::clone(&request_seen),
+                state: Arc::clone(&state),
+            },
+        );
+    Ok(ChromiumNativeDownloadCapture {
+        tab_target_id,
+        timeout_ms: timeout_ms.max(1),
+        request_seen,
+        state,
+    })
+}
+
+fn finish_chromium_native_download_capture(
+    capture: ChromiumNativeDownloadCapture,
+) -> Result<Option<ChromiumClientDownload>, String> {
+    let deadline =
+        Instant::now() + Duration::from_millis(capture.timeout_ms.saturating_add(250).max(1));
+    let result = loop {
+        let result = capture
+            .state
+            .lock()
+            .map_err(|_| "failed to inspect Chromium download response capture".to_owned())?
+            .take();
+        if result.is_some() || Instant::now() >= deadline {
+            break result;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    cleanup_chromium_native_download_capture(&capture);
+    match result {
+        Some(result) => result.map(Some),
+        None if capture.request_seen.load(Ordering::SeqCst) => {
+            Err("Chromium download response capture timed out after the matching request"
+                .to_owned())
+        }
+        None => Ok(None),
+    }
+}
+
+fn cleanup_chromium_native_download_capture(capture: &ChromiumNativeDownloadCapture) {
+    if let Ok(mut captures) = CHROMIUM_DOWNLOAD_CAPTURES.lock() {
+        captures.remove(capture.tab_target_id.as_str());
+    }
 }
 
 /// Clicks the first element matching `selector` on the active tab.
@@ -4943,9 +5405,13 @@ pub(crate) async fn click_with_chromium(
     timeout_ms: u64,
     max_attempts: u32,
     allow_downloads: bool,
-) -> ChromiumActionOutcome {
+) -> ChromiumClickOutcome {
     enum ClickAttempt {
-        Clicked { download_like: bool, may_open_window: bool },
+        Clicked {
+            download_like: bool,
+            may_open_window: bool,
+            download: Option<ChromiumClientDownload>,
+        },
         DownloadBlocked,
         Disabled,
         NotFound,
@@ -4954,11 +5420,14 @@ pub(crate) async fn click_with_chromium(
     let (tab_id, tab) = match chromium_active_tab_for_session(runtime, session_id).await {
         Ok(value) => value,
         Err(error) => {
-            return ChromiumActionOutcome {
-                success: false,
-                outcome: "chromium_runtime_missing".to_owned(),
-                error,
-                attempts: 1,
+            return ChromiumClickOutcome {
+                action: ChromiumActionOutcome {
+                    success: false,
+                    outcome: "chromium_runtime_missing".to_owned(),
+                    error,
+                    attempts: 1,
+                },
+                download: None,
             }
         }
     };
@@ -4995,10 +5464,34 @@ pub(crate) async fn click_with_chromium(
                         format!("failed to initialize Chromium download capture: {error}")
                     })?;
             }
+            let native_download_capture = if download_like && allow_downloads {
+                let raw_href =
+                    chromium_element_attribute(attributes, "href").unwrap_or_default();
+                let source_url = Url::parse(raw_href)
+                    .or_else(|_| {
+                        Url::parse(tab_for_attempt.get_url().as_str())
+                            .and_then(|base| base.join(raw_href))
+                    })
+                    .map(|url| url.to_string())
+                    .unwrap_or_else(|_| raw_href.to_owned());
+                let suggested_file_name =
+                    chromium_element_attribute(attributes, "download")
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| infer_download_file_name(source_url.as_str()));
+                Some(begin_chromium_native_download_capture(
+                    &tab_for_attempt,
+                    source_url,
+                    suggested_file_name,
+                    timeout_ms,
+                )?)
+            } else {
+                None
+            };
             // `Element::click` waits on an IntersectionObserver before dispatch and can consume
             // the entire CDP timeout on otherwise actionable elements on Windows. A synchronous
             // scroll plus the JS-reported midpoint preserves real mouse input without that wait.
-            element
+            let click_result = element
                 .call_js_fn(
                     "function() { this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); return true; }",
                     Vec::new(),
@@ -5011,13 +5504,23 @@ pub(crate) async fn click_with_chromium(
                     "failed to click selector '{}' through Chromium input dispatch: {error}",
                     selector_for_attempt
                 )
-                })?;
-            Ok(ClickAttempt::Clicked { download_like, may_open_window })
+                });
+            if let Err(error) = click_result {
+                if let Some(capture) = native_download_capture.as_ref() {
+                    cleanup_chromium_native_download_capture(capture);
+                }
+                return Err(error);
+            }
+            let download = native_download_capture
+                .map(finish_chromium_native_download_capture)
+                .transpose()?
+                .flatten();
+            Ok(ClickAttempt::Clicked { download_like, may_open_window, download })
         })
         .await;
 
         match attempt {
-            Ok(ClickAttempt::Clicked { download_like, may_open_window }) => {
+            Ok(ClickAttempt::Clicked { download_like, may_open_window, download }) => {
                 let new_tab_count = match chromium_sync_session_tabs_after_click(
                     runtime,
                     session_id,
@@ -5029,53 +5532,68 @@ pub(crate) async fn click_with_chromium(
                 {
                     Ok(value) => value,
                     Err(error) => {
-                        return ChromiumActionOutcome {
-                            success: false,
-                            outcome: "new_tab_sync_failed".to_owned(),
-                            error,
-                            attempts,
+                        return ChromiumClickOutcome {
+                            action: ChromiumActionOutcome {
+                                success: false,
+                                outcome: "new_tab_sync_failed".to_owned(),
+                                error,
+                                attempts,
+                            },
+                            download: None,
                         };
                     }
                 };
                 let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
-                return ChromiumActionOutcome {
-                    success: true,
-                    outcome: if download_like {
-                        "download_allowed".to_owned()
-                    } else if new_tab_count > 0 {
-                        "clicked_new_tab".to_owned()
-                    } else {
-                        "clicked".to_owned()
+                return ChromiumClickOutcome {
+                    action: ChromiumActionOutcome {
+                        success: true,
+                        outcome: if download_like {
+                            "download_allowed".to_owned()
+                        } else if new_tab_count > 0 {
+                            "clicked_new_tab".to_owned()
+                        } else {
+                            "clicked".to_owned()
+                        },
+                        error: String::new(),
+                        attempts,
                     },
-                    error: String::new(),
-                    attempts,
+                    download,
                 };
             }
             Ok(ClickAttempt::DownloadBlocked) => {
-                return ChromiumActionOutcome {
-                    success: false,
-                    outcome: "download_blocked".to_owned(),
-                    error:
-                        "download-like click is blocked by session policy (allow_downloads=false)"
-                            .to_owned(),
-                    attempts,
+                return ChromiumClickOutcome {
+                    action: ChromiumActionOutcome {
+                        success: false,
+                        outcome: "download_blocked".to_owned(),
+                        error:
+                            "download-like click is blocked by session policy (allow_downloads=false)"
+                                .to_owned(),
+                        attempts,
+                    },
+                    download: None,
                 };
             }
             Ok(ClickAttempt::Disabled) => {
-                return ChromiumActionOutcome {
-                    success: false,
-                    outcome: "selector_disabled".to_owned(),
-                    error: format!("selector '{selector}' is disabled"),
-                    attempts,
+                return ChromiumClickOutcome {
+                    action: ChromiumActionOutcome {
+                        success: false,
+                        outcome: "selector_disabled".to_owned(),
+                        error: format!("selector '{selector}' is disabled"),
+                        attempts,
+                    },
+                    download: None,
                 };
             }
             Ok(ClickAttempt::NotFound) => {}
             Err(error) => {
-                return ChromiumActionOutcome {
-                    success: false,
-                    outcome: "click_failed".to_owned(),
-                    error,
-                    attempts,
+                return ChromiumClickOutcome {
+                    action: ChromiumActionOutcome {
+                        success: false,
+                        outcome: "click_failed".to_owned(),
+                        error,
+                        attempts,
+                    },
+                    download: None,
                 };
             }
         }
@@ -5087,18 +5605,21 @@ pub(crate) async fn click_with_chromium(
         let sleep_ms = DEFAULT_ACTION_RETRY_INTERVAL_MS.min(remaining_ms.max(1));
         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
     }
-    ChromiumActionOutcome {
-        success: false,
-        outcome: "selector_not_found".to_owned(),
-        error: chromium_selector_not_found_error(
-            runtime,
-            session_id,
-            tab_id.as_str(),
-            selector,
-            "click",
-        )
-        .await,
-        attempts,
+    ChromiumClickOutcome {
+        action: ChromiumActionOutcome {
+            success: false,
+            outcome: "selector_not_found".to_owned(),
+            error: chromium_selector_not_found_error(
+                runtime,
+                session_id,
+                tab_id.as_str(),
+                selector,
+                "click",
+            )
+            .await,
+            attempts,
+        },
+        download: None,
     }
 }
 
@@ -6206,10 +6727,10 @@ fn chromium_viewport_dimensions_match(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        chromium_cookie_delete_requests, chromium_element_capture_script,
-        chromium_element_may_open_window, chromium_layout_metrics_from_cdp,
-        chromium_mobile_viewport_needs_css_fallback, chromium_network_log_headers,
-        chromium_observe_state_script, chromium_permission_origin,
+        chromium_cookie_delete_requests, chromium_download_sensitive_header,
+        chromium_element_capture_script, chromium_element_may_open_window,
+        chromium_layout_metrics_from_cdp, chromium_mobile_viewport_needs_css_fallback,
+        chromium_network_log_headers, chromium_observe_state_script, chromium_permission_origin,
         chromium_permission_origins_for_urls, chromium_permission_reset_request,
         chromium_permission_set_requests, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
@@ -6284,6 +6805,23 @@ mod tests {
         let same_tab = vec!["target".to_owned(), "_self".to_owned()];
         assert!(!chromium_element_may_open_window(Some(same_tab.as_slice())));
         assert!(!chromium_element_may_open_window(None));
+    }
+
+    #[test]
+    fn chromium_download_redirects_classify_custom_credential_headers_as_sensitive() {
+        for name in [
+            "Authorization",
+            "Cookie",
+            "Proxy-Authorization",
+            "X-API-Key",
+            "X-Auth-Token",
+            "X-Client-Secret",
+            "X-Cloud-Credential",
+        ] {
+            assert!(chromium_download_sensitive_header(name), "{name} must not cross origins");
+        }
+        assert!(!chromium_download_sensitive_header("Accept"));
+        assert!(!chromium_download_sensitive_header("User-Agent"));
     }
 
     #[test]
