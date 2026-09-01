@@ -156,7 +156,9 @@ use startup::{
 use workspace_diagnostics::load_failure_workspace_projection_with_hook;
 
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
-const DAEMON_HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
+// Windows runners can publish listen ports before the daemon's full contract state is ready.
+// Keep the health phase independently bounded without treating loaded startup as a dead daemon.
+const DAEMON_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 // Unix cleanup can require several full process-table and marker scans before proving inactivity.
 // Keep one bounded budget with enough headroom for concurrent cleanup under system load.
