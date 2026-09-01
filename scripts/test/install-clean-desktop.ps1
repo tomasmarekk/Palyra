@@ -202,7 +202,7 @@ set "PALYRA_OS_FILE_ROOTS=$cmdOsFileRoots"
         $psE2EHomeRoot = ConvertTo-PowerShellSingleQuotedLiteral -Value $E2EHomeRoot
         $psE2EOsRoot = ConvertTo-PowerShellSingleQuotedLiteral -Value $E2EOsRoot
         $psOsFileRoots = ConvertTo-PowerShellSingleQuotedLiteral -Value $OsFileRoots
-        Set-Content -LiteralPath (Join-Path $CommandRoot "palyra-pwsh.ps1") -Value @"
+        $powerShellShimBody = @"
 Set-StrictMode -Version Latest
 `$ErrorActionPreference = "Stop"
 `$ProgressPreference = "SilentlyContinue"
@@ -218,7 +218,9 @@ if (`$MyInvocation.ExpectingInput) {
     & $psTargetBinary @args
 }
 exit `$LASTEXITCODE
-"@ -NoNewline
+"@
+        Set-Content -LiteralPath (Join-Path $CommandRoot "palyra.ps1") -Value $powerShellShimBody -NoNewline
+        Set-Content -LiteralPath (Join-Path $CommandRoot "palyra-pwsh.ps1") -Value $powerShellShimBody -NoNewline
     } else {
         $shTargetBinary = ConvertTo-PosixSingleQuotedLiteral -Value $TargetBinaryPath
         $shStateRoot = ConvertTo-PosixSingleQuotedLiteral -Value $StateRoot

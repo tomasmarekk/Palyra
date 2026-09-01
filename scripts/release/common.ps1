@@ -916,14 +916,6 @@ function Install-PalyraCliExposure {
 
         New-Item -ItemType Directory -Path $Root -Force | Out-Null
 
-        # PowerShell resolves palyra.ps1 ahead of palyra.cmd, so an obsolete
-        # installer-owned shim would otherwise shadow the new command shim.
-        $legacyPowerShellShimPath = Join-Path $Root "$commandName.ps1"
-        if (Test-Path -LiteralPath $legacyPowerShellShimPath -PathType Leaf) {
-            Remove-Item -LiteralPath $legacyPowerShellShimPath -Force
-            $legacyShimPathsRemoved.Add($legacyPowerShellShimPath) | Out-Null
-        }
-
         $cmdTargetBinary = ConvertTo-CmdShimLiteral -Value $resolvedTargetBinary
         $cmdStateRoot = if ($null -ne $resolvedStateRoot) { ConvertTo-CmdShimLiteral -Value $resolvedStateRoot } else { $null }
         $cmdConfigPath = if ($null -ne $resolvedConfigPath) { ConvertTo-CmdShimLiteral -Value $resolvedConfigPath } else { $null }
@@ -942,7 +934,9 @@ $(if ($null -ne $cmdConfigPath) { 'set "PALYRA_CONFIG=' + $cmdConfigPath + '"' }
 "@
         Set-Content -LiteralPath $cmdShimPath -Value $cmdShimBody -NoNewline
 
-        $psShimPath = Join-Path $Root "$commandName-pwsh.ps1"
+        # PowerShell resolves the primary .ps1 shim ahead of .cmd. Forwarding through @args
+        # preserves structured JSON arguments that cmd.exe would otherwise reinterpret.
+        $psShimPath = Join-Path $Root "$commandName.ps1"
         $psShimBody =
 @"
 Set-StrictMode -Version Latest
@@ -960,7 +954,10 @@ exit `$LASTEXITCODE
 "@
         Set-Content -LiteralPath $psShimPath -Value $psShimBody -NoNewline
 
-        return @($cmdShimPath, $psShimPath)
+        $psAliasShimPath = Join-Path $Root "$commandName-pwsh.ps1"
+        Set-Content -LiteralPath $psAliasShimPath -Value $psShimBody -NoNewline
+
+        return @($cmdShimPath, $psShimPath, $psAliasShimPath)
     }
 
     if ($IsWindows) {

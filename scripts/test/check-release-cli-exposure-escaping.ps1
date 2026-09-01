@@ -139,22 +139,23 @@ try {
     if ($IsWindows) {
         Assert-Equal `
             -Actual (Test-Path -LiteralPath $legacyShim) `
-            -Expected $false `
-            -Message "CLI exposure must remove the legacy PowerShell shim that shadows palyra.cmd."
-        Assert-Equal `
-            -Actual (@($cliExposure.legacy_shim_paths_removed) -contains $legacyShim) `
             -Expected $true `
-            -Message "CLI exposure metadata must report the removed legacy shim."
+            -Message "CLI exposure must replace the legacy PowerShell shim with the safe primary shim."
         Assert-Equal `
             -Actual (Test-PathEntryPresent -Entry $legacyAliasRoot -PathValue ([Environment]::GetEnvironmentVariable("Path", "User"))) `
             -Expected $true `
             -Message "Session-only CLI exposure must not remove persistent Windows user PATH entries."
-        $powerShellShim = $cliExposure.shim_paths | Where-Object { [string]$_ -like "*-pwsh.ps1" } | Select-Object -First 1
+        $powerShellShim = $cliExposure.shim_paths | Where-Object { [string]$_ -like "*\palyra.ps1" } | Select-Object -First 1
+        $powerShellAliasShim = $cliExposure.shim_paths | Where-Object { [string]$_ -like "*-pwsh.ps1" } | Select-Object -First 1
         $cmdShim = $cliExposure.shim_paths | Where-Object { [string]$_ -like "*.cmd" } | Select-Object -First 1
         Assert-Contains `
             -Haystack (Get-Content -Raw -LiteralPath $powerShellShim) `
             -Needle ("& " + (ConvertTo-PowerShellSingleQuotedLiteral -Value (Resolve-Path -LiteralPath $targetBinary).Path) + " @args") `
-            -Message "PowerShell shim must invoke the target through a non-expandable literal."
+            -Message "Primary PowerShell shim must preserve argv through @args."
+        Assert-Contains `
+            -Haystack (Get-Content -Raw -LiteralPath $powerShellAliasShim) `
+            -Needle ("& " + (ConvertTo-PowerShellSingleQuotedLiteral -Value (Resolve-Path -LiteralPath $targetBinary).Path) + " @args") `
+            -Message "Explicit PowerShell alias shim must preserve argv through @args."
         Assert-Contains `
             -Haystack (Get-Content -Raw -LiteralPath $cmdShim) `
             -Needle "setlocal DisableDelayedExpansion" `

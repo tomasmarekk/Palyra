@@ -73,8 +73,8 @@ use palyra_common::{
     },
     process_runner_input::{
         interpreter_args_contain_blocked_eval_flag, parse_process_runner_tool_input,
-        process_executable_is_interpreter, BackgroundLifetimeMode, ProcessRunnerToolInput,
-        ProcessWatchStream,
+        process_executable_is_interpreter, BackgroundLifetimeMode, ProcessRunnerPathAccessMode,
+        ProcessRunnerToolInput, ProcessWatchStream,
     },
     qa_fault_injection::{QaFaultAction, QaFaultDirective, QaFaultRecoveryClass},
     redaction::{redact_auth_error, redact_url_segments_in_text, REDACTED},
@@ -1129,6 +1129,7 @@ pub(crate) fn spawn_sandboxed_managed_stdio_process(
         command: configured_command.to_owned(),
         args: config.args.clone(),
         cwd: Some(config.cwd.to_string_lossy().into_owned()),
+        path_access_mode: ProcessRunnerPathAccessMode::ApprovedRoots,
         env: config.env.clone(),
         prepend_path: Vec::new(),
         requested_egress_hosts: Vec::new(),
@@ -3125,6 +3126,8 @@ pub(crate) fn run_constrained_process_with_fault_injection(
     }
 
     let mut input = parse_process_runner_input(input_json)?;
+    let effective_policy = process_runner_policy_for_input(policy, &input)?;
+    let policy = &effective_policy;
     validate_input_shape(&input)?;
     validate_background_lifetime_mode(&input)?;
     validate_background_registration_fence(&input, background_registration_fence.as_ref())?;
@@ -5613,6 +5616,29 @@ fn parse_process_runner_input(
     })
 }
 
+fn process_runner_policy_for_input(
+    policy: &SandboxProcessRunnerPolicy,
+    input: &ProcessRunnerInput,
+) -> Result<SandboxProcessRunnerPolicy, SandboxProcessRunError> {
+    let requested = match input.path_access_mode {
+        ProcessRunnerPathAccessMode::WorkspaceOnly => PathAccessMode::WorkspaceOnly,
+        ProcessRunnerPathAccessMode::ApprovedRoots => PathAccessMode::ApprovedRoots,
+    };
+    if requested == PathAccessMode::ApprovedRoots
+        && (policy.tier != SandboxProcessRunnerTier::B
+            || policy.path_access_mode != PathAccessMode::ApprovedRoots)
+    {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: "sandbox denied: path_access_mode='approved_roots' requires a Tier-B process runner whose operator configuration enables approved_roots"
+                .to_owned(),
+        });
+    }
+    let mut effective = policy.clone();
+    effective.path_access_mode = requested;
+    Ok(effective)
+}
+
 fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcessRunError> {
     if input.command.trim().is_empty() {
         return Err(SandboxProcessRunError {
@@ -6290,6 +6316,9 @@ fn validate_host_interpreter_argument_guardrails_with_roots(
     host_roots: &[PathBuf],
 ) -> Result<(), SandboxProcessRunError> {
     if host_command_bridges_unscoped_namespace(command) {
+        if normalized_process_command_name(command) == "wsl" {
+            return validate_windows_wsl_guest_invocation(workspace_root, cwd, args, host_roots);
+        }
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
             message: format!(
@@ -6343,6 +6372,132 @@ fn host_command_bridges_unscoped_namespace(command: &str) -> bool {
     // These Windows launchers cross into a separate WSL filesystem, where
     // relative paths and HOME no longer inherit the approved Windows roots.
     matches!(normalized_process_command_name(command).as_str(), "wsl" | "bash")
+}
+
+fn validate_windows_wsl_guest_invocation(
+    workspace_root: &Path,
+    cwd: &Path,
+    args: &[String],
+    host_roots: &[PathBuf],
+) -> Result<(), SandboxProcessRunError> {
+    let separator = args.iter().position(|arg| arg.trim() == "--").ok_or_else(|| {
+        SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: "sandbox denied: approved WSL execution requires '-d <distribution> -- <guest executable> [args...]' so the guest-runtime boundary is explicit"
+                .to_owned(),
+        }
+    })?;
+    let mut distribution = None;
+    let mut index = 0usize;
+    while index < separator {
+        let option = args[index].trim();
+        match option.to_ascii_lowercase().as_str() {
+            "-d" | "--distribution" => {
+                let value =
+                    args.get(index.saturating_add(1)).map(|value| value.trim()).filter(|value| {
+                        !value.is_empty()
+                            && value.len() <= 128
+                            && value.chars().all(|ch| {
+                                ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')
+                            })
+                    });
+                let Some(value) = value else {
+                    return Err(invalid_wsl_distribution_error());
+                };
+                distribution = Some(value);
+                index = index.saturating_add(2);
+            }
+            _ => {
+                return Err(SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::InvalidInput,
+                    message: format!(
+                        "sandbox denied: unsupported WSL launcher option '{option}' before the guest command boundary"
+                    ),
+                });
+            }
+        }
+    }
+    if distribution.is_none() {
+        return Err(invalid_wsl_distribution_error());
+    }
+    let guest_args = &args[separator.saturating_add(1)..];
+    if guest_args.first().is_none_or(|command| command.trim().is_empty()) {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: "sandbox denied: approved WSL execution requires a non-empty guest executable after '--'"
+                .to_owned(),
+        });
+    }
+    for argument in guest_args {
+        validate_wsl_host_mount_argument(workspace_root, cwd, argument.as_str(), host_roots)?;
+    }
+    Ok(())
+}
+
+fn invalid_wsl_distribution_error() -> SandboxProcessRunError {
+    SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::InvalidInput,
+        message: "sandbox denied: approved WSL execution requires one bounded distribution name via '-d <distribution>'"
+            .to_owned(),
+    }
+}
+
+fn validate_wsl_host_mount_argument(
+    workspace_root: &Path,
+    cwd: &Path,
+    argument: &str,
+    host_roots: &[PathBuf],
+) -> Result<(), SandboxProcessRunError> {
+    let candidate = option_assignment_value(argument).unwrap_or(argument).trim();
+    let Some(host_path) = windows_path_from_wsl_mount(candidate) else {
+        if candidate.replace('\\', "/").starts_with("/mnt/") {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                message: format!("sandbox denied: malformed WSL host mount argument '{candidate}'"),
+            });
+        }
+        if token_looks_like_drive_qualified_path(candidate) || candidate.starts_with('\\') {
+            let _ = resolve_host_access_path_with_roots(
+                workspace_root,
+                cwd,
+                candidate,
+                false,
+                host_roots,
+            )?;
+        }
+        return Ok(());
+    };
+    let _ = resolve_host_access_path_with_roots(
+        workspace_root,
+        cwd,
+        host_path.to_string_lossy().as_ref(),
+        false,
+        host_roots,
+    )
+    .map_err(|error| SandboxProcessRunError {
+        kind: error.kind,
+        message: format!(
+            "sandbox denied: WSL host mount argument '{candidate}' is outside approved Windows roots: {}",
+            error.message
+        ),
+    })?;
+    Ok(())
+}
+
+fn windows_path_from_wsl_mount(raw: &str) -> Option<PathBuf> {
+    let normalized = raw.trim().replace('\\', "/");
+    let suffix = normalized.strip_prefix("/mnt/")?;
+    let bytes = suffix.as_bytes();
+    if bytes.is_empty()
+        || !bytes[0].is_ascii_alphabetic()
+        || (bytes.len() > 1 && bytes[1] != b'/')
+        || suffix.split('/').any(|component| component == "..")
+    {
+        return None;
+    }
+    let drive = char::from(bytes[0]).to_ascii_uppercase();
+    let relative = suffix.get(2..).unwrap_or("");
+    Some(PathBuf::from(format!("{drive}:\\{}", relative.replace('/', "\\"))))
 }
 
 fn interpreter_absolute_path_argument_stays_in_workspace(
@@ -6697,6 +6852,9 @@ fn validate_host_argument_scope_with_roots(
     args: &[String],
     host_roots: &[PathBuf],
 ) -> Result<(), SandboxProcessRunError> {
+    if normalized_process_command_name(command) == "wsl" && cfg!(windows) {
+        return validate_windows_wsl_guest_invocation(workspace_root, cwd, args, host_roots);
+    }
     let mut index = 0usize;
     while index < args.len() {
         let arg = &args[index];
@@ -13264,7 +13422,7 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use palyra_common::process_runner_input::ProcessWatchStream;
+    use palyra_common::process_runner_input::{ProcessRunnerPathAccessMode, ProcessWatchStream};
     #[cfg(feature = "qa-fault-injection")]
     use palyra_common::qa_fault_injection::{
         parse_qa_fault_evidence_sidecar_ndjson, QaFaultAction, QaFaultActivation,
@@ -13284,15 +13442,15 @@ mod tests {
         host_access_roots, is_host_allowlisted, maybe_emit_process_progress,
         process_completion_notification_projection, process_failure_message,
         process_failure_output_json, process_output_diagnostic_summary, process_progress_tail,
-        process_runner_command_with_args_message, process_runtime_request_projection,
-        process_success_output_json, process_watch_events_projection,
-        redacted_process_output_preview, redacted_process_output_text,
-        resolve_host_executable_path_with_roots, resolve_host_working_directory,
-        resolve_host_working_directory_with_roots, resolve_scoped_path, resolve_working_directory,
-        rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
-        rewrite_host_virtual_workspace_args, run_constrained_process,
-        run_constrained_process_with_fault_injection, same_path_case_aware,
-        tier_c_plan_inner_path_index, validate_allowed_executable,
+        process_runner_command_with_args_message, process_runner_policy_for_input,
+        process_runtime_request_projection, process_success_output_json,
+        process_watch_events_projection, redacted_process_output_preview,
+        redacted_process_output_text, resolve_host_executable_path_with_roots,
+        resolve_host_working_directory, resolve_host_working_directory_with_roots,
+        resolve_scoped_path, resolve_working_directory, rewrite_arguments_to_scoped_paths,
+        rewrite_host_access_process_args, rewrite_host_virtual_workspace_args,
+        run_constrained_process, run_constrained_process_with_fault_injection,
+        same_path_case_aware, tier_c_plan_inner_path_index, validate_allowed_executable,
         validate_argument_workspace_scope, validate_cmd_invocation_shape,
         validate_host_argument_scope, validate_host_argument_scope_with_roots,
         validate_host_interpreter_argument_guardrails,
@@ -13313,7 +13471,10 @@ mod tests {
         BACKGROUND_TERMINATION_WAIT_MS,
     };
     #[cfg(windows)]
-    use super::{validate_host_command_path_scope, windows_program_files_path};
+    use super::{
+        validate_host_command_path_scope, validate_windows_wsl_guest_invocation,
+        windows_path_from_wsl_mount, windows_program_files_path,
+    };
     #[cfg(not(target_os = "macos"))]
     use std::sync::atomic::AtomicBool;
 
@@ -13971,6 +14132,7 @@ mod tests {
             command: command.to_owned(),
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::new(),
             prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
@@ -14001,6 +14163,26 @@ mod tests {
         policy.egress_enforcement_mode = EgressEnforcementMode::None;
         policy.path_access_mode = PathAccessMode::ApprovedRoots;
         policy
+    }
+
+    #[test]
+    fn approved_roots_are_selected_only_by_an_explicit_process_request() {
+        let workspace = unique_temp_dir("workspace-requested-path-mode");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let policy = host_access_policy(workspace.clone());
+        let workspace_input = process_runner_input("uname", &[], None);
+        let mut host_input = workspace_input.clone();
+        host_input.path_access_mode = ProcessRunnerPathAccessMode::ApprovedRoots;
+
+        let workspace_policy = process_runner_policy_for_input(&policy, &workspace_input)
+            .expect("workspace request should remain available");
+        let host_policy = process_runner_policy_for_input(&policy, &host_input)
+            .expect("approved-roots request should use the configured capability");
+
+        assert_eq!(workspace_policy.path_access_mode, PathAccessMode::WorkspaceOnly);
+        assert_eq!(host_policy.path_access_mode, PathAccessMode::ApprovedRoots);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
     }
 
     fn unique_temp_dir(suffix: &str) -> PathBuf {
@@ -14349,25 +14531,121 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn host_access_rejects_relative_wsl_execution_outside_windows_root_authority() {
+    fn host_access_allows_explicit_wsl_guest_invocation_after_approval() {
         let workspace = unique_temp_dir("workspace-host-wsl-relative-deny");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
             .expect("workspace root should canonicalize");
-        let args =
-            vec!["--exec".to_owned(), "sh".to_owned(), "scripts/configure-user.sh".to_owned()];
+        let args = vec![
+            "-d".to_owned(),
+            "Ubuntu-24.04".to_owned(),
+            "--".to_owned(),
+            "/bin/chmod".to_owned(),
+            "+x".to_owned(),
+            "/var/tmp/palyra-e2e/check.sh".to_owned(),
+        ];
 
-        let error = validate_host_interpreter_argument_guardrails_with_roots(
+        validate_host_interpreter_argument_guardrails_with_roots(
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
             "wsl.exe",
             args.as_slice(),
             std::slice::from_ref(&canonical_workspace),
         )
-        .expect_err("WSL must not inherit Windows approved-root authority");
+        .expect("explicit WSL guest paths should use the approved nested-runtime boundary");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "requires a local Ubuntu-24.04 WSL distribution"]
+    fn approved_roots_process_runner_executes_explicit_wsl_guest_command_when_available() {
+        let available = Command::new("wsl.exe")
+            .args(["-d", "Ubuntu-24.04", "--", "/bin/true"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !available {
+            return;
+        }
+        let workspace = unique_temp_dir("workspace-host-wsl-execution");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let policy = host_access_policy(workspace.clone());
+        let input = br#"{
+            "command":"wsl.exe",
+            "args":["-d","Ubuntu-24.04","--","/usr/bin/printf","PALYRA_WSL_OK"],
+            "path_access_mode":"approved_roots"
+        }"#;
+
+        let result = run_constrained_process(&policy, input, Duration::from_millis(20_000))
+            .expect("approved WSL guest command should execute");
+        let output: Value =
+            serde_json::from_slice(result.output_json.as_slice()).expect("output should parse");
+
+        assert_eq!(output["exit_code"], 0);
+        assert_eq!(output["stdout"], "PALYRA_WSL_OK");
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn approved_wsl_invocation_requires_an_explicit_distribution_and_boundary() {
+        let workspace = unique_temp_dir("workspace-host-wsl-shape");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+
+        for args in [
+            vec!["--".to_owned(), "/bin/true".to_owned()],
+            vec!["-d".to_owned(), "Ubuntu-24.04".to_owned(), "/bin/true".to_owned()],
+        ] {
+            let error = validate_windows_wsl_guest_invocation(
+                canonical_workspace.as_path(),
+                canonical_workspace.as_path(),
+                args.as_slice(),
+                std::slice::from_ref(&canonical_workspace),
+            )
+            .expect_err("ambiguous WSL invocation must be rejected");
+            assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+        }
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn wsl_mount_path_conversion_distinguishes_guest_and_windows_paths() {
+        assert_eq!(
+            windows_path_from_wsl_mount("/mnt/c/Users/test/check.sh"),
+            Some(PathBuf::from(r"C:\Users\test\check.sh"))
+        );
+        assert_eq!(windows_path_from_wsl_mount("/mnt/d"), Some(PathBuf::from(r"D:\")));
+        assert_eq!(windows_path_from_wsl_mount("/var/tmp/check.sh"), None);
+        assert_eq!(windows_path_from_wsl_mount("/mnt/c/../Windows"), None);
+    }
+
+    #[test]
+    fn approved_wsl_invocation_rejects_malformed_host_mount_paths() {
+        let workspace = unique_temp_dir("workspace-host-wsl-mount");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec![
+            "-d".to_owned(),
+            "Ubuntu-24.04".to_owned(),
+            "--".to_owned(),
+            "/bin/cat".to_owned(),
+            "/mnt/c/../Windows/win.ini".to_owned(),
+        ];
+
+        let error = validate_windows_wsl_guest_invocation(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            args.as_slice(),
+            std::slice::from_ref(&canonical_workspace),
+        )
+        .expect_err("malformed WSL mount paths must fail closed");
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
-        assert!(error.message.contains("nested runtime"), "{}", error.message);
+        assert!(error.message.contains("malformed WSL host mount"));
         let _ = fs::remove_dir_all(workspace.as_path());
     }
 
@@ -14802,6 +15080,7 @@ mod tests {
             command: "node".to_owned(),
             args: vec!["/".to_owned(), "--config=/workspace/e2e-file-workflow/test.js".to_owned()],
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: Default::default(),
             prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
@@ -15293,6 +15572,7 @@ mod tests {
             command: "node".to_owned(),
             args: vec!["node -e \"(() => console.log('ok'))()\"".to_owned()],
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: Default::default(),
             prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
@@ -15346,6 +15626,7 @@ mod tests {
             command: executable.display().to_string(),
             args: vec!["--version".to_owned()],
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::new(),
             prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
@@ -15481,6 +15762,7 @@ mod tests {
             command: "repo/.venv/Scripts/python.exe".to_owned(),
             args: vec!["--version".to_owned()],
             cwd: Some("repo".to_owned()),
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::new(),
             prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
@@ -15743,6 +16025,7 @@ mod tests {
             command: "node".to_owned(),
             args: Vec::new(),
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::new(),
             prepend_path: vec![outside.to_string_lossy().into_owned()],
             requested_egress_hosts: Vec::new(),
@@ -15796,6 +16079,7 @@ mod tests {
             command: helper.to_string_lossy().into_owned(),
             args: Vec::new(),
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::new(),
             prepend_path: vec![toolchain_bin.to_string_lossy().into_owned()],
             requested_egress_hosts: Vec::new(),
@@ -15851,6 +16135,7 @@ mod tests {
             command: command_name.to_owned(),
             args: Vec::new(),
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::new(),
             prepend_path: vec![toolchain_bin.to_string_lossy().into_owned()],
             requested_egress_hosts: Vec::new(),
@@ -15915,6 +16200,7 @@ mod tests {
                 command: "palyra-helper".to_owned(),
                 args: Vec::new(),
                 cwd: None,
+                path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
                 env: BTreeMap::new(),
                 prepend_path: Vec::new(),
                 requested_egress_hosts: Vec::new(),
@@ -15992,6 +16278,7 @@ mod tests {
             command: "bash".to_owned(),
             args: vec!["scripts/show-env.sh".to_owned()],
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::from([
                 ("PALYRA_E2E_HOME".to_owned(), e2e_home.to_string_lossy().into_owned()),
                 ("PALYRA_E2E_OS_ROOT".to_owned(), e2e_os_root.to_string_lossy().into_owned()),
@@ -16138,6 +16425,7 @@ mod tests {
             command: "node".to_owned(),
             args: vec!["--version".to_owned()],
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::new(),
             prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
@@ -16193,6 +16481,7 @@ mod tests {
             command: helper.to_string_lossy().into_owned(),
             args: vec!["--root=/".to_owned()],
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::new(),
             prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
@@ -17281,7 +17570,7 @@ mod tests {
                 );
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
-        assert!(error.message.contains("outside workspace"), "{}", error.message);
+        assert!(error.message.contains("workspace"), "{}", error.message);
         assert!(!target.exists(), "outside-workspace mkdir target must not be created");
 
         let _ = fs::remove_dir_all(workspace.as_path());
@@ -17499,6 +17788,7 @@ mod tests {
             command: "python".to_owned(),
             args: Vec::new(),
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::new(),
             prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
@@ -19870,7 +20160,8 @@ mod tests {
         assert!(super::process_runner_allows_host_access(&policy));
         let input = serde_json::to_vec(&serde_json::json!({
             "command": "node",
-            "args": [approved_script.to_string_lossy()]
+            "args": [approved_script.to_string_lossy()],
+            "path_access_mode": "approved_roots"
         }))
         .expect("approved-root process input should serialize");
         let result =
@@ -19885,7 +20176,8 @@ mod tests {
 
         let denied_input = serde_json::to_vec(&serde_json::json!({
             "command": "node",
-            "args": [adjacent_script.to_string_lossy()]
+            "args": [adjacent_script.to_string_lossy()],
+            "path_access_mode": "approved_roots"
         }))
         .expect("adjacent-root process input should serialize");
         let error = run_constrained_process(
@@ -20413,6 +20705,7 @@ mod tests {
                 "README.md".to_owned(),
             ],
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: Default::default(),
             prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
@@ -20484,6 +20777,7 @@ mod tests {
             command: "uname".to_owned(),
             args: Vec::new(),
             cwd: None,
+            path_access_mode: ProcessRunnerPathAccessMode::WorkspaceOnly,
             env: BTreeMap::from([
                 ("APP_ENDPOINT".to_owned(), "https://blocked.example/api".to_owned()),
                 ("APP_HOST".to_owned(), "allowed.example:443".to_owned()),

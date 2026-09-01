@@ -1702,6 +1702,14 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         json!({"type":"string","description":"Working directory. In sandbox mode, omit for the workspace root or use /workspace and /workspace/subdir as virtual workspace aliases. In host-access E2E mode, launch-context path prefixes are accepted only when they were explicitly provided by the CLI/tool context; do not invent $PALYRA_E2E_OS_ROOT or similar env aliases when the prompt already contains an absolute path."}),
                     ),
                     (
+                        "path_access_mode",
+                        json!({
+                            "type":"string",
+                            "enum":["workspace_only","approved_roots"],
+                            "description":"Filesystem authority for this invocation; defaults to workspace_only. Use approved_roots only when the user requested work in an exact operator-configured OS root. Tier-B approved-roots calls require explicit host-access approval even under an always-allow tool posture. This mode also provides the dedicated approval boundary for a direct wsl.exe invocation; guest POSIX paths are then interpreted inside the selected distribution while /mnt/<drive> host paths remain restricted to approved Windows roots."
+                        }),
+                    ),
+                    (
                         "env",
                         json!({
                             "type":"object",

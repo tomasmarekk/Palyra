@@ -1100,6 +1100,7 @@ mod tests {
             command: command.to_owned(),
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             cwd: None,
+            path_access_mode: Default::default(),
             env: Default::default(),
             prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),

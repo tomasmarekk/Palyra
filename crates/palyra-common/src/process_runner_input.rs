@@ -103,6 +103,17 @@ pub struct ProcessRunnerFacadeMapping {
     pub canonical_tool_name: String,
 }
 
+/// Filesystem authority requested for one `palyra.process.run` invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessRunnerPathAccessMode {
+    /// Confine path-bearing input to the active workspace.
+    #[default]
+    WorkspaceOnly,
+    /// Request access to the workspace plus operator-configured OS roots.
+    ApprovedRoots,
+}
+
 /// Canonical input payload for `palyra.process.run`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +123,8 @@ pub struct ProcessRunnerToolInput {
     pub args: Vec<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub path_access_mode: ProcessRunnerPathAccessMode,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -372,7 +385,7 @@ fn python_option_consumes_next_value(arg: &str) -> bool {
 mod tests {
     use super::{
         interpreter_args_contain_blocked_eval_flag, parse_process_runner_tool_input,
-        process_executable_is_interpreter, BackgroundLifetimeMode,
+        process_executable_is_interpreter, BackgroundLifetimeMode, ProcessRunnerPathAccessMode,
         ProcessRunnerToolInputParseError,
     };
 
@@ -435,6 +448,7 @@ mod tests {
         assert_eq!(parsed.command, "uname");
         assert_eq!(parsed.args, vec!["-a"]);
         assert_eq!(parsed.cwd.as_deref(), Some("workspace"));
+        assert_eq!(parsed.path_access_mode, ProcessRunnerPathAccessMode::WorkspaceOnly);
         assert!(parsed.env.is_empty());
         assert!(parsed.prepend_path.is_empty());
         assert_eq!(parsed.requested_egress_hosts, vec!["api.example.com"]);
@@ -444,6 +458,15 @@ mod tests {
         assert!(!parsed.pty);
         assert!(parsed.port_hints.is_empty());
         assert_eq!(parsed.effective_lifetime_mode(), BackgroundLifetimeMode::RunOwned);
+    }
+
+    #[test]
+    fn parse_process_runner_tool_input_accepts_approved_roots_handoff() {
+        let input = br#"{"command":"pwsh","args":["-File","C:\\approved\\check.ps1"],"path_access_mode":"approved_roots"}"#;
+        let parsed = parse_process_runner_tool_input(input)
+            .expect("approved-roots process handoff should parse");
+
+        assert_eq!(parsed.path_access_mode, ProcessRunnerPathAccessMode::ApprovedRoots);
     }
 
     #[test]

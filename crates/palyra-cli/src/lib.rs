@@ -997,7 +997,7 @@ fn apply_local_desktop_tool_defaults(
     set_value_at_path(
         document,
         "tool_call.process_runner.path_access_mode",
-        toml::Value::String("workspace_only".to_owned()),
+        toml::Value::String("approved_roots".to_owned()),
     )?;
     set_value_at_path(
         document,
@@ -15804,7 +15804,7 @@ mod init_command_tests {
         );
         assert_eq!(
             read_string(&document, "tool_call.process_runner.path_access_mode").as_deref(),
-            Some("workspace_only")
+            Some("approved_roots")
         );
         assert_eq!(
             read_integer(&document, "tool_call.process_runner.cpu_time_limit_ms"),

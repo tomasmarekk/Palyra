@@ -9,6 +9,9 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
+use palyra_common::process_runner_input::{
+    parse_process_runner_tool_input, ProcessRunnerPathAccessMode,
+};
 use palyra_policy::{
     evaluate_with_context, PolicyDecision, PolicyEvaluationConfig, PolicyRequest,
     PolicyRequestContext,
@@ -482,12 +485,18 @@ fn proposal_requires_approval(
 fn tier_b_approved_roots_requires_host_access_approval(
     runtime_state: &GatewayRuntimeState,
     tool_name: &str,
+    input_json: &[u8],
 ) -> bool {
     let policy = &runtime_state.config.tool_call.process_runner;
+    let requested_path_access_mode = parse_process_runner_tool_input(input_json)
+        .ok()
+        .map(|input| input.path_access_mode)
+        .unwrap_or_default();
     tier_b_path_posture_requires_host_access_approval(
         tool_name,
         policy.tier,
         crate::sandbox_runner::process_runner_effective_path_access_mode(policy),
+        requested_path_access_mode,
     )
 }
 
@@ -495,10 +504,12 @@ fn tier_b_path_posture_requires_host_access_approval(
     tool_name: &str,
     tier: crate::sandbox_runner::SandboxProcessRunnerTier,
     path_access_mode: crate::sandbox_runner::PathAccessMode,
+    requested_path_access_mode: ProcessRunnerPathAccessMode,
 ) -> bool {
     matches!(tool_name, "palyra.process.run" | "palyra.exec.run")
         && tier == crate::sandbox_runner::SandboxProcessRunnerTier::B
         && path_access_mode == crate::sandbox_runner::PathAccessMode::ApprovedRoots
+        && requested_path_access_mode == ProcessRunnerPathAccessMode::ApprovedRoots
 }
 
 /// Formats an allowlist for denial reasons, making emptiness explicit.
@@ -675,7 +686,7 @@ pub(crate) async fn evaluate_tool_proposal_security(
         skill_gate_decision.as_ref(),
         effective_posture.effective_state,
         backend_selection.resolution.approval_required,
-        tier_b_approved_roots_requires_host_access_approval(runtime_state, tool_name),
+        tier_b_approved_roots_requires_host_access_approval(runtime_state, tool_name, input_json),
     );
     let approval_subject_id =
         build_tool_approval_subject_id(tool_name, skill_context.as_ref(), input_json);
@@ -1139,26 +1150,37 @@ mod tests {
     #[test]
     fn only_tier_b_approved_roots_process_runs_require_host_access_approval() {
         use crate::sandbox_runner::{PathAccessMode, SandboxProcessRunnerTier};
+        use palyra_common::process_runner_input::ProcessRunnerPathAccessMode;
 
         assert!(tier_b_path_posture_requires_host_access_approval(
             "palyra.process.run",
             SandboxProcessRunnerTier::B,
             PathAccessMode::ApprovedRoots,
+            ProcessRunnerPathAccessMode::ApprovedRoots,
         ));
         assert!(!tier_b_path_posture_requires_host_access_approval(
             "palyra.process.run",
             SandboxProcessRunnerTier::B,
             PathAccessMode::WorkspaceOnly,
+            ProcessRunnerPathAccessMode::ApprovedRoots,
         ));
         assert!(!tier_b_path_posture_requires_host_access_approval(
             "palyra.process.run",
             SandboxProcessRunnerTier::C,
             PathAccessMode::ApprovedRoots,
+            ProcessRunnerPathAccessMode::ApprovedRoots,
         ));
         assert!(!tier_b_path_posture_requires_host_access_approval(
             "palyra.fs.read_file",
             SandboxProcessRunnerTier::B,
             PathAccessMode::ApprovedRoots,
+            ProcessRunnerPathAccessMode::ApprovedRoots,
+        ));
+        assert!(!tier_b_path_posture_requires_host_access_approval(
+            "palyra.process.run",
+            SandboxProcessRunnerTier::B,
+            PathAccessMode::ApprovedRoots,
+            ProcessRunnerPathAccessMode::WorkspaceOnly,
         ));
     }
 
