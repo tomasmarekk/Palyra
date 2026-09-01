@@ -239,6 +239,11 @@ fn console_anthropic_api_key_flow_persists_vault_refs_and_default_selection() ->
         "default selection should persist the anthropic auth provider kind: {document_toml}"
     );
     assert!(
+        document_toml.contains(format!("anthropic_base_url = \"{}\"", mock.base_url()).as_str()),
+        "default selection should preserve the endpoint that validated the credential: \
+         {document_toml}"
+    );
+    assert!(
         !document_toml.contains("sk-live-anthropic"),
         "config inspect must not leak the raw Anthropic API key"
     );

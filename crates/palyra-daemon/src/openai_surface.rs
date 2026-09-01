@@ -3749,10 +3749,13 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
             )?;
         }
         ModelProviderAuthProviderKind::Anthropic => {
+            // Keep selection on the endpoint that accepted the credential; replacing an
+            // explicit compatible endpoint with the public default would break the next turn.
+            let anthropic_base_url = load_anthropic_validation_base_url(Some(&document));
             ensure_string_value_at_path(
                 &mut document,
                 "model_provider.anthropic_base_url",
-                ANTHROPIC_DEFAULT_BASE_URL,
+                anthropic_base_url.as_str(),
             )?;
             apply_discovered_or_clear_text_model_selection(
                 &mut document,
@@ -3767,7 +3770,7 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                         provider_id: "anthropic-primary",
                         display_name: "Anthropic",
                         kind: "anthropic",
-                        base_url: ANTHROPIC_DEFAULT_BASE_URL,
+                        base_url: anthropic_base_url.as_str(),
                         auth_provider_kind: "anthropic",
                     },
                 )?;
