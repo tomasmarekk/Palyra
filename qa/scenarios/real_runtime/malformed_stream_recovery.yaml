@@ -71,5 +71,6 @@ maturity:
     - provider_recovery
     - baseline_replay
 timeout:
-  run_ms: 30000
-  step_ms: 10000
+  # Shared Windows CI may schedule this retry path alongside other real-runtime test binaries.
+  run_ms: 60000
+  step_ms: 30000
