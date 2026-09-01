@@ -2170,6 +2170,8 @@ async fn snapshot_build_redacts_console_and_connector_diagnostics() {
     let server = std::thread::spawn(move || {
         listener.set_nonblocking(true).expect("listener should support nonblocking mode");
         let mut idle_since = Instant::now();
+        let mut served_diagnostics = false;
+        let mut served_discord = false;
         loop {
             let (mut stream, _) = match listener.accept() {
                 Ok(connection) => {
@@ -2177,7 +2179,7 @@ async fn snapshot_build_redacts_console_and_connector_diagnostics() {
                     connection
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if idle_since.elapsed() >= Duration::from_millis(250) {
+                    if idle_since.elapsed() >= Duration::from_secs(2) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -2303,6 +2305,10 @@ async fn snapshot_build_redacts_console_and_connector_diagnostics() {
                         }"#,
                     &[],
                 );
+                served_diagnostics = true;
+                if served_discord {
+                    break;
+                }
                 continue;
             }
             if request_line.starts_with("GET /console/v1/channels/discord%3Adefault ") {
@@ -2337,6 +2343,10 @@ async fn snapshot_build_redacts_console_and_connector_diagnostics() {
                         }"#,
                     &[],
                 );
+                served_discord = true;
+                if served_diagnostics {
+                    break;
+                }
                 continue;
             }
             panic!("unexpected desktop snapshot request: {request_line}");
