@@ -13458,8 +13458,9 @@ mod tests {
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
         validate_process_env_overrides, validate_process_prepend_path_shape,
         validate_process_termination_scope, validate_runtime_egress_enforcement,
-        BackgroundLifetimeMode, EgressEnforcementMode, ManagedChildGuard, PathAccessMode,
-        ProcessCompletionState, ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
+        validate_windows_wsl_guest_invocation, windows_path_from_wsl_mount, BackgroundLifetimeMode,
+        EgressEnforcementMode, ManagedChildGuard, PathAccessMode, ProcessCompletionState,
+        ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
         ProcessSuccessOutputJsonInput, SandboxProcessRunError, SandboxProcessRunErrorKind,
         SandboxProcessRunnerPolicy, SandboxProcessRunnerTier, StreamCapture,
         MAX_PREPEND_PATH_COUNT, MAX_WATCH_PATTERNS, NODE_DISABLE_COMPILE_CACHE_ENV,
@@ -13471,10 +13472,7 @@ mod tests {
         BACKGROUND_TERMINATION_WAIT_MS,
     };
     #[cfg(windows)]
-    use super::{
-        validate_host_command_path_scope, validate_windows_wsl_guest_invocation,
-        windows_path_from_wsl_mount, windows_program_files_path,
-    };
+    use super::{validate_host_command_path_scope, windows_program_files_path};
     #[cfg(not(target_os = "macos"))]
     use std::sync::atomic::AtomicBool;
 
