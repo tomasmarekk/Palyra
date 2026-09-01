@@ -36,10 +36,96 @@ use crate::{
     },
     journal::{
         MemoryItemCreateRequest, MemoryItemLifecycleUpdateRequest, MemoryItemRecord,
-        MemorySearchHit, MemorySearchRequest, MemorySource,
+        MemorySearchHit, MemorySearchRequest, MemorySource, WorkspaceDocumentDeleteRequest,
+        WorkspaceDocumentRecord,
     },
     transport::grpc::proto::palyra::{common::v1 as common_v1, memory::v1 as memory_v1},
 };
+
+/// Soft-deletes a workspace/project memory document by canonical document id.
+///
+/// The lookup is principal-scoped first, then the loaded row is checked
+/// against authenticated channel and agent scope before any mutation.
+///
+/// # Errors
+/// Returns `PermissionDenied` for a scope mismatch or the mapped storage error
+/// when inspection or deletion fails.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn delete_workspace_memory_document_by_id(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    channel: Option<&str>,
+    requested_agent_id: Option<&str>,
+    session_id: Option<&str>,
+    document_id: &str,
+) -> Result<Option<WorkspaceDocumentRecord>, Status> {
+    let Some(document) = runtime_state
+        .workspace_document_by_id(principal.to_owned(), None, None, document_id.to_owned(), false)
+        .await?
+    else {
+        return Ok(None);
+    };
+    enforce_workspace_document_mutation_scope(&document, principal, channel, requested_agent_id)?;
+    authorize_memory_action(
+        principal,
+        "memory.delete",
+        format!("memory:workspace_document:{}", document.document_id).as_str(),
+    )?;
+    runtime_state
+        .soft_delete_workspace_document(WorkspaceDocumentDeleteRequest {
+            principal: document.principal,
+            channel: document.channel,
+            agent_id: document.agent_id,
+            session_id: session_id.map(str::to_owned),
+            path: document.path,
+        })
+        .await
+        .map(Some)
+}
+
+/// Enforces principal, channel, and agent authority for workspace-memory mutation.
+#[allow(clippy::result_large_err)]
+pub(crate) fn enforce_workspace_document_mutation_scope(
+    document: &WorkspaceDocumentRecord,
+    principal: &str,
+    channel: Option<&str>,
+    requested_agent_id: Option<&str>,
+) -> Result<(), Status> {
+    if document.principal != principal {
+        return Err(Status::permission_denied(
+            "workspace document principal does not match context",
+        ));
+    }
+    match (channel, document.channel.as_deref()) {
+        (Some(context_channel), Some(document_channel)) if context_channel != document_channel => {
+            return Err(Status::permission_denied(
+                "workspace document channel does not match context",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(Status::permission_denied(
+                "workspace document is channel-scoped and requires authenticated channel context",
+            ));
+        }
+        _ => {}
+    }
+    match (requested_agent_id, document.agent_id.as_deref()) {
+        (Some(requested_agent_id), Some(document_agent_id))
+            if requested_agent_id != document_agent_id =>
+        {
+            return Err(Status::permission_denied(
+                "workspace document agent_id does not match request",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(Status::permission_denied(
+                "workspace document is agent-scoped and requires matching agent_id",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 /// Resolves the effective channel scope for a memory request.
 ///

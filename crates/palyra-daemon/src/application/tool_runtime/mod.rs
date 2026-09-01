@@ -23,6 +23,7 @@ pub(crate) mod routines;
 pub(crate) mod session_operations;
 pub(crate) mod tool_program;
 pub(crate) mod tool_rpc;
+pub(crate) mod vault;
 pub(crate) mod web_search;
 pub(crate) mod work_graph;
 pub(crate) mod workspace_file;

@@ -159,6 +159,26 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "palyra.vault.metadata",
+            "Verify whether one exact, caller-authorized vault reference exists and inspect its descriptor metadata. Never returns or resolves the secret value.",
+            object_schema(
+                &["scope", "key"],
+                vec![
+                    (
+                        "scope",
+                        json!({"type":"string","maxLength":768,"description":"Exact vault scope: global, principal:<id>, or channel:<name>:<account_id>. Skill scopes are unavailable to agent calls."}),
+                    ),
+                    (
+                        "key",
+                        json!({"type":"string","maxLength":256,"description":"Exact secret key to inspect; the result contains existence and metadata only."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.context.inspect",
             "Inspect the current session context-engine binding, health, projection epoch, lifecycle counters, and token calibration. Returns metadata only; prompt text and tool payloads are never exposed.",
             object_schema(&[], Vec::new(), false),

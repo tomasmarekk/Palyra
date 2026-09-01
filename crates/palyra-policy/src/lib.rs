@@ -229,6 +229,7 @@ permit(principal, action, resource)
 when {
     context.action == "vault.put" ||
     context.action == "vault.get" ||
+    context.action == "vault.metadata" ||
     context.action == "vault.delete" ||
     context.action == "vault.list"
 };
@@ -1177,20 +1178,22 @@ mod tests {
 
     #[test]
     fn vault_actions_are_explicitly_allowed() {
-        let request = PolicyRequest {
-            principal: "user:ops".to_owned(),
-            action: "vault.get".to_owned(),
-            resource: "secrets:global:openai_api_key".to_owned(),
-        };
+        for action in ["vault.get", "vault.metadata"] {
+            let request = PolicyRequest {
+                principal: "user:ops".to_owned(),
+                action: action.to_owned(),
+                resource: "secrets:global:openai_api_key".to_owned(),
+            };
 
-        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
-            .expect("well-formed request evaluates without engine error");
+            let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+                .expect("well-formed request evaluates without engine error");
 
-        assert_eq!(evaluation.decision, PolicyDecision::Allow);
-        assert!(
-            evaluation.explanation.reason.contains("vault action allowed"),
-            "vault allow reason should reflect dedicated vault policy"
-        );
+            assert_eq!(evaluation.decision, PolicyDecision::Allow);
+            assert!(
+                evaluation.explanation.reason.contains("vault action allowed"),
+                "vault allow reason should reflect dedicated vault policy"
+            );
+        }
     }
 
     #[test]

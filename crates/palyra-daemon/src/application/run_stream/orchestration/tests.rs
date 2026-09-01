@@ -2970,6 +2970,64 @@ fn incomplete_terminal_final_answer_allows_concrete_summary_after_action_tool() 
 }
 
 #[test]
+fn incomplete_terminal_final_answer_keeps_success_evidence_after_context_recovery() {
+    let mut state =
+        loop_state_after_tool("Create fixtures/notes-api and run tests.", "palyra.fs.apply_patch");
+    state.replace_messages(vec![ProviderMessage::user_text(
+        "Recovered compact context: finish the existing task.".to_owned(),
+    )]);
+
+    assert!(incomplete_terminal_final_answer(
+        Some("I created the files and summarized the completed implementation."),
+        &state,
+    )
+    .is_none());
+}
+
+#[test]
+fn incomplete_terminal_final_answer_rejects_claim_after_failed_action_tool() {
+    let mut failed_state = AgentRunLoopState::new(
+        vec![ProviderMessage::user_text("Create fixtures/notes-api.")],
+        4,
+        8,
+        10_000,
+    );
+    failed_state.set_direct_user_input("Create fixtures/notes-api.");
+    failed_state.append_assistant_turn(&ProviderTurnOutput {
+        full_text: String::new(),
+        content_parts: vec![ProviderOutputContentPart::ToolCall {
+            proposal_id: "toolu_failed_01".to_owned(),
+            tool_name: "palyra.fs.apply_patch".to_owned(),
+            input_json: json!({}),
+        }],
+        finish_reason: ProviderFinishReason::ToolCalls,
+        usage: ProviderUsage::new(0, 0, "test"),
+        raw_provider_refs: ProviderRawProviderRefs::default(),
+        redaction_state: Default::default(),
+    });
+    failed_state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+        "toolu_failed_01",
+        r#"{"success":false,"error":"patch rejected"}"#,
+    )]);
+
+    let message =
+        incomplete_terminal_final_answer(Some("I created the requested files."), &failed_state)
+            .expect("a failed action must not satisfy final-answer evidence");
+
+    assert!(message.contains("without matching tool evidence"));
+}
+
+#[test]
+fn incomplete_terminal_final_answer_accepts_successful_exec_alias_test_evidence() {
+    let state = loop_state_after_tool(
+        "Run the test suite and summarize it.",
+        crate::gateway::PROCESS_RUNNER_ALIAS_TOOL_NAME,
+    );
+
+    assert!(incomplete_terminal_final_answer(Some("Tests passed."), &state).is_none());
+}
+
+#[test]
 fn incomplete_terminal_final_answer_allows_read_claim_after_read_tool() {
     let state = loop_state_after_tool("Read README.md and summarize it.", "palyra.fs.read_file");
 

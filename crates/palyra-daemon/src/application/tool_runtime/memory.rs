@@ -36,14 +36,15 @@ use crate::{
     agents::AgentResolveRequest,
     application::{
         memory::{
-            classify_memory_write, enforce_memory_item_scope, lifecycle_item_write_category,
-            lifecycle_tags, memory_item_delete_channel, normalize_lifecycle_content,
-            redact_memory_text_for_output, reflect_memory_candidates, ttl_unix_ms_from_input,
-            MemoryLifecycleProvider, MemoryLifecycleRetainOutcome, MemoryLifecycleRetainRequest,
-            MemoryLifecycleScope, MemoryLifecycleStatus, MemoryReflectionCategory,
-            MemoryReflectionOutcome, MemoryReflectionRequest, MemoryWriteApprovalState,
-            MemoryWriteCategory, MemoryWriteClassificationInput, MEMORY_CONTEXT_FENCE_VERSION,
-            MEMORY_TRUST_LABEL_RETRIEVED,
+            classify_memory_write, delete_workspace_memory_document_by_id,
+            enforce_memory_item_scope, enforce_workspace_document_mutation_scope,
+            lifecycle_item_write_category, lifecycle_tags, memory_item_delete_channel,
+            normalize_lifecycle_content, redact_memory_text_for_output, reflect_memory_candidates,
+            ttl_unix_ms_from_input, MemoryLifecycleProvider, MemoryLifecycleRetainOutcome,
+            MemoryLifecycleRetainRequest, MemoryLifecycleScope, MemoryLifecycleStatus,
+            MemoryReflectionCategory, MemoryReflectionOutcome, MemoryReflectionRequest,
+            MemoryWriteApprovalState, MemoryWriteCategory, MemoryWriteClassificationInput,
+            MEMORY_CONTEXT_FENCE_VERSION, MEMORY_TRUST_LABEL_RETRIEVED,
         },
         recall::{preview_recall, RecallPreviewEnvelope, RecallRequest},
         service_authorization::authorize_memory_action,
@@ -64,8 +65,8 @@ use crate::{
         MemorySearchHit, MemorySearchRequest, MemorySource, OrchestratorSessionRecord,
         SearchAnchor, SessionSearchEvent, SessionSearchLineage, SessionSearchOperationV2,
         SessionSearchOutcomeV2, SessionSearchRequestV2, SessionSearchRunRef,
-        WorkspaceDocumentDeleteRequest, WorkspaceDocumentRecord, WorkspaceDocumentWriteRequest,
-        WorkspaceSearchHit, WorkspaceSearchRequest, SESSION_SEARCH_V2_SCHEMA_VERSION,
+        WorkspaceDocumentRecord, WorkspaceDocumentWriteRequest, WorkspaceSearchHit,
+        WorkspaceSearchRequest, SESSION_SEARCH_V2_SCHEMA_VERSION,
     },
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
     transport::grpc::auth::RequestContext,
@@ -1767,72 +1768,18 @@ async fn maybe_delete_workspace_document_by_id(
     input_json: &[u8],
     document_id: &str,
 ) -> Option<ToolExecutionOutcome> {
-    let document = match runtime_state
-        .workspace_document_by_id(
-            context.principal.to_owned(),
-            None,
-            None,
-            document_id.to_owned(),
-            false,
-        )
-        .await
-    {
-        Ok(Some(document)) => document,
-        Ok(None) => return None,
-        Err(error) => {
-            return Some(memory_tool_execution_outcome(
-                namespace,
-                proposal_id,
-                input_json,
-                false,
-                b"{}".to_vec(),
-                format!(
-                    "palyra.memory.delete failed to inspect workspace document: {}",
-                    error.message()
-                ),
-            ));
-        }
-    };
-    if let Err(error) = enforce_workspace_document_mutation_scope(
-        &document,
+    let deleted_document = match delete_workspace_memory_document_by_id(
+        runtime_state,
         context.principal,
         context.channel,
         None,
-    ) {
-        return Some(memory_tool_execution_outcome(
-            namespace,
-            proposal_id,
-            input_json,
-            false,
-            b"{}".to_vec(),
-            format!("palyra.memory.delete {}", error.message()),
-        ));
-    }
-    if let Err(error) = authorize_memory_action(
-        context.principal,
-        "memory.delete",
-        format!("memory:workspace_document:{}", document.document_id).as_str(),
-    ) {
-        return Some(memory_tool_execution_outcome(
-            namespace,
-            proposal_id,
-            input_json,
-            false,
-            b"{}".to_vec(),
-            format!("palyra.memory.delete {}", error.message()),
-        ));
-    }
-    let deleted_document = match runtime_state
-        .soft_delete_workspace_document(WorkspaceDocumentDeleteRequest {
-            principal: document.principal.clone(),
-            channel: document.channel.clone(),
-            agent_id: document.agent_id.clone(),
-            session_id: Some(context.session_id.to_owned()),
-            path: document.path.clone(),
-        })
-        .await
+        Some(context.session_id),
+        document_id,
+    )
+    .await
     {
-        Ok(document) => document,
+        Ok(Some(document)) => document,
+        Ok(None) => return None,
         Err(error) => {
             return Some(memory_tool_execution_outcome(
                 namespace,
@@ -2366,49 +2313,6 @@ fn is_workspace_memory_document_path(path: &str) -> bool {
         || path.strip_prefix("projects/").is_some_and(|project_path| {
             project_path.contains('/') && project_path.ends_with("/MEMORY.md")
         })
-}
-
-#[allow(clippy::result_large_err)]
-fn enforce_workspace_document_mutation_scope(
-    document: &WorkspaceDocumentRecord,
-    principal: &str,
-    channel: Option<&str>,
-    requested_agent_id: Option<&str>,
-) -> Result<(), Status> {
-    if document.principal != principal {
-        return Err(Status::permission_denied(
-            "workspace document principal does not match context",
-        ));
-    }
-    match (channel, document.channel.as_deref()) {
-        (Some(context_channel), Some(document_channel)) if context_channel != document_channel => {
-            return Err(Status::permission_denied(
-                "workspace document channel does not match context",
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(Status::permission_denied(
-                "workspace document is channel-scoped and requires authenticated channel context",
-            ));
-        }
-        _ => {}
-    }
-    match (requested_agent_id, document.agent_id.as_deref()) {
-        (Some(requested_agent_id), Some(document_agent_id))
-            if requested_agent_id != document_agent_id =>
-        {
-            return Err(Status::permission_denied(
-                "workspace document agent_id does not match request",
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(Status::permission_denied(
-                "workspace document is agent-scoped and requires matching agent_id",
-            ));
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 fn workspace_memory_replace_payload(

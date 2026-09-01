@@ -1183,7 +1183,7 @@ pub fn built_in_delegation_catalog() -> DelegationCatalog {
             DelegationRole::Research,
             &["palyra.http.fetch"],
             DelegationMemoryScopeKind::ParentSessionAndWorkspace,
-            1_800,
+            24_000,
             DelegationExecutionMode::Parallel,
             DelegationMergeStrategy::Summarize,
             false,
@@ -1195,7 +1195,7 @@ pub fn built_in_delegation_catalog() -> DelegationCatalog {
             DelegationRole::Synthesis,
             &[],
             DelegationMemoryScopeKind::ParentSession,
-            1_600,
+            24_000,
             DelegationExecutionMode::Serial,
             DelegationMergeStrategy::Summarize,
             false,
@@ -1207,7 +1207,7 @@ pub fn built_in_delegation_catalog() -> DelegationCatalog {
             DelegationRole::Review,
             &["palyra.http.fetch"],
             DelegationMemoryScopeKind::ParentSessionAndWorkspace,
-            2_200,
+            32_000,
             DelegationExecutionMode::Parallel,
             DelegationMergeStrategy::Triage,
             false,
@@ -1219,7 +1219,7 @@ pub fn built_in_delegation_catalog() -> DelegationCatalog {
             DelegationRole::Patching,
             &["palyra.fs.apply_patch", "palyra.http.fetch"],
             DelegationMemoryScopeKind::ParentSessionAndWorkspace,
-            2_600,
+            32_000,
             DelegationExecutionMode::Serial,
             DelegationMergeStrategy::PatchReview,
             true,
@@ -1231,7 +1231,7 @@ pub fn built_in_delegation_catalog() -> DelegationCatalog {
             DelegationRole::Triage,
             &["palyra.http.fetch"],
             DelegationMemoryScopeKind::ParentSession,
-            1_400,
+            24_000,
             DelegationExecutionMode::Parallel,
             DelegationMergeStrategy::Triage,
             false,
@@ -1796,8 +1796,12 @@ mod tests {
             parent_model_profile: Some("provider-runtime-model".to_owned()),
             parent_tool_allowlist: vec!["palyra.http.fetch".to_owned()],
             parent_skill_allowlist: vec!["repo.read".to_owned()],
-            parent_budget_tokens: Some(2_400),
+            parent_budget_tokens: Some(32_000),
         }
+    }
+
+    fn budget_constrained_parent_context() -> DelegationParentContext {
+        DelegationParentContext { parent_budget_tokens: Some(2_400), ..parent_context() }
     }
 
     #[test]
@@ -1987,7 +1991,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            &parent_context(),
+            &budget_constrained_parent_context(),
         )
         .expect("safe runtime overrides should resolve");
 
@@ -2009,7 +2013,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            &parent_context(),
+            &budget_constrained_parent_context(),
         )
         .expect_err("child budget override above parent ceiling should fail");
         assert!(error.message().contains("delegation budget_tokens exceeds"));
@@ -2048,7 +2052,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            &parent_context(),
+            &budget_constrained_parent_context(),
         )
         .expect_err("budget above the configured parent share should fail");
 

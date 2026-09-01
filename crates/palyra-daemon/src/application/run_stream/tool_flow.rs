@@ -3838,6 +3838,7 @@ async fn project_prepared_tool_execution_outcome(
     {
         warn!(error = %error, "fail-open tool-result projection observer hook failed");
     }
+    synchronize_parent_tape_sequence(runtime_state, run_id, tape_seq).await?;
     append_tool_result_replay_safety_tape_event(runtime_state, run_id, tape_seq, &replay_safety)
         .await?;
     if let Some(report) = projected.middleware_report.as_ref() {
@@ -3892,6 +3893,9 @@ async fn commit_and_publish_projected_tool_execution_outcome(
     )
     .await
     .map_err(ToolOutcomeFinalizationError::BeforeSettlement)?;
+    synchronize_parent_tape_sequence(runtime_state, run_id, tape_seq)
+        .await
+        .map_err(ToolOutcomeFinalizationError::BeforeSettlement)?;
     let transition_is_atomic =
         side_effect_fence.is_some() && !execution_outcome.attestation.timed_out;
     if transition_is_atomic {
@@ -3993,12 +3997,25 @@ async fn commit_and_publish_projected_tool_execution_outcome(
     )
     .await
     .map_err(ToolOutcomeFinalizationError::AfterSettlement)?;
+    synchronize_parent_tape_sequence(runtime_state, run_id, tape_seq)
+        .await
+        .map_err(ToolOutcomeFinalizationError::AfterSettlement)?;
     Ok(RunStreamToolExecutionOutcome::Completed {
         proposal_id: prepared.proposal_id.clone(),
         tool_name: prepared.tool_name.clone(),
         input_json: prepared.input_json.clone(),
         outcome: execution_outcome,
     })
+}
+
+async fn synchronize_parent_tape_sequence(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+) -> Result<(), Status> {
+    let durable_next = runtime_state.next_orchestrator_tape_sequence(run_id.to_owned()).await?;
+    *tape_seq = (*tape_seq).max(durable_next);
+    Ok(())
 }
 
 fn sessions_yield_suspended(tool_name: &str, outcome: &ToolExecutionOutcome) -> bool {
@@ -5810,7 +5827,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_v2_commit_failure_marks_successful_mutation_effect_unknown() {
+    async fn ordinary_v2_commit_synchronizes_after_subsystem_tape_append() {
         let state = test_runtime_state();
         let session_id = "session_v2_commit_failure";
         let run_id = "run_v2_commit_failure";
@@ -5851,9 +5868,9 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(super::ToolOutcomeFinalizationError::BeforeSettlement(_))));
+        assert!(result.is_ok(), "the parent sequence should advance past subsystem tape rows");
         assert_eq!(retention_count, 1, "the projection must be retained exactly once");
-        assert_tool_fence_state(&state, &fence, SideEffectFenceState::EffectUnknown);
+        assert_tool_fence_is_observed(&state, &fence);
     }
 
     #[test]

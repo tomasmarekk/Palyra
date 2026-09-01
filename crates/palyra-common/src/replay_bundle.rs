@@ -1325,13 +1325,29 @@ fn string_contains_unredacted_secret(raw: &str, key_context: Option<&str>) -> bo
         "x-amz-signature=",
         "x-goog-signature=",
     ] {
-        if lowered.contains(marker) {
+        if assignment_marker_has_value(lowered.as_str(), marker) {
             return true;
         }
     }
     // URLs with a userinfo component embed credentials in the authority part; a bare
     // "://@" means the userinfo was already emptied and is safe.
     lowered.contains("://") && lowered.contains('@') && !lowered.contains("://@")
+}
+
+fn assignment_marker_has_value(raw: &str, marker: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(relative_index) = raw[offset..].find(marker) {
+        let value_start = offset.saturating_add(relative_index).saturating_add(marker.len());
+        let value = raw[value_start..].split(['\r', '\n']).next().unwrap_or_default().trim();
+        if !matches!(value, "" | "\"\"" | "''") {
+            return true;
+        }
+        offset = value_start;
+        if offset >= raw.len() {
+            break;
+        }
+    }
+    false
 }
 
 fn compare_usize(
@@ -1652,6 +1668,24 @@ mod tests {
         let report = validate_replay_bundle(&bundle);
         assert!(!report.valid);
         assert!(report.issues.iter().any(|issue| issue.path.contains("token")));
+    }
+
+    #[test]
+    fn validator_accepts_empty_secret_assignments_in_example_text() {
+        assert!(!string_contains_unredacted_secret(
+            "# Populate this locally.\nAPP_API_TOKEN=\nPASSWORD=\"\"\nCLIENT_SECRET=''\n",
+            None
+        ));
+    }
+
+    #[test]
+    fn validator_rejects_non_empty_secret_assignments_in_multiline_text() {
+        assert!(string_contains_unredacted_secret(
+            "APP_API_TOKEN=\nSAFE=true\nCLIENT_SECRET=must-not-leak\n",
+            None
+        ));
+        assert!(string_contains_unredacted_secret(r#"APP_API_TOKEN=""must-not-leak"#, None));
+        assert!(string_contains_unredacted_secret(r#"PASSWORD=''must-not-leak"#, None));
     }
 
     #[test]

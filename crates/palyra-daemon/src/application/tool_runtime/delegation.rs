@@ -1740,7 +1740,7 @@ mod tests {
 
         let snapshot = resolve_delegation_request(
             &delegation_request_for_spawn(&request, &[]),
-            &test_parent_context(Some(2_000)),
+            &test_parent_context(Some(48_000)),
         )
         .expect("explicit no-tool delegation should resolve");
         assert!(snapshot.tool_allowlist.is_empty());
@@ -1796,7 +1796,7 @@ mod tests {
         )
         .expect("omitted optional limits should resolve for a tool-free child");
 
-        assert_eq!(snapshot.budget_tokens, 1_800);
+        assert_eq!(snapshot.budget_tokens, 24_000);
         assert!(snapshot.tool_allowlist.is_empty());
 
         let input = serde_json::from_value::<DelegationToolInput>(serde_json::json!({

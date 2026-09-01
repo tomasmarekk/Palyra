@@ -1098,7 +1098,7 @@ impl Default for MemoryRuntimeConfig {
         Self {
             max_item_bytes: MAX_MEMORY_ITEM_BYTES,
             max_item_tokens: MAX_MEMORY_ITEM_TOKENS,
-            auto_inject_enabled: false,
+            auto_inject_enabled: true,
             auto_inject_max_items: 3,
             default_ttl_ms: Some(30 * 24 * 60 * 60 * 1_000),
             retention_max_entries: None,
@@ -13476,6 +13476,23 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("orchestrator tape worker panicked"))??;
         self.counters.orchestrator_tape_events.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Loads the next free durable tape sequence after subsystem-owned appends.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn next_orchestrator_tape_sequence(
+        self: &Arc<Self>,
+        run_id: String,
+    ) -> Result<i64, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .next_orchestrator_tape_sequence(run_id.as_str())
+                .map_err(|error| map_orchestrator_store_error("load next tape sequence", error))
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator tape sequence worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

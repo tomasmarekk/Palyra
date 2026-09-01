@@ -38,6 +38,7 @@ use palyra_common::{
     workspace_patch::WorkspacePatchRedactionPolicy,
 };
 use palyra_model_providers::retry_provider_classification;
+use palyra_vault::VaultScope;
 use reqwest::Url;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -48,6 +49,7 @@ use tokio::{
 use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 
 use crate::agents::{AgentBindingRequest, AgentCreateRequest};
+use crate::application::memory::delete_workspace_memory_document_by_id;
 use crate::application::turn_control::{
     ControlActivePhase, TurnControlOperation, TurnControlRequest,
 };
@@ -160,6 +162,99 @@ fn common_tool_dispatch_future_stays_within_bounded_worker_stack_budget() {
     assert!(
         future_bytes <= MAX_COMMON_TOOL_DISPATCH_FUTURE_BYTES,
         "common tool dispatch future is {future_bytes} bytes; isolate large runtime branches behind pinned heap futures"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vault_metadata_tool_confirms_exact_reference_without_secret_value() {
+    let state = build_test_runtime_state(false);
+    let secret_value = b"vault-metadata-secret-canary".to_vec();
+    state
+        .vault_put_secret(
+            VaultScope::Global,
+            "vault_metadata_test_key".to_owned(),
+            secret_value.clone(),
+        )
+        .await
+        .expect("test secret should be stored");
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-vault-metadata",
+            run_id: "run-vault-metadata",
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-vault-metadata",
+        super::VAULT_METADATA_TOOL_NAME,
+        br#"{"scope":"global","key":"vault_metadata_test_key"}"#,
+        None,
+    )
+    .await;
+
+    assert!(outcome.success, "metadata lookup should succeed: {}", outcome.error);
+    let output: Value =
+        serde_json::from_slice(outcome.output_json.as_slice()).expect("output should be JSON");
+    assert_eq!(output["exists"], true);
+    assert_eq!(output["metadata"]["value_bytes"], secret_value.len());
+    assert_eq!(output["secret_value_included"], false);
+    assert!(
+        !String::from_utf8_lossy(outcome.output_json.as_slice()).contains("secret-canary"),
+        "metadata output must never include secret bytes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exact_project_memory_document_id_supports_cli_delete_fallback() {
+    let state = build_test_runtime_state(false);
+    let document = state
+        .upsert_workspace_document(WorkspaceDocumentWriteRequest {
+            document_id: None,
+            principal: "user:ops".to_owned(),
+            channel: Some("cli".to_owned()),
+            agent_id: None,
+            session_id: Some("session-project-memory-delete".to_owned()),
+            path: "projects/project-a/MEMORY.md".to_owned(),
+            title: Some("Project Memory".to_owned()),
+            content_text: "Project-scoped deletion canary.".to_owned(),
+            template_id: None,
+            template_version: None,
+            template_content_hash: None,
+            source_memory_id: None,
+            manual_override: false,
+        })
+        .await
+        .expect("project memory document should be stored");
+
+    let deleted = delete_workspace_memory_document_by_id(
+        &state,
+        "user:ops",
+        Some("cli"),
+        None,
+        None,
+        document.document_id.as_str(),
+    )
+    .await
+    .expect("exact project document deletion should execute")
+    .expect("exact project document should be deleted");
+
+    assert_eq!(deleted.document_id, document.document_id);
+    assert!(
+        state
+            .workspace_document_by_id(
+                "user:ops".to_owned(),
+                None,
+                None,
+                document.document_id,
+                false,
+            )
+            .await
+            .expect("post-delete lookup should execute")
+            .is_none(),
+        "soft-deleted project memory must disappear from active lookups"
     );
 }
 
@@ -5083,11 +5178,11 @@ async fn memory_auto_inject_searches_current_scope_without_cross_session_or_chan
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn default_memory_auto_inject_does_not_add_manual_memory_to_fresh_session_prompt() {
+async fn default_memory_auto_inject_adds_scoped_manual_memory_to_fresh_session_prompt() {
     let state = build_test_runtime_state(false);
     assert!(
-        !state.memory_config_snapshot().auto_inject_enabled,
-        "manual/import memory auto-inject must be disabled until the operator opts in"
+        state.memory_config_snapshot().auto_inject_enabled,
+        "curated durable memory should be available to ordinary agent runs by default"
     );
 
     let context = RequestContext {
@@ -5102,7 +5197,7 @@ async fn default_memory_auto_inject_does_not_add_manual_memory_to_fresh_session_
         .start_orchestrator_run(OrchestratorRunStartRequest {
             run_id: current_run_id.to_owned(),
             session_id: current_session_id.to_owned(),
-            origin_kind: "memory_auto_inject_default_disabled_test".to_owned(),
+            origin_kind: "memory_auto_inject_default_enabled_test".to_owned(),
             origin_run_id: None,
             triggered_by_principal: Some(context.principal.clone()),
             parameter_delta_json: None,
@@ -5126,7 +5221,7 @@ async fn default_memory_auto_inject_does_not_add_manual_memory_to_fresh_session_
             ttl_unix_ms: None,
         })
         .await
-        .expect("manual memory ingest should seed the opt-in boundary regression");
+        .expect("manual memory ingest should seed the default recall regression");
 
     let mut tape_seq = 1_i64;
     let prepared = prepare_model_provider_input(
@@ -5144,29 +5239,29 @@ async fn default_memory_auto_inject_does_not_add_manual_memory_to_fresh_session_
             provider_kind_hint: None,
             provider_model_id_hint: None,
             tool_catalog_snapshot: None,
-            memory_ingest_reason: "memory_auto_inject_default_disabled_test",
+            memory_ingest_reason: "memory_auto_inject_default_enabled_test",
             memory_prompt_failure_mode: MemoryPromptFailureMode::Fail,
             channel_for_log: "cli",
         },
     )
     .await
-    .expect("provider input preparation should succeed with auto-inject disabled by default");
+    .expect("provider input preparation should succeed with auto-inject enabled by default");
 
     assert!(
-        !prepared.provider_input_text.contains("<memory_context"),
-        "fresh-session provider input must not include durable memory without opt-in: {}",
+        prepared.provider_input_text.contains("<memory_context"),
+        "fresh-session provider input should include matching scoped durable memory: {}",
         prepared.provider_input_text
     );
     assert!(
-        !prepared.provider_input_text.contains("TypeScript, Playwright, and concise reports"),
-        "stored manual memory must not cross into a fresh provider prompt by default: {}",
+        prepared.provider_input_text.contains("TypeScript, Playwright, and concise reports"),
+        "matching principal/channel memory should carry into a fresh provider prompt: {}",
         prepared.provider_input_text
     );
     let tape =
         state.journal_store.orchestrator_tape(current_run_id).expect("test tape should load");
     assert!(
-        tape.iter().all(|event| event.event_type != "memory_auto_inject"),
-        "disabled auto-inject must not append a memory_auto_inject tape event"
+        tape.iter().any(|event| event.event_type == "memory_auto_inject"),
+        "default auto-inject must append auditable tape evidence"
     );
 }
 

@@ -8408,7 +8408,6 @@ fn incomplete_terminal_final_answer(
     text: Option<&str>,
     loop_state: &AgentRunLoopState,
 ) -> Option<String> {
-    let messages = loop_state.messages();
     if loop_state.completed_tool_calls() == 0 {
         return incomplete_final_answer_without_tools(text, loop_state.direct_user_input());
     }
@@ -8433,7 +8432,7 @@ fn incomplete_terminal_final_answer(
         );
     }
     if final_answer_claims_tool_work_without_evidence(text)
-        && !final_answer_has_matching_tool_evidence(text, messages.as_slice())
+        && !final_answer_has_matching_tool_evidence(text, loop_state)
     {
         return Some(
             "model claimed file, process, browser, or verification work without matching tool evidence"
@@ -8595,35 +8594,21 @@ fn exact_answer_marker_is_negated(prefix: &str) -> bool {
         || prefix.ends_with("not")
 }
 
-fn has_action_tool_evidence(messages: &[ProviderMessage]) -> bool {
-    messages.iter().flat_map(|message| message.tool_calls.iter()).any(|call| {
-        !matches!(
-            call.tool_name.as_str(),
-            "palyra.fs.list_dir"
-                | "palyra.fs.read_file"
-                | "palyra.fs.search"
-                | "palyra.memory.status"
-                | "palyra.context.inspect"
-                | "palyra.memory.search"
-                | "palyra.memory.recall"
-        )
-    })
-}
-
-fn final_answer_has_matching_tool_evidence(text: &str, messages: &[ProviderMessage]) -> bool {
+fn final_answer_has_matching_tool_evidence(text: &str, loop_state: &AgentRunLoopState) -> bool {
     let normalized = normalize_final_answer_text(text);
     if normalized.contains("i read the file") {
-        return has_tool_name(messages, "palyra.fs.read_file");
+        return loop_state.has_successful_tool("palyra.fs.read_file");
     }
     if normalized.contains("i navigated") || normalized.contains("i opened the browser") {
-        return has_tool_name_prefix(messages, "palyra.browser.");
+        return loop_state.has_successful_tool_prefix("palyra.browser.");
     }
     if normalized.contains("i ran the test")
         || normalized.contains("i ran tests")
         || normalized.contains("test passed")
         || normalized.contains("tests passed")
     {
-        return has_tool_name(messages, "palyra.process.run");
+        return loop_state.has_successful_tool("palyra.process.run")
+            || loop_state.has_successful_tool(crate::gateway::PROCESS_RUNNER_ALIAS_TOOL_NAME);
     }
     if normalized.contains("i applied the patch")
         || normalized.contains("i created")
@@ -8634,23 +8619,9 @@ fn final_answer_has_matching_tool_evidence(text: &str, messages: &[ProviderMessa
         || normalized.contains("i updated")
         || normalized.contains("i wrote")
     {
-        return has_tool_name(messages, "palyra.fs.apply_patch");
+        return loop_state.has_successful_tool("palyra.fs.apply_patch");
     }
-    has_action_tool_evidence(messages)
-}
-
-fn has_tool_name(messages: &[ProviderMessage], tool_name: &str) -> bool {
-    messages
-        .iter()
-        .flat_map(|message| message.tool_calls.iter())
-        .any(|call| call.tool_name == tool_name)
-}
-
-fn has_tool_name_prefix(messages: &[ProviderMessage], prefix: &str) -> bool {
-    messages
-        .iter()
-        .flat_map(|message| message.tool_calls.iter())
-        .any(|call| call.tool_name.starts_with(prefix))
+    loop_state.has_successful_action_tool()
 }
 
 // Heuristic phrase tables backing the incomplete-final-answer guards. They
@@ -8661,6 +8632,7 @@ const UNSUPPORTED_TOOL_WORK_CLAIMS: &[&str] = &[
     "i applied the patch",
     "i created the file",
     "i created files",
+    "i created the requested",
     "i edited the file",
     "i fixed the file",
     "i implemented",

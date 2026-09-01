@@ -14559,6 +14559,18 @@ impl JournalStore {
         self.append_orchestrator_tape_event_with_runtime_projection(request, None).map(|_| ())
     }
 
+    /// Returns the next free tape sequence for a run.
+    ///
+    /// This is used by the active run loop after a tool invokes a subsystem
+    /// that appends its own durable events to the same parent tape.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the journal lock or sequence query fails.
+    pub fn next_orchestrator_tape_sequence(&self, run_id: &str) -> Result<i64, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        next_orchestrator_tape_seq(&guard, run_id)
+    }
+
     /// Atomically appends one tape event and its optional generation-aware projection.
     ///
     /// The projection is checked and sequenced in the same transaction as the
@@ -21782,6 +21794,21 @@ impl JournalStore {
                 now,
             ],
         )?;
+        if next_status == "dismissed" {
+            transaction.execute(
+                r#"
+                    UPDATE commitment_delivery_attempts
+                    SET
+                        status = 'cancelled',
+                        reason = 'commitment dismissed before delivery',
+                        result_json = '{"outcome":"cancelled","reason":"commitment_dismissed"}',
+                        updated_at_unix_ms = ?2
+                    WHERE commitment_ulid = ?1
+                      AND status IN ('queued', 'pending', 'retry_queued')
+                "#,
+                params![request.commitment_id, now],
+            )?;
+        }
         insert_commitment_event(
             &transaction,
             CommitmentEventInsert {
@@ -50186,6 +50213,35 @@ mod tests {
                 .len(),
             1
         );
+        store
+            .update_commitment(&CommitmentUpdateRequest {
+                commitment_id: "commitment-1".to_owned(),
+                expected_status: Some("approved".to_owned()),
+                status: Some("dismissed".to_owned()),
+                user_wording: None,
+                normalized_action: None,
+                due_condition_json: None,
+                recurrence_json: None,
+                channel_binding_json: None,
+                approval_requirement: None,
+                privacy_label: None,
+                review_reason: None,
+                scheduler_binding_json: None,
+                due_at_unix_ms: None,
+                scheduled_at_unix_ms: None,
+                completed_at_unix_ms: Some(Some(1_730_000_000_000)),
+                actor_principal: "user:ops".to_owned(),
+                event_type: "commitment.dismissed".to_owned(),
+                summary: "dismissed".to_owned(),
+                payload_json: r#"{"status":"dismissed"}"#.to_owned(),
+            })
+            .expect("commitment should dismiss");
+        let attempts = store
+            .list_commitment_delivery_attempts("commitment-1", 10)
+            .expect("attempts should list after dismissal");
+        assert_eq!(attempts[0].status, "cancelled");
+        assert_eq!(attempts[0].reason, "commitment dismissed before delivery");
+        assert!(attempts[0].result_json.contains("commitment_dismissed"));
     }
 
     #[test]
@@ -53687,6 +53743,12 @@ mod tests {
         store
             .append_orchestrator_tape_event(&first_tape_request)
             .expect("first tape sequence should succeed");
+        assert_eq!(
+            store
+                .next_orchestrator_tape_sequence("01ARZ3NDEKTSV4RRFFQ69G5FAX")
+                .expect("next tape sequence should load"),
+            8
+        );
         let duplicate_tape = store
             .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),

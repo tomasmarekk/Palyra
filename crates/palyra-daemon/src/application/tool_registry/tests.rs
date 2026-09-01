@@ -2004,6 +2004,16 @@ fn memory_status_schema_exposes_capacity_without_mutation() {
 }
 
 #[test]
+fn vault_metadata_schema_requires_an_exact_reference_without_value_access() {
+    let entry = registry_entry("palyra.vault.metadata").expect("vault metadata tool entry");
+
+    assert_eq!(entry.input_schema["required"], serde_json::json!(["scope", "key"]));
+    assert_eq!(entry.input_schema["additionalProperties"], false);
+    assert!(entry.description.contains("Never returns"));
+    assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::ReadOnly);
+}
+
+#[test]
 fn memory_retain_schema_explains_principal_scope_for_corrections() {
     let entry = registry_entry("palyra.memory.retain").expect("retain tool entry");
     let alias = registry_entry("palyra.retain").expect("retain alias tool entry");

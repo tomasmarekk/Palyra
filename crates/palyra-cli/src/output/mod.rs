@@ -375,7 +375,7 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     if lower.contains("policy") || lower.contains("approval required") || lower.contains("denied") {
         return CliExitCode::Policy;
     }
-    if lower.contains("not found") {
+    if lower.contains("not found") || lower.contains("_not_found") {
         return CliExitCode::NotFound;
     }
     if lower.contains("invalid")
@@ -711,6 +711,14 @@ mod tests {
         .context("failed to call ResolveSession");
 
         assert_eq!(classify_error(&error), CliExitCode::NotFound);
+    }
+
+    #[test]
+    fn classify_error_maps_stable_not_found_reason_codes() {
+        assert_eq!(
+            classify_error(&anyhow!("browser session lookup failed: session_not_found")),
+            CliExitCode::NotFound
+        );
     }
 
     #[test]

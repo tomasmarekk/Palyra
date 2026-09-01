@@ -143,14 +143,16 @@ fn run_verification_tape_evidence_from_records(
             crate::gateway::WORKSPACE_PATCH_TOOL_NAME => {
                 collect_observed_patch_mutation(&payload, evidence_refs.as_slice(), &mut activity);
             }
-            "palyra.process.run" => collect_observed_process_attempt(
-                proposal_id,
-                proposal,
-                &payload,
-                executed_at_by_proposal.get(proposal_id).copied().unwrap_or_default(),
-                evidence_refs,
-                &mut activity,
-            ),
+            "palyra.process.run" | crate::gateway::PROCESS_RUNNER_ALIAS_TOOL_NAME => {
+                collect_observed_process_attempt(
+                    proposal_id,
+                    proposal,
+                    &payload,
+                    executed_at_by_proposal.get(proposal_id).copied().unwrap_or_default(),
+                    evidence_refs,
+                    &mut activity,
+                )
+            }
             _ => {}
         }
     }
@@ -459,6 +461,52 @@ mod tests {
             Some("verification.finalizer.rollout_disabled_with_observed_mutation")
         );
         assert!(summary.final_answer_allowed);
+    }
+
+    #[test]
+    fn tape_fallback_reports_process_activity_from_exec_alias() {
+        let records = vec![
+            OrchestratorTapeRecord {
+                seq: 1,
+                event_type: "tool_proposal".to_owned(),
+                payload_json: json!({
+                    "proposal_id": "exec-1",
+                    "tool_name": crate::gateway::PROCESS_RUNNER_ALIAS_TOOL_NAME,
+                    "input_json": {
+                        "command": "npm",
+                        "args": ["test"]
+                    },
+                    "approval_required": false,
+                })
+                .to_string(),
+            },
+            OrchestratorTapeRecord {
+                seq: 2,
+                event_type: "tool_result".to_owned(),
+                payload_json: json!({
+                    "proposal_id": "exec-1",
+                    "success": true,
+                    "output_json": {
+                        "summary": json!({
+                            "success": true,
+                            "exit_code": 0
+                        })
+                        .to_string()
+                    },
+                    "error": "",
+                })
+                .to_string(),
+            },
+        ];
+
+        let evidence = run_verification_tape_evidence_from_records(records.as_slice(), true);
+
+        assert_eq!(evidence.observed_tool_activity.commands_executed.len(), 1);
+        assert_eq!(
+            evidence.observed_tool_activity.commands_executed[0].status.as_deref(),
+            Some("passed")
+        );
+        assert!(evidence.observed_tool_activity.commands_executed[0].command.contains("npm test"));
     }
 
     #[test]

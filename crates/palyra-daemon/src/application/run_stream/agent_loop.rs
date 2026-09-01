@@ -842,6 +842,7 @@ pub(crate) struct AgentRunLoopState {
     started_at: Instant,
     current_turn: u32,
     completed_tool_calls: u32,
+    successful_tool_names: BTreeSet<String>,
     usage: AgentLoopUsageSnapshot,
 }
 
@@ -870,6 +871,7 @@ impl AgentRunLoopState {
             started_at: Instant::now(),
             current_turn: 0,
             completed_tool_calls: 0,
+            successful_tool_names: BTreeSet::new(),
             usage: AgentLoopUsageSnapshot::default(),
         }
     }
@@ -905,6 +907,36 @@ impl AgentRunLoopState {
 
     /// Appends tool-result messages and counts them as completed tool calls.
     pub(crate) fn append_tool_result_messages(&mut self, messages: Vec<ProviderMessage>) {
+        let tool_calls_by_id = self
+            .messages
+            .iter()
+            .flat_map(|message| message.tool_calls.iter())
+            .map(|tool_call| {
+                (
+                    tool_call.proposal_id.clone(),
+                    ProviderMessageToolCallRef {
+                        tool_name: tool_call.tool_name.clone(),
+                        input_json: tool_call.input_json.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for message in &messages {
+            if message.role != ProviderMessageRole::Tool {
+                continue;
+            }
+            let Some(tool_call) =
+                message.tool_call_id.as_deref().and_then(|id| tool_calls_by_id.get(id))
+            else {
+                continue;
+            };
+            let Ok(output) = serde_json::from_str::<Value>(message.text_content().as_str()) else {
+                continue;
+            };
+            if model_visible_tool_result_succeeded(&output) {
+                self.successful_tool_names.insert(effective_tool_call_ref(tool_call).tool_name);
+            }
+        }
         let added = messages.len().try_into().unwrap_or(u32::MAX);
         self.completed_tool_calls = self.completed_tool_calls.saturating_add(added);
         self.messages.extend(messages);
@@ -935,6 +967,33 @@ impl AgentRunLoopState {
     /// Number of tool results appended so far in this run.
     pub(crate) fn completed_tool_calls(&self) -> u32 {
         self.completed_tool_calls
+    }
+
+    /// Whether a successful result was recorded for the exact effective tool name.
+    pub(crate) fn has_successful_tool(&self, tool_name: &str) -> bool {
+        self.successful_tool_names.contains(tool_name)
+    }
+
+    /// Whether a successful result was recorded for an effective tool-name prefix.
+    pub(crate) fn has_successful_tool_prefix(&self, prefix: &str) -> bool {
+        self.successful_tool_names.iter().any(|tool_name| tool_name.starts_with(prefix))
+    }
+
+    /// Whether any successful result came from a tool that can perform observable work.
+    pub(crate) fn has_successful_action_tool(&self) -> bool {
+        self.successful_tool_names.iter().any(|tool_name| {
+            !matches!(
+                tool_name.as_str(),
+                "palyra.fs.list_dir"
+                    | "palyra.fs.read_file"
+                    | "palyra.fs.search"
+                    | "palyra.memory.status"
+                    | "palyra.vault.metadata"
+                    | "palyra.context.inspect"
+                    | "palyra.memory.search"
+                    | "palyra.memory.recall"
+            )
+        })
     }
 
     /// Accepts legacy tool-budget sync calls without making them terminal.
@@ -2048,10 +2107,14 @@ fn collect_process_progress(
             let Some(pid) = process_pid(output) else {
                 return;
             };
-            let status = match output.get("alive").and_then(Value::as_bool) {
-                Some(true) => "running",
-                Some(false) => "stopped",
-                None => "status_unknown",
+            if output.get("alive").and_then(Value::as_bool) == Some(false) {
+                process_by_pid.remove(&pid);
+                return;
+            }
+            let status = if output.get("alive").and_then(Value::as_bool) == Some(true) {
+                "running"
+            } else {
+                "status_unknown"
             };
             process_by_pid
                 .entry(pid)
@@ -2068,18 +2131,19 @@ fn collect_process_progress(
             let Some(pid) = process_pid(output) else {
                 return;
             };
-            let status = if output.get("stopped").and_then(Value::as_bool) == Some(true) {
-                "stopped"
-            } else {
-                "stop_attempted_status_unknown"
-            };
+            if output.get("stopped").and_then(Value::as_bool) == Some(true) {
+                process_by_pid.remove(&pid);
+                return;
+            }
             process_by_pid
                 .entry(pid)
-                .and_modify(|process| process.status = status.to_owned())
+                .and_modify(|process| {
+                    process.status = "stop_attempted_status_unknown".to_owned();
+                })
                 .or_insert_with(|| RunProgressProcessSummary {
                     pid,
                     kind: "background".to_owned(),
-                    status: status.to_owned(),
+                    status: "stop_attempted_status_unknown".to_owned(),
                     cleanup: "stop_command_already_attempted".to_owned(),
                     log_artifact: None,
                 });
@@ -3899,6 +3963,66 @@ mod tests {
         assert_eq!(checkpoint.active_processes[0].pid, 12345);
         assert_eq!(checkpoint.active_processes[0].status, "run_owned_background_started");
         assert!(checkpoint.recommended_next_action.contains("background process state"));
+    }
+
+    #[test]
+    fn progress_checkpoint_removes_process_after_confirmed_stop() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Start and stop the dev server")],
+            2,
+            4,
+            10_000,
+        );
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: "call-process".to_owned(),
+                tool_name: PROCESS_RUN_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({
+                    "command": "npm",
+                    "args": ["run", "dev"],
+                    "background": true
+                }),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            "call-process",
+            serde_json::json!({
+                "background": true,
+                "pid": 12345,
+                "process_handle": {"direct_process_pid": 12345}
+            })
+            .to_string(),
+        )]);
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: "stop-process".to_owned(),
+                tool_name: PROCESS_STOP_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({"pid": 12345}),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            "stop-process",
+            serde_json::json!({
+                "stopped": true,
+                "pid": 12345,
+                "process_handle": {"direct_process_pid": 12345}
+            })
+            .to_string(),
+        )]);
+
+        let checkpoint = state.progress_checkpoint("run-01", AgentLoopTerminationReason::WallClock);
+
+        assert!(checkpoint.active_processes.is_empty(), "{checkpoint:#?}");
     }
 
     #[test]

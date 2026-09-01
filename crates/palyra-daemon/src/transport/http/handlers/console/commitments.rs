@@ -385,9 +385,11 @@ async fn update_commitment_status(
     body: ConsoleCommitmentActionRequest,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    let _ = load_authorized_commitment(&state, &session, commitment_id.as_str()).await?;
-    let terminal_at =
-        matches!(status, "dismissed" | "delivered" | "failed").then_some(Some(current_unix_ms()));
+    let existing = load_authorized_commitment(&state, &session, commitment_id.as_str()).await?;
+    let now = current_unix_ms();
+    let terminal_at = matches!(status, "dismissed" | "delivered" | "failed").then_some(Some(now));
+    let scheduler_binding_json =
+        (status == "dismissed").then(|| cancelled_scheduler_binding(&existing, now)).flatten();
     let commitment = state
         .runtime
         .update_commitment(CommitmentUpdateRequest {
@@ -402,7 +404,7 @@ async fn update_commitment_status(
             approval_requirement: None,
             privacy_label: None,
             review_reason: body.reason.clone(),
-            scheduler_binding_json: None,
+            scheduler_binding_json,
             due_at_unix_ms: body.due_at_unix_ms.map(Some),
             scheduled_at_unix_ms: None,
             completed_at_unix_ms: terminal_at,
@@ -414,6 +416,25 @@ async fn update_commitment_status(
         .await
         .map_err(runtime_status_response)?;
     Ok(Json(json!({ "contract": commitment_contract_descriptor(), "commitment": commitment })))
+}
+
+fn cancelled_scheduler_binding(
+    commitment: &CommitmentRecord,
+    cancelled_at_unix_ms: i64,
+) -> Option<String> {
+    let mut binding = serde_json::from_str::<Value>(commitment.scheduler_binding_json.as_str())
+        .ok()?
+        .as_object()
+        .cloned()?;
+    if !binding.contains_key("type") || binding.get("type").and_then(Value::as_str) == Some("none")
+    {
+        return None;
+    }
+    binding.insert("state".to_owned(), Value::String("cancelled".to_owned()));
+    binding.insert("cancelled_at_unix_ms".to_owned(), Value::Number(cancelled_at_unix_ms.into()));
+    binding
+        .insert("cancellation_reason".to_owned(), Value::String("commitment_dismissed".to_owned()));
+    serde_json::to_string(&binding).ok()
 }
 
 async fn load_authorized_commitment(

@@ -1748,8 +1748,8 @@ fn attach_manual_ingest_visibility(payload: &mut Value) {
         "agent_visibility".to_owned(),
         json!({
             "manual_ingest_auto_attached_by_command": false,
-            "auto_inject_default_enabled": false,
-            "normal_agent_run_context": "manual memory ingest stores searchable memory but default agent runs do not attach durable memories automatically; enable auto-inject explicitly or use recall for deterministic preview",
+            "auto_inject_default_enabled": true,
+            "normal_agent_run_context": "manual memory ingest stores searchable durable memory; subsequent default agent runs may attach a small scoped set of relevant curated memories, while explicit recall remains the deterministic preview path",
             "recall_for_prompt_preview": "palyra memory recall <query> --json",
         }),
     );
@@ -2098,7 +2098,7 @@ mod tests {
         );
         assert_eq!(
             payload.pointer("/agent_visibility/auto_inject_default_enabled"),
-            Some(&json!(false))
+            Some(&json!(true))
         );
         assert_eq!(
             payload.pointer("/agent_visibility/recall_for_prompt_preview"),

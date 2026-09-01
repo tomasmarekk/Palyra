@@ -301,6 +301,7 @@ fn builtin_tool_effect(tool_name: &str, input_json: &[u8]) -> Option<BuiltinTool
         | "palyra.mcp.prompts.list"
         | "palyra.mcp.prompts.get"
         | "palyra.memory.status"
+        | "palyra.vault.metadata"
         | "palyra.context.inspect"
         | "palyra.memory.search"
         | "palyra.memory.recall"
