@@ -6906,7 +6906,7 @@ async fn grpc_run_stream_reports_partial_summary_when_provider_timeout_follows_t
             2,
             250,
             250,
-            &[("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "2")],
+            &[("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "3")],
         )?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
