@@ -112,6 +112,7 @@ pub fn select_available_local_runtime_ports(host: &str) -> Result<LocalRuntimePo
         LOCAL_RUNTIME_PORT_RANGE_START,
         LOCAL_RUNTIME_PORT_RANGE_END,
         5,
+        &[],
     )
     .ok_or_else(|| local_runtime_ports_exhausted_message(host, 5))?;
     Ok(LocalRuntimePorts {
@@ -128,9 +129,23 @@ pub fn select_available_local_runtime_ports(host: &str) -> Result<LocalRuntimePo
 /// # Errors
 /// Returns an error message if `host` is not loopback or no free block exists.
 pub fn select_available_gateway_runtime_ports(host: &str) -> Result<GatewayRuntimePorts, String> {
+    select_available_gateway_runtime_ports_excluding(host, &[])
+}
+
+/// Gateway-only port selection that never returns a port reserved by another
+/// service in the same local runtime profile.
+///
+/// # Errors
+/// Returns an error message if `host` is not loopback or no free block exists.
+pub fn select_available_gateway_runtime_ports_excluding(
+    host: &str,
+    excluded_ports: &[u16],
+) -> Result<GatewayRuntimePorts, String> {
     ensure_loopback_host(host)?;
     let defaults = default_gateway_runtime_ports();
-    if reserve_ports(host, &[defaults.admin, defaults.grpc, defaults.quic]).is_ok() {
+    let default_ports = [defaults.admin, defaults.grpc, defaults.quic];
+    if !ports_overlap(&default_ports, excluded_ports) && reserve_ports(host, &default_ports).is_ok()
+    {
         return Ok(defaults);
     }
 
@@ -139,6 +154,7 @@ pub fn select_available_gateway_runtime_ports(host: &str) -> Result<GatewayRunti
         LOCAL_RUNTIME_PORT_RANGE_START,
         LOCAL_RUNTIME_PORT_RANGE_END,
         3,
+        excluded_ports,
     )
     .ok_or_else(|| local_runtime_ports_exhausted_message(host, 3))?;
     Ok(GatewayRuntimePorts { admin: block[0], grpc: block[1], quic: block[2] })
@@ -149,9 +165,23 @@ pub fn select_available_gateway_runtime_ports(host: &str) -> Result<GatewayRunti
 /// # Errors
 /// Returns an error message if `host` is not loopback or no free block exists.
 pub fn select_available_browser_runtime_ports(host: &str) -> Result<BrowserRuntimePorts, String> {
+    select_available_browser_runtime_ports_excluding(host, &[])
+}
+
+/// Browserd-only port selection that never returns a port reserved by another
+/// service in the same local runtime profile.
+///
+/// # Errors
+/// Returns an error message if `host` is not loopback or no free block exists.
+pub fn select_available_browser_runtime_ports_excluding(
+    host: &str,
+    excluded_ports: &[u16],
+) -> Result<BrowserRuntimePorts, String> {
     ensure_loopback_host(host)?;
     let defaults = default_browser_runtime_ports();
-    if reserve_ports(host, &[defaults.health, defaults.grpc]).is_ok() {
+    let default_ports = [defaults.health, defaults.grpc];
+    if !ports_overlap(&default_ports, excluded_ports) && reserve_ports(host, &default_ports).is_ok()
+    {
         return Ok(defaults);
     }
 
@@ -160,6 +190,7 @@ pub fn select_available_browser_runtime_ports(host: &str) -> Result<BrowserRunti
         LOCAL_RUNTIME_PORT_RANGE_START,
         LOCAL_RUNTIME_PORT_RANGE_END,
         2,
+        excluded_ports,
     )
     .ok_or_else(|| local_runtime_ports_exhausted_message(host, 2))?;
     Ok(BrowserRuntimePorts { health: block[0], grpc: block[1] })
@@ -216,6 +247,7 @@ fn select_available_port_block(
     range_start: u16,
     range_end: u16,
     width: u16,
+    excluded_ports: &[u16],
 ) -> Option<Vec<u16>> {
     if width == 0 || range_end < range_start {
         return None;
@@ -226,11 +258,18 @@ fn select_available_port_block(
     }
     for block_start in range_start..=last_start {
         let ports = (0..width).map(|offset| block_start + offset).collect::<Vec<_>>();
+        if ports_overlap(ports.as_slice(), excluded_ports) {
+            continue;
+        }
         if reserve_ports(host, ports.as_slice()).is_ok() {
             return Some(ports);
         }
     }
     None
+}
+
+fn ports_overlap(candidate_ports: &[u16], excluded_ports: &[u16]) -> bool {
+    candidate_ports.iter().any(|candidate| *candidate != 0 && excluded_ports.contains(candidate))
 }
 
 // Binds all ports simultaneously so a block is only reported free when every port in it
@@ -284,8 +323,34 @@ mod tests {
             .expect("test should reserve a loopback port");
         let port = listener.local_addr().expect("listener address").port();
 
-        let selected = select_available_port_block(LOCAL_RUNTIME_LOOPBACK_HOST, port, port, 1);
+        let selected = select_available_port_block(LOCAL_RUNTIME_LOOPBACK_HOST, port, port, 1, &[]);
 
         assert!(selected.is_none(), "reserved port must not be selected");
+    }
+
+    #[test]
+    fn profile_reserved_port_overlap_is_detected_without_binding() {
+        assert!(ports_overlap(&[7144, 7145], &[7142, 7144, 7145]));
+        assert!(!ports_overlap(&[7147, 7148], &[7142, 7144, 7145]));
+    }
+
+    #[test]
+    fn browser_selection_never_reuses_gateway_profile_ports() {
+        let defaults = default_browser_runtime_ports();
+        let gateway_reserved = [
+            defaults.health,
+            defaults.grpc,
+            LOCAL_RUNTIME_PORT_RANGE_START,
+            LOCAL_RUNTIME_PORT_RANGE_START + 1,
+        ];
+
+        let selected = select_available_browser_runtime_ports_excluding(
+            LOCAL_RUNTIME_LOOPBACK_HOST,
+            &gateway_reserved,
+        )
+        .expect("a browser pair outside the reserved gateway set should exist");
+
+        assert!(!gateway_reserved.contains(&selected.health));
+        assert!(!gateway_reserved.contains(&selected.grpc));
     }
 }

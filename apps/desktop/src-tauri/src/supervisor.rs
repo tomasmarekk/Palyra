@@ -1359,9 +1359,10 @@ impl ControlCenter {
                         format_port_availability_summary(unavailable.as_slice())
                     );
                 }
-                let ports =
-                    palyra_common::local_runtime_ports::select_available_gateway_runtime_ports(
+                let ports = palyra_common::local_runtime_ports::
+                    select_available_gateway_runtime_ports_excluding(
                         LOOPBACK_HOST,
+                        self.runtime.browser_bound_ports().as_slice(),
                     )
                     .map_err(anyhow::Error::msg)?;
                 self.runtime.gateway_admin_port = ports.admin;
@@ -1396,9 +1397,10 @@ impl ControlCenter {
                         format_port_availability_summary(unavailable.as_slice())
                     );
                 }
-                let ports =
-                    palyra_common::local_runtime_ports::select_available_browser_runtime_ports(
+                let ports = palyra_common::local_runtime_ports::
+                    select_available_browser_runtime_ports_excluding(
                         LOOPBACK_HOST,
+                        self.runtime.gateway_bound_ports().as_slice(),
                     )
                     .map_err(anyhow::Error::msg)?;
                 self.runtime.browser_health_port = ports.health;
@@ -1595,9 +1597,9 @@ impl ControlCenter {
         Ok(())
     }
 
-    fn gateway_env(&self) -> Vec<(String, String)> {
+    pub(crate) fn gateway_env(&self) -> Vec<(String, String)> {
         let browser_enabled = self.persisted.browser_service_enabled;
-        vec![
+        let mut env = vec![
             ("PALYRA_DEPLOYMENT_MODE".to_owned(), "local_desktop".to_owned()),
             ("PALYRA_ADMIN_REQUIRE_AUTH".to_owned(), "true".to_owned()),
             ("PALYRA_ADMIN_TOKEN".to_owned(), self.admin_token.clone()),
@@ -1615,7 +1617,13 @@ impl ControlCenter {
                 format!("http://{LOOPBACK_HOST}:{}", self.runtime.browser_grpc_port),
             ),
             ("PALYRA_BROWSER_SERVICE_AUTH_TOKEN".to_owned(), self.browser_auth_token.clone()),
-        ]
+        ];
+        // The selected profile remains authoritative even if unrelated process-global
+        // environment changes occur after the desktop supervisor is initialized.
+        if let Some(config_path) = self.active_profile.config_path.as_ref() {
+            env.push(("PALYRA_CONFIG".to_owned(), config_path.to_string_lossy().into_owned()));
+        }
+        env
     }
 
     fn browserd_env(&self) -> Vec<(String, String)> {

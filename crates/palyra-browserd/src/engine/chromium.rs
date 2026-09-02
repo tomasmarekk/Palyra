@@ -4946,11 +4946,17 @@ async fn chromium_refresh_tab_snapshot_inner(
                 Vec::new()
             }
         };
-    let mut network_log =
-        chromium_drain_pending_network_log(runtime, session_id, tab_id).await.unwrap_or_default();
-    network_log.extend(
-        chromium_drain_page_network_log(runtime, session_id, tab_id).await.unwrap_or_default(),
-    );
+    let network_log = if retain_network_log {
+        let mut entries = chromium_drain_pending_network_log(runtime, session_id, tab_id)
+            .await
+            .unwrap_or_default();
+        let page_entries =
+            chromium_drain_page_network_log(runtime, session_id, tab_id).await.unwrap_or_default();
+        entries.extend(page_network_failures_without_cdp_response(page_entries));
+        entries
+    } else {
+        Vec::new()
+    };
     enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     let mut sessions = runtime.sessions.lock().await;
     let Some(session) = sessions.get_mut(session_id) else {
@@ -4983,6 +4989,14 @@ async fn chromium_refresh_tab_snapshot_inner(
         );
     }
     Ok(())
+}
+
+fn page_network_failures_without_cdp_response(
+    entries: Vec<NetworkLogEntryInternal>,
+) -> impl Iterator<Item = NetworkLogEntryInternal> {
+    // CDP is authoritative for completed responses. The page hook is retained only for fetch/XHR
+    // failures that never produce a CDP response; merging both successful paths duplicates calls.
+    entries.into_iter().filter(|entry| entry.status_code == 0)
 }
 
 /// Refreshes only the active URL while preserving a pending native dialog.
@@ -6740,21 +6754,22 @@ mod tests {
         chromium_upload_staging_path, chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
         decode_chromium_bounded_json_script_value, decode_chromium_console_entries_value,
         decode_chromium_json_script_value, decode_chromium_network_entries_value,
-        decode_chromium_observe_state_value, parse_chromium_clear_storage_status,
-        parse_chromium_client_download_entries, parse_chromium_console_entries,
-        parse_chromium_document_cookie_snapshot, parse_chromium_element_captures,
-        parse_chromium_local_storage_restore_status, parse_chromium_local_storage_snapshot,
-        parse_chromium_page_network_entries, parse_chromium_viewport_metrics, parse_key_press_spec,
-        reserve_chromium_upload_bytes, selector_not_found_error_from_cached_snapshot,
-        split_chromium_observe_state, ChromiumLayoutMetrics, ChromiumObserveSnapshot,
-        ChromiumPrivateTargetPolicy, ChromiumStagedUpload,
-        CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT, CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT,
-        CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT, CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT,
-        CHROMIUM_READ_CONSOLE_LOG_SCRIPT, CHROMIUM_SELECT_STATUS_DISABLED,
-        CHROMIUM_SELECT_STATUS_NOT_FOUND, CHROMIUM_SELECT_STATUS_NOT_SELECT,
-        CHROMIUM_SELECT_STATUS_SELECTED, CHROMIUM_SELECT_STATUS_VALUE_NOT_FOUND,
-        MAX_CHROMIUM_CONSOLE_JSON_BYTES, MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES,
-        MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES, MAX_CHROMIUM_NETWORK_JSON_BYTES,
+        decode_chromium_observe_state_value, page_network_failures_without_cdp_response,
+        parse_chromium_clear_storage_status, parse_chromium_client_download_entries,
+        parse_chromium_console_entries, parse_chromium_document_cookie_snapshot,
+        parse_chromium_element_captures, parse_chromium_local_storage_restore_status,
+        parse_chromium_local_storage_snapshot, parse_chromium_page_network_entries,
+        parse_chromium_viewport_metrics, parse_key_press_spec, reserve_chromium_upload_bytes,
+        selector_not_found_error_from_cached_snapshot, split_chromium_observe_state,
+        ChromiumLayoutMetrics, ChromiumObserveSnapshot, ChromiumPrivateTargetPolicy,
+        ChromiumStagedUpload, CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT,
+        CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT, CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT,
+        CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT, CHROMIUM_READ_CONSOLE_LOG_SCRIPT,
+        CHROMIUM_SELECT_STATUS_DISABLED, CHROMIUM_SELECT_STATUS_NOT_FOUND,
+        CHROMIUM_SELECT_STATUS_NOT_SELECT, CHROMIUM_SELECT_STATUS_SELECTED,
+        CHROMIUM_SELECT_STATUS_VALUE_NOT_FOUND, MAX_CHROMIUM_CONSOLE_JSON_BYTES,
+        MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES, MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES,
+        MAX_CHROMIUM_NETWORK_JSON_BYTES,
     };
     use crate::{
         PermissionSettingInternal, SessionPermissionsInternal, DEFAULT_SESSION_IDLE_TTL_MS,
@@ -7838,6 +7853,30 @@ mod tests {
             .headers
             .iter()
             .any(|header| header.name == "set-cookie" && header.value == "<redacted>"));
+    }
+
+    #[test]
+    fn page_network_fallback_keeps_only_requests_without_cdp_response() {
+        let entries = parse_chromium_page_network_entries(serde_json::json!([
+            {
+                "request_url": "https://example.test/api/success",
+                "status_code": 200,
+                "latency_ms": 10,
+                "captured_at_unix_ms": 20
+            },
+            {
+                "request_url": "https://example.test/api/network-error",
+                "status_code": 0,
+                "latency_ms": 30,
+                "captured_at_unix_ms": 40
+            }
+        ]));
+
+        let fallback = page_network_failures_without_cdp_response(entries).collect::<Vec<_>>();
+
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].status_code, 0);
+        assert!(fallback[0].request_url.ends_with("/api/network-error"));
     }
 
     #[test]

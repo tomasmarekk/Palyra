@@ -126,6 +126,7 @@ struct BrowserResolvedConfig {
     connection: BrowserServiceConnection,
     policy: BrowserPolicySnapshot,
     config_path: Option<String>,
+    reserved_gateway_ports: Vec<u16>,
     state_key_vault_ref: Option<String>,
     token_from_cli_only: bool,
     token_conflicts_with_gateway_config: bool,
@@ -828,6 +829,7 @@ fn configure_browser_setup(
     let path_ref = Path::new(&config_path);
     let (mut document, migration) = load_document_for_mutation(path_ref)
         .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+    let reserved_gateway_ports = reserved_gateway_ports(Some(&document))?;
 
     set_value_at_path(
         &mut document,
@@ -838,10 +840,12 @@ fn configure_browser_setup(
     let existing_health_base_url =
         document_string(Some(&document), "tool_call.browser_service.health_base_url");
     if existing_endpoint.is_none() {
-        let ports = palyra_common::local_runtime_ports::select_available_browser_runtime_ports(
-            palyra_common::local_runtime_ports::LOCAL_RUNTIME_LOOPBACK_HOST,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let ports =
+            palyra_common::local_runtime_ports::select_available_browser_runtime_ports_excluding(
+                palyra_common::local_runtime_ports::LOCAL_RUNTIME_LOOPBACK_HOST,
+                reserved_gateway_ports.as_slice(),
+            )
+            .map_err(anyhow::Error::msg)?;
         set_value_at_path(
             &mut document,
             "tool_call.browser_service.endpoint",
@@ -1114,7 +1118,7 @@ async fn run_browser_start(
 
     let binary = resolve_browser_bin_path(bin_path)?;
     let mut fallback_selected = false;
-    let mut fallback_config_updated = false;
+    let mut fallback_previous_connection = None;
     let port_diagnostics = browser_connection_port_diagnostics(&resolved.connection);
     let unavailable =
         port_diagnostics.iter().filter(|diagnostic| !diagnostic.bind_available).collect::<Vec<_>>();
@@ -1131,15 +1135,8 @@ async fn run_browser_start(
                 format_browser_port_diagnostic_summary(unavailable.as_slice())
             )
         })?;
-        let config_updated =
-            persist_browser_service_connection_urls(resolved.config_path.as_deref(), &fallback)?;
         fallback_selected = true;
-        fallback_config_updated = config_updated;
-        lifecycle_warnings.push(browser_port_fallback_warning(
-            &resolved.connection,
-            &fallback,
-            config_updated,
-        ));
+        fallback_previous_connection = Some(resolved.connection.clone());
         resolved.connection = fallback;
     }
     let (health_host, health_port) =
@@ -1176,7 +1173,7 @@ async fn run_browser_start(
     #[cfg(windows)]
     command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
 
-    let child = command
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to start browser service binary {}", binary.display()))?;
 
@@ -1204,6 +1201,31 @@ async fn run_browser_start(
             Ok(_) => match probe_browser_start_grpc_reachability(&resolved.connection).await {
                 Ok(()) => match probe_browser_engine_readiness(&resolved.connection).await {
                     Ok(()) => {
+                        let fallback_config_updated = if fallback_selected {
+                            match persist_browser_service_connection_urls(
+                                resolved.config_path.as_deref(),
+                                &resolved.connection,
+                            ) {
+                                Ok(updated) => updated,
+                                Err(error) => {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    let _ = remove_browser_service_metadata();
+                                    return Err(error.context(
+                                        "browserd reached readiness on fallback ports, but the active config could not be updated; the fallback process was stopped",
+                                    ));
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        if let Some(previous) = fallback_previous_connection.as_ref() {
+                            lifecycle_warnings.push(browser_port_fallback_warning(
+                                previous,
+                                &resolved.connection,
+                                fallback_config_updated,
+                            ));
+                        }
                         let gateway_reload = if fallback_config_updated {
                             Some(
                                 crate::commands::runtime_reload::try_apply_active_config_reload(
@@ -3606,6 +3628,7 @@ fn resolve_browser_config(
     let file_state_key_vault_ref =
         document_string(document.as_ref(), "tool_call.browser_service.state_key_vault_ref");
     let file_allowed_tools = document_string_array(document.as_ref(), "tool_call.allowed_tools");
+    let reserved_gateway_ports = reserved_gateway_ports(document.as_ref())?;
 
     let env_endpoint = env_optional("PALYRA_BROWSER_SERVICE_ENDPOINT");
     let env_token = env_optional("PALYRA_BROWSER_SERVICE_AUTH_TOKEN");
@@ -3668,6 +3691,7 @@ fn resolve_browser_config(
             profiles_ready: env_state_encryption_key.is_some(),
         },
         config_path: config_path.map(|value| value.display().to_string()),
+        reserved_gateway_ports,
         state_key_vault_ref,
         token_from_cli_only,
         token_conflicts_with_gateway_config,
@@ -4283,6 +4307,41 @@ fn document_u64(document: Option<&toml::Value>, path: &str) -> Option<u64> {
         .and_then(|value| u64::try_from(value).ok())
 }
 
+fn reserved_gateway_ports(document: Option<&toml::Value>) -> Result<Vec<u16>> {
+    let mut ports = BTreeSet::from([
+        palyra_common::local_runtime_ports::DEFAULT_GATEWAY_ADMIN_PORT,
+        palyra_common::local_runtime_ports::DEFAULT_GATEWAY_GRPC_PORT,
+        palyra_common::local_runtime_ports::DEFAULT_GATEWAY_QUIC_PORT,
+    ]);
+    for path in ["daemon.port", "gateway.grpc_port", "gateway.quic_port"] {
+        let Some(value) =
+            document.and_then(|document| get_value_at_path(document, path).ok().flatten())
+        else {
+            continue;
+        };
+        let raw = value
+            .as_integer()
+            .with_context(|| format!("configured gateway port `{path}` must be an integer"))?;
+        let port = u16::try_from(raw)
+            .with_context(|| format!("configured gateway port `{path}` is outside 0..=65535"))?;
+        if port != 0 {
+            ports.insert(port);
+        }
+    }
+    for variable in ["PALYRA_DAEMON_PORT", "PALYRA_GATEWAY_GRPC_PORT", "PALYRA_GATEWAY_QUIC_PORT"] {
+        let Some(raw) = env_optional(variable) else {
+            continue;
+        };
+        let port = raw
+            .parse::<u16>()
+            .with_context(|| format!("{variable} must be a port in 0..=65535"))?;
+        if port != 0 {
+            ports.insert(port);
+        }
+    }
+    Ok(ports.into_iter().collect())
+}
+
 fn document_string_array(document: Option<&toml::Value>, path: &str) -> Vec<String> {
     document
         .and_then(|document| get_value_at_path(document, path).ok().flatten())
@@ -4401,10 +4460,12 @@ fn select_browser_start_fallback_connection(
             "browser port recovery only auto-selects loopback ports, got health host `{health_host}` and gRPC host `{grpc_host}`"
         );
     }
-    let ports = palyra_common::local_runtime_ports::select_available_browser_runtime_ports(
-        palyra_common::local_runtime_ports::LOCAL_RUNTIME_LOOPBACK_HOST,
-    )
-    .map_err(anyhow::Error::msg)?;
+    let ports =
+        palyra_common::local_runtime_ports::select_available_browser_runtime_ports_excluding(
+            palyra_common::local_runtime_ports::LOCAL_RUNTIME_LOOPBACK_HOST,
+            resolved.reserved_gateway_ports.as_slice(),
+        )
+        .map_err(anyhow::Error::msg)?;
     Ok(BrowserServiceConnection {
         grpc_url: format!(
             "http://{}:{}",
@@ -5453,10 +5514,10 @@ mod tests {
         ensure_browser_gateway_auth_token_alignment, ensure_browser_service_enabled,
         ensure_browser_start_preflight, ensure_browser_value_success, format_browser_console_text,
         format_browser_session_summary_text, normalize_session_scoped_output,
-        redact_browser_output_value, session_summary_value, should_write_browser_setup_auth_token,
-        should_write_browser_setup_state_key, BrowserControlPlaneSnapshot, BrowserOutputMode,
-        BrowserPolicySnapshot, BrowserResolvedConfig, BrowserServiceConnection,
-        BrowserServiceMetadata,
+        redact_browser_output_value, reserved_gateway_ports, session_summary_value,
+        should_write_browser_setup_auth_token, should_write_browser_setup_state_key,
+        BrowserControlPlaneSnapshot, BrowserOutputMode, BrowserPolicySnapshot,
+        BrowserResolvedConfig, BrowserServiceConnection, BrowserServiceMetadata,
     };
     use crate::{args::BrowserCommand, browser_v1, common_v1};
     #[cfg(windows)]
@@ -5486,6 +5547,28 @@ mod tests {
             Some(expected_header.as_str())
         );
         assert_ne!(expected, derive_browser_principal_token(b"root-secret", "user:beta"));
+    }
+
+    #[test]
+    fn browser_port_recovery_reserves_profile_gateway_ports() {
+        let document: toml::Value = toml::from_str(
+            r#"
+[daemon]
+port = 7144
+
+[gateway]
+grpc_port = 7145
+quic_port = 7146
+"#,
+        )
+        .expect("gateway port fixture should parse");
+
+        let reserved =
+            reserved_gateway_ports(Some(&document)).expect("gateway ports should resolve");
+
+        assert!(reserved.contains(&7144));
+        assert!(reserved.contains(&7145));
+        assert!(reserved.contains(&7146));
     }
 
     #[cfg(windows)]
@@ -5547,6 +5630,11 @@ mod tests {
                 profiles_ready: false,
             },
             config_path: Some(r"C:\Palyra\palyra.toml".to_owned()),
+            reserved_gateway_ports: vec![
+                palyra_common::local_runtime_ports::DEFAULT_GATEWAY_ADMIN_PORT,
+                palyra_common::local_runtime_ports::DEFAULT_GATEWAY_GRPC_PORT,
+                palyra_common::local_runtime_ports::DEFAULT_GATEWAY_QUIC_PORT,
+            ],
             state_key_vault_ref: None,
             token_from_cli_only: false,
             token_conflicts_with_gateway_config: false,

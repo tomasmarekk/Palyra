@@ -257,6 +257,13 @@ fn browserd_port_fallback_restarts_gateway_for_new_endpoint() {
 
     assert_ne!(control_center.runtime.browser_health_port, health_port);
     assert_ne!(control_center.runtime.browser_grpc_port, grpc_port);
+    let gateway_ports = [
+        control_center.runtime.gateway_admin_port,
+        control_center.runtime.gateway_grpc_port,
+        control_center.runtime.gateway_quic_port,
+    ];
+    assert!(!gateway_ports.contains(&control_center.runtime.browser_health_port));
+    assert!(!gateway_ports.contains(&control_center.runtime.browser_grpc_port));
     assert_ne!(control_center.gateway.next_restart_unix_ms, Some(i64::MAX));
     assert!(control_center.gateway.logs.iter().any(|line| {
         line.line.contains("browserd endpoint changed after port fallback")
@@ -270,6 +277,33 @@ fn browserd_port_fallback_restarts_gateway_for_new_endpoint() {
                 .as_str()
         ),
         "config should point gateway at the fallback browserd gRPC endpoint: {config_toml}"
+    );
+}
+
+#[test]
+fn supervised_gateway_receives_the_selected_profile_config_path() {
+    let fixture = TempFixtureDir::new();
+    let config_path = write_config_file(
+        fixture.path(),
+        r#"
+version = 1
+
+[feature_rollouts]
+context_engine = true
+compaction_safeguard = true
+"#,
+    );
+    let mut control_center = build_test_control_center(fixture.path());
+    control_center.active_profile.config_path = Some(config_path.clone());
+
+    let gateway_env = control_center.gateway_env();
+
+    assert_eq!(
+        gateway_env
+            .iter()
+            .find(|(key, _)| key == "PALYRA_CONFIG")
+            .map(|(_, value)| PathBuf::from(value)),
+        Some(config_path)
     );
 }
 
