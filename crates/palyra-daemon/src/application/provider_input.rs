@@ -746,17 +746,8 @@ fn memory_query_stopword(token: &str) -> bool {
             | "why"
             | "where"
             | "when"
-            | "pro"
             | "do"
-            | "na"
-            | "se"
-            | "si"
-            | "mi"
             | "i"
-            | "ve"
-            | "v"
-            | "z"
-            | "ze"
     )
 }
 
@@ -776,7 +767,6 @@ fn memory_query_mentions_ui_test_workflow(normalized_query: &str) -> bool {
                 | "end-to-end"
                 | "test"
                 | "tests"
-                | "testy"
                 | "testing"
                 | "accessibility"
                 | "a11y"

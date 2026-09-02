@@ -258,7 +258,21 @@ async fn ensure_console_cron_job_owner(
     job_id: &str,
     principal: &str,
 ) -> Result<(), Response> {
-    load_console_cron_job_for_owner(state, job_id, principal).await?;
+    let job = state
+        .runtime
+        .cron_job_for_history(job_id.to_owned())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "cron job not found: {job_id}"
+            )))
+        })?;
+    if job.owner_principal != principal {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "cron job owner mismatch for authenticated principal",
+        )));
+    }
     Ok(())
 }
 

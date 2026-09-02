@@ -5197,7 +5197,7 @@ mod tests {
             origin_kind: "model".to_owned(),
             origin_run_id: Some(origin_run_id.to_owned()),
             parent_run_id: None,
-            text: "docasny feature flag se jmenuje PALYRA_E2E_BETA".to_owned(),
+            text: "the temporary feature flag is named PALYRA_E2E_BETA".to_owned(),
             is_match: true,
         };
         let outcome = SessionSearchOutcome {

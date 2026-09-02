@@ -8102,6 +8102,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "startup_recovery_resolutions",
         sql: startup_recovery::MIGRATION_106_SQL,
     },
+    Migration {
+        version: 107,
+        name: "cron_job_history_tombstones",
+        sql: r#"
+            ALTER TABLE cron_jobs ADD COLUMN deleted_at_unix_ms INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_cron_jobs_deleted
+                ON cron_jobs(deleted_at_unix_ms);
+        "#,
+    },
 ];
 
 fn emit_background_task_wake_events_tx(
@@ -13392,6 +13401,15 @@ impl JournalStore {
                 request.run_id
             )));
         }
+        transaction.execute(
+            r#"
+                UPDATE orchestrator_sessions
+                SET updated_at_unix_ms = MAX(updated_at_unix_ms, ?3)
+                WHERE session_ulid = ?1
+                  AND last_run_ulid = ?2
+            "#,
+            params![session_id, request.run_id, now],
+        )?;
         append_run_lifecycle_event_tx(
             &transaction,
             &RunLifecycleEventAppendRequest {
@@ -23835,7 +23853,7 @@ impl JournalStore {
                     next_run_at_unix_ms = ?16,
                     queued_run = ?17,
                     updated_at_unix_ms = ?18
-                WHERE job_ulid = ?1
+                WHERE job_ulid = ?1 AND deleted_at_unix_ms IS NULL
             "#,
             params![
                 job_id,
@@ -23862,7 +23880,7 @@ impl JournalStore {
             .ok_or_else(|| JournalError::CronJobNotFound { job_id: job_id.to_owned() })
     }
 
-    /// Deletes a cron job; returns whether a row was removed.
+    /// Deletes an active cron job while retaining its completed run history.
     ///
     /// # Errors
     /// Returns [`JournalError::CronJobHasActiveRuns`] if a run is still active, or
@@ -23927,6 +23945,18 @@ impl JournalStore {
         load_cron_job_by_id(&guard, job_id)
     }
 
+    /// Returns a cron job for run-history authorization, including a deleted tombstone.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
+    pub fn cron_job_for_history(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<CronJobRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        load_cron_job_by_id_including_deleted(&guard, job_id)
+    }
+
     /// Lists cron jobs matching the filter.
     ///
     /// # Errors
@@ -23962,6 +23992,7 @@ impl JournalStore {
                     updated_at_unix_ms
                 FROM cron_jobs
                 WHERE
+                    deleted_at_unix_ms IS NULL AND
                     (?1 IS NULL OR job_ulid > ?1) AND
                     (?2 IS NULL OR enabled = ?2) AND
                     (?3 IS NULL OR owner_principal = ?3) AND
@@ -24021,7 +24052,8 @@ impl JournalStore {
                     updated_at_unix_ms
                 FROM cron_jobs
                 WHERE
-                    enabled = 1
+                    deleted_at_unix_ms IS NULL
+                    AND enabled = 1
                     AND next_run_at_unix_ms IS NOT NULL
                     AND next_run_at_unix_ms <= ?1
                 ORDER BY next_run_at_unix_ms ASC, job_ulid ASC
@@ -24047,7 +24079,9 @@ impl JournalStore {
                 r#"
                     SELECT next_run_at_unix_ms
                     FROM cron_jobs
-                    WHERE enabled = 1 AND next_run_at_unix_ms IS NOT NULL
+                    WHERE deleted_at_unix_ms IS NULL
+                      AND enabled = 1
+                      AND next_run_at_unix_ms IS NOT NULL
                     ORDER BY next_run_at_unix_ms ASC
                     LIMIT 1
                 "#,
@@ -24079,7 +24113,7 @@ impl JournalStore {
                     next_run_at_unix_ms = ?2,
                     last_run_at_unix_ms = COALESCE(?3, last_run_at_unix_ms),
                     updated_at_unix_ms = ?4
-                WHERE job_ulid = ?1
+                WHERE job_ulid = ?1 AND deleted_at_unix_ms IS NULL
             "#,
             params![job_id, next_run_at_unix_ms, last_run_at_unix_ms, now],
         )?;
@@ -24107,7 +24141,7 @@ impl JournalStore {
                 SET
                     queued_run = ?2,
                     updated_at_unix_ms = ?3
-                WHERE job_ulid = ?1
+                WHERE job_ulid = ?1 AND deleted_at_unix_ms IS NULL
             "#,
             params![job_id, queued_run as i64, now],
         )?;
@@ -24142,7 +24176,7 @@ impl JournalStore {
         if request.status.is_active() {
             let (concurrency_policy_raw, schedule_payload_json) = transaction
                 .query_row(
-                    "SELECT concurrency_policy, schedule_payload_json FROM cron_jobs WHERE job_ulid = ?1",
+                    "SELECT concurrency_policy, schedule_payload_json FROM cron_jobs WHERE job_ulid = ?1 AND deleted_at_unix_ms IS NULL",
                     params![request.job_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
@@ -24255,7 +24289,7 @@ impl JournalStore {
                 SET
                     last_run_at_unix_ms = ?2,
                     updated_at_unix_ms = ?2
-                WHERE job_ulid = ?1
+                WHERE job_ulid = ?1 AND deleted_at_unix_ms IS NULL
             "#,
             params![request.job_id, now],
         )?;
@@ -33253,6 +33287,21 @@ fn load_cron_job_by_id(
     connection: &Connection,
     job_id: &str,
 ) -> Result<Option<CronJobRecord>, JournalError> {
+    load_cron_job_by_id_with_deleted_state(connection, job_id, false)
+}
+
+fn load_cron_job_by_id_including_deleted(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Option<CronJobRecord>, JournalError> {
+    load_cron_job_by_id_with_deleted_state(connection, job_id, true)
+}
+
+fn load_cron_job_by_id_with_deleted_state(
+    connection: &Connection,
+    job_id: &str,
+    include_deleted: bool,
+) -> Result<Option<CronJobRecord>, JournalError> {
     let mut statement = connection.prepare(
         r#"
             SELECT
@@ -33278,10 +33327,14 @@ fn load_cron_job_by_id(
                 updated_at_unix_ms
             FROM cron_jobs
             WHERE job_ulid = ?1
+              AND (?2 = 1 OR deleted_at_unix_ms IS NULL)
             LIMIT 1
         "#,
     )?;
-    statement.query_row(params![job_id], map_cron_job_row).optional().map_err(Into::into)
+    statement
+        .query_row(params![job_id, i64::from(include_deleted)], map_cron_job_row)
+        .optional()
+        .map_err(Into::into)
 }
 
 fn map_cron_run_row(row: &rusqlite::Row<'_>) -> Result<CronRunRecord, rusqlite::Error> {
@@ -33362,9 +33415,21 @@ fn delete_cron_job_tx(transaction: &Transaction<'_>, job_id: &str) -> Result<boo
         return Err(JournalError::CronJobHasActiveRuns { job_id: job_id.to_owned() });
     }
 
-    transaction.execute("DELETE FROM cron_runs WHERE job_ulid = ?1", params![job_id])?;
-    let deleted =
-        transaction.execute("DELETE FROM cron_jobs WHERE job_ulid = ?1", params![job_id])?;
+    let now = current_unix_ms()?;
+    let deleted = transaction.execute(
+        r#"
+            UPDATE cron_jobs
+            SET
+                enabled = 0,
+                next_run_at_unix_ms = NULL,
+                queued_run = 0,
+                deleted_at_unix_ms = ?2,
+                updated_at_unix_ms = ?2
+            WHERE job_ulid = ?1
+              AND deleted_at_unix_ms IS NULL
+        "#,
+        params![job_id, now],
+    )?;
     Ok(deleted > 0)
 }
 
@@ -53938,6 +54003,15 @@ mod tests {
             .expect("run should exist");
         assert_eq!(snapshot.state, RunLifecycleState::Cancelled.as_str());
         assert_eq!(snapshot.last_error.as_deref(), Some("operator_requested"));
+        let session = store
+            .orchestrator_session_by_id(session_id)
+            .expect("session lookup should succeed")
+            .expect("session should exist");
+        assert_eq!(
+            session.updated_at_unix_ms,
+            snapshot.completed_at_unix_ms.expect("terminal run should have completion time"),
+            "terminal settlement should advance the owning session recency"
+        );
         assert!(store
             .active_runtime_generation_for_run(run_id, RuntimeGenerationLane::Run)
             .expect("generation lookup should succeed")
@@ -54691,7 +54765,7 @@ mod tests {
     }
 
     #[test]
-    fn cron_job_delete_removes_terminal_run_history() {
+    fn cron_job_delete_retains_terminal_run_history_behind_tombstone() {
         let db_path = temp_db_path();
         let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
@@ -54728,13 +54802,18 @@ mod tests {
 
         let deleted = store
             .delete_cron_job(job.job_id.as_str())
-            .expect("cron job delete should remove terminal run history first");
+            .expect("cron job delete should create a history tombstone");
 
         assert!(deleted, "cron job should be deleted");
         assert!(
             store.cron_job(job.job_id.as_str()).expect("cron job lookup should succeed").is_none(),
-            "cron job should no longer exist"
+            "deleted cron job should disappear from active lookup"
         );
+        let history_job = store
+            .cron_job_for_history(job.job_id.as_str())
+            .expect("history owner lookup should succeed")
+            .expect("deleted cron job should retain an authorization tombstone");
+        assert_eq!(history_job.owner_principal, job.owner_principal);
         let remaining_runs = store
             .list_cron_runs(CronRunsListFilter {
                 job_id: Some(job.job_id.as_str()),
@@ -54743,7 +54822,21 @@ mod tests {
                 limit: 10,
             })
             .expect("cron run listing should succeed");
-        assert!(remaining_runs.is_empty(), "terminal run history should be removed");
+        assert_eq!(remaining_runs.len(), 1, "terminal run history should remain queryable");
+        assert_eq!(remaining_runs[0].run_id, "01ARZ3NDEKTSV4RRFFQ69G5FBK");
+        assert!(
+            store
+                .list_cron_jobs(CronJobsListFilter {
+                    after_job_id: None,
+                    limit: 10,
+                    enabled: None,
+                    owner_principal: None,
+                    channel: None,
+                })
+                .expect("active cron job listing should succeed")
+                .is_empty(),
+            "tombstones must not reappear in active job listings"
+        );
     }
 
     #[test]

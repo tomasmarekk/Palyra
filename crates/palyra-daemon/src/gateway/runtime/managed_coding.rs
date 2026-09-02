@@ -333,7 +333,8 @@ impl GatewayRuntimeState {
     ) -> Result<Option<CodingTaskHandleV2>, CodingRuntimeError> {
         let selection = match managed_coding_admission(request)? {
             Some(selection) => Some(selection),
-            None => managed_coding_policy_admission(
+            None => managed_coding_policy_admission_for_request(
+                request,
                 self.config.code_intel.enabled,
                 self.config.code_intel.workspace_root.as_deref(),
             ),
@@ -682,6 +683,33 @@ fn managed_coding_policy_admission(
     ))
 }
 
+fn managed_coding_policy_admission_for_request(
+    request: &OrchestratorRunStartRequest,
+    code_intel_enabled: bool,
+    configured_workspace_root: Option<&std::path::Path>,
+) -> Option<(ManagedCodingAdmission, PathBuf, CodingWorkspaceAdmissionV2)> {
+    let launch_cwd = request
+        .parameter_delta_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.get("cli_context").cloned())
+        .and_then(|value| serde_json::from_value::<ManagedCodingCliContext>(value).ok())
+        .and_then(|context| context.launch_cwd);
+
+    if let Some(launch_cwd) = launch_cwd {
+        // Authenticated CLI launch context owns this run's filesystem scope.
+        // Falling through to the configured root here can silently redirect a
+        // fresh project into an unrelated repository such as the user home.
+        let workspace_root =
+            crate::application::tool_runtime::workspace_scope::canonical_launch_workspace_root(
+                launch_cwd.as_str(),
+            )?;
+        return managed_coding_policy_admission(code_intel_enabled, Some(workspace_root.as_path()));
+    }
+
+    managed_coding_policy_admission(code_intel_enabled, configured_workspace_root)
+}
+
 fn validate_wait_context(
     context: &crate::application::coding_runtime::CodingObjectiveWaitContextV2,
 ) -> Result<(), String> {
@@ -729,5 +757,87 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp workspace");
         assert!(managed_coding_policy_admission(false, Some(temp.path())).is_none());
         assert!(managed_coding_policy_admission(true, Some(temp.path())).is_none());
+    }
+
+    #[test]
+    fn cli_launch_cwd_prevents_fallback_to_unrelated_configured_project() {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let configured_project = temp.path().join("configured-project");
+        let fresh_project = temp.path().join("fresh-project");
+        std::fs::create_dir_all(configured_project.as_path())
+            .expect("configured project should exist");
+        std::fs::create_dir_all(fresh_project.as_path()).expect("fresh project should exist");
+        std::fs::write(configured_project.join("package.json"), "{}")
+            .expect("configured project marker should exist");
+        let mut request = sample_run_start_request();
+        request.parameter_delta_json = Some(
+            serde_json::json!({
+                "cli_context": {
+                    "launch_cwd": fresh_project,
+                    "workspace_roots": []
+                }
+            })
+            .to_string(),
+        );
+
+        let selection = managed_coding_policy_admission_for_request(
+            &request,
+            true,
+            Some(configured_project.as_path()),
+        );
+
+        assert!(
+            selection.is_none(),
+            "a fresh CLI workspace must not fall back to an unrelated configured project"
+        );
+    }
+
+    #[test]
+    fn cli_launch_project_replaces_unrelated_configured_project() {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let configured_project = temp.path().join("configured-project");
+        let launch_project = temp.path().join("launch-project");
+        std::fs::create_dir_all(configured_project.as_path())
+            .expect("configured project should exist");
+        std::fs::create_dir_all(launch_project.as_path()).expect("launch project should exist");
+        std::fs::write(configured_project.join("package.json"), "{}")
+            .expect("configured project marker should exist");
+        std::fs::write(launch_project.join("Cargo.toml"), "[workspace]\n")
+            .expect("launch project marker should exist");
+        let mut request = sample_run_start_request();
+        request.parameter_delta_json = Some(
+            serde_json::json!({
+                "cli_context": {
+                    "launch_cwd": launch_project,
+                    "workspace_roots": []
+                }
+            })
+            .to_string(),
+        );
+
+        let (_, selected_root, admission) = managed_coding_policy_admission_for_request(
+            &request,
+            true,
+            Some(configured_project.as_path()),
+        )
+        .expect("launch project should select managed coding");
+
+        assert_eq!(
+            selected_root,
+            launch_project.canonicalize().expect("launch project should canonicalize")
+        );
+        assert_eq!(admission, CodingWorkspaceAdmissionV2::Policy);
+    }
+
+    fn sample_run_start_request() -> OrchestratorRunStartRequest {
+        OrchestratorRunStartRequest {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            origin_kind: "cli".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some("principal:test".to_owned()),
+            parameter_delta_json: None,
+            delegated_admission: None,
+        }
     }
 }

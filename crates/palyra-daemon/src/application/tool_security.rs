@@ -37,10 +37,12 @@ use crate::{
         ExecutionBackendPreference, ExecutionBackendResolution,
     },
     gateway::{
-        current_unix_ms, GatewayRuntimeState, ToolApprovalOutcome, ToolSkillContext,
+        current_unix_ms, process_runner_tool_config_for_session, GatewayRuntimeState,
+        ToolApprovalOutcome, ToolRuntimeExecutionContext, ToolSkillContext,
         SKILL_EXECUTION_DENY_REASON_PREFIX,
     },
     journal::{JournalAppendRequest, SkillExecutionStatus},
+    sandbox_runner::process_run_requires_destructive_approval,
     tool_posture::{
         derive_scope_chain, evaluate_effective_tool_posture, ToolPostureOverrideRecord,
         ToolPostureScopeKind, ToolPostureScopeRef, ToolPostureState,
@@ -473,13 +475,13 @@ fn proposal_requires_approval(
     skill_gate_decision: Option<&ToolDecision>,
     effective_posture: ToolPostureState,
     backend_approval_required: bool,
-    host_access_approval_required: bool,
+    authority_approval_required: bool,
 ) -> bool {
     skill_gate_decision
         .map(|decision| decision.allowed && effective_posture == ToolPostureState::AskEachTime)
         .unwrap_or(effective_posture == ToolPostureState::AskEachTime)
         || backend_approval_required
-        || host_access_approval_required
+        || authority_approval_required
 }
 
 fn tier_b_approved_roots_requires_host_access_approval(
@@ -679,14 +681,34 @@ pub(crate) async fn evaluate_tool_proposal_security(
     if skill_gate_decision.is_none() {
         skill_gate_decision = evaluate_backend_capability_gate(tool_name, &backend_selection);
     }
-    // Risk classification remains available for audit and operator surfaces, but it does not
-    // silently replace the resolved tool posture. The Tier-B approved-roots exception below is
-    // a concrete backend authority boundary: host processes cannot enforce syscall path scope.
+    let destructive_process_approval_required =
+        if matches!(tool_name, "palyra.process.run" | "palyra.exec.run") {
+            let config = process_runner_tool_config_for_session(
+                runtime_state,
+                ToolRuntimeExecutionContext {
+                    principal: request_context.principal.as_str(),
+                    device_id: request_context.device_id.as_str(),
+                    channel: request_context.channel.as_deref(),
+                    session_id,
+                    run_id,
+                    execution_backend: backend_selection.resolution.resolved,
+                    backend_reason_code: backend_selection.resolution.reason_code.as_str(),
+                },
+                input_json,
+            )
+            .await;
+            process_run_requires_destructive_approval(&config.process_runner, input_json)
+        } else {
+            false
+        };
+    // Recognized recursive deletion is a narrower authority boundary than the general process
+    // posture: a client may auto-resolve the prompt, but execution must not precede that decision.
     let proposal_approval_required = proposal_requires_approval(
         skill_gate_decision.as_ref(),
         effective_posture.effective_state,
         backend_selection.resolution.approval_required,
-        tier_b_approved_roots_requires_host_access_approval(runtime_state, tool_name, input_json),
+        tier_b_approved_roots_requires_host_access_approval(runtime_state, tool_name, input_json)
+            || destructive_process_approval_required,
     );
     let approval_subject_id =
         build_tool_approval_subject_id(tool_name, skill_context.as_ref(), input_json);

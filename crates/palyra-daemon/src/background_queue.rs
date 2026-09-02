@@ -2604,6 +2604,15 @@ fn build_parameter_delta_bytes(task: &OrchestratorBackgroundTaskRecord) -> Resul
         None => json!({}),
     };
     if let Some(root) = merged.as_object_mut() {
+        let budget_scope = task
+            .payload_json
+            .as_deref()
+            .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+            .and_then(|payload| {
+                payload.get("entry_point").and_then(Value::as_str).map(ToOwned::to_owned)
+            })
+            .filter(|entry_point| entry_point == "startup_recovery")
+            .map_or("total_tokens", |_| "completion_tokens");
         let mut background_task = json!({
             "schema_version": 1,
             "task_id": task.task_id,
@@ -2612,6 +2621,7 @@ fn build_parameter_delta_bytes(task: &OrchestratorBackgroundTaskRecord) -> Resul
             "child_session_id": task.child_session_id,
             "parent_run_id": task.parent_run_id,
             "budget_tokens": task.budget_tokens,
+            "budget_scope": budget_scope,
         });
         if let (Some(background_task), Some(cancellation)) =
             (background_task.as_object_mut(), task.cancellation_context.as_ref())
@@ -5009,6 +5019,14 @@ mod tests {
             .await
             .expect("parent generation lookup should succeed")
             .is_none());
+        let parameter_delta_bytes = build_parameter_delta_bytes(&task)
+            .expect("startup-recovery parameter delta should encode");
+        let parameter_delta: Value = serde_json::from_slice(parameter_delta_bytes.as_slice())
+            .expect("startup-recovery parameter delta should parse");
+        assert_eq!(
+            parameter_delta.pointer("/background_task/budget_scope").and_then(Value::as_str),
+            Some("completion_tokens")
+        );
         state
             .start_orchestrator_run(OrchestratorRunStartRequest {
                 run_id: child_run_id.clone(),
@@ -5017,11 +5035,8 @@ mod tests {
                 origin_run_id: Some(parent_run_id.clone()),
                 triggered_by_principal: Some("user:test".to_owned()),
                 parameter_delta_json: Some(
-                    String::from_utf8(
-                        build_parameter_delta_bytes(&task)
-                            .expect("startup-recovery parameter delta should encode"),
-                    )
-                    .expect("startup-recovery parameter delta should be UTF-8"),
+                    String::from_utf8(parameter_delta_bytes)
+                        .expect("startup-recovery parameter delta should be UTF-8"),
                 ),
                 delegated_admission: None,
             })

@@ -863,7 +863,7 @@ pub(crate) async fn console_routine_runs_handler(
     Query(query): Query<ConsoleRoutineRunsQuery>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
-    let routine = load_routine_parts_for_owner(
+    let routine = load_routine_history_context_for_owner(
         &state,
         routine_id.as_str(),
         session.context.principal.as_str(),
@@ -883,10 +883,10 @@ pub(crate) async fn console_routine_runs_handler(
             .find_run_metadata(run.run_id.as_str())
             .map_err(routine_registry_error_response)?;
         let mut mapped = join_run_metadata(
-            routine.metadata.routine_id.as_str(),
+            routine_id.as_str(),
             run,
             metadata.as_ref(),
-            Some(&routine.metadata.approval_policy),
+            routine.approval_policy.as_ref(),
             Some(now_unix_ms),
         );
         enrich_routine_run_output_fields(&state, routine.job.owner_principal.as_str(), &mut mapped)
@@ -1238,6 +1238,12 @@ struct RoutineParts {
 }
 
 #[derive(Debug)]
+struct RoutineHistoryContext {
+    job: CronJobRecord,
+    approval_policy: Option<RoutineApprovalPolicy>,
+}
+
+#[derive(Debug)]
 struct ScheduleResolution {
     schedule_type: CronScheduleType,
     schedule_payload_json: String,
@@ -1368,6 +1374,28 @@ async fn load_routine_parts_for_owner(
         })?;
     ensure_job_owner(&job, principal)?;
     Ok(RoutineParts { job, metadata })
+}
+
+async fn load_routine_history_context_for_owner(
+    state: &AppState,
+    routine_id: &str,
+    principal: &str,
+) -> Result<RoutineHistoryContext, Response> {
+    synchronize_schedule_routines(state).await?;
+    let metadata =
+        state.routines.get_routine(routine_id).map_err(routine_registry_error_response)?;
+    let job = if metadata.is_some() {
+        state.runtime.cron_job(routine_id.to_owned()).await
+    } else {
+        state.runtime.cron_job_for_history(routine_id.to_owned()).await
+    }
+    .map_err(runtime_status_response)?
+    .ok_or_else(|| runtime_status_response(tonic::Status::not_found("routine not found")))?;
+    ensure_job_owner(&job, principal)?;
+    Ok(RoutineHistoryContext {
+        job,
+        approval_policy: metadata.map(|metadata| metadata.approval_policy),
+    })
 }
 
 async fn persist_routine_job(

@@ -3256,7 +3256,7 @@ fn execute_process_list_tool(
         );
     }
     let processes = runtime_state
-        .list_run_background_process_history(context.run_id)
+        .list_run_background_processes(context.run_id)
         .into_iter()
         .map(|process| {
             let pid = process.ownership_root_pid();
@@ -3819,7 +3819,7 @@ fn browser_session_id_from_tool_input(input_json: &[u8]) -> Option<String> {
 // static configured root is only a fallback when agent resolution fails or the
 // agent has no usable root; otherwise file and process tools in one session
 // would operate on different projects.
-async fn process_runner_tool_config_for_session(
+pub(crate) async fn process_runner_tool_config_for_session(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
     input_json: &[u8],

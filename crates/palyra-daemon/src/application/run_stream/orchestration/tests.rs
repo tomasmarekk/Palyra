@@ -32,9 +32,10 @@ use super::{
     terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
     tool_catalog_snapshot_phase_timeout, tool_followup_timeout_context,
     tool_followup_timeout_partial_summary, tool_result_to_provider_message,
-    truncated_final_answer_without_tools, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
-    RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
-    RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
+    truncated_final_answer_without_tools, BackgroundBudgetScope, BackgroundRunBudget,
+    ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
+    RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
+    RunStreamMessageProcessingOutcome, RunStreamProviderRequestExecution,
     RunStreamProviderRequestOutcome, RunStreamToolResultForModel, ToolCatalogPolicySnapshot,
     CODEX_MANAGED_RUNTIME_ID, HARNESS_SELECTION_EVENT, MAX_LENGTH_RECOVERY_ATTEMPTS,
     RUNTIME_SELECTED_METADATA_EVENT, RUN_STREAM_HARNESS_RUNTIME_POLICY,
@@ -1454,9 +1455,24 @@ fn background_run_budget_tokens_reads_background_parameter_delta() {
     })
     .to_string();
 
-    assert_eq!(background_run_budget_tokens(Some(parameter_delta.as_str())), Some(1_000));
+    assert_eq!(
+        background_run_budget_tokens(Some(parameter_delta.as_str())),
+        Some(BackgroundRunBudget::total(1_000))
+    );
     assert_eq!(background_run_budget_tokens(Some("{}")), None);
     assert_eq!(background_run_budget_tokens(Some("not-json")), None);
+
+    let recovery_delta = json!({
+        "background_task": {
+            "budget_tokens": 4_096,
+            "budget_scope": "completion_tokens"
+        }
+    })
+    .to_string();
+    assert_eq!(
+        background_run_budget_tokens(Some(recovery_delta.as_str())),
+        Some(BackgroundRunBudget::completion(4_096))
+    );
 }
 
 #[test]
@@ -1529,8 +1545,9 @@ fn background_budget_guard_clamps_provider_output_tokens() {
     );
     request.max_output_tokens = Some(900);
 
-    let decision = apply_background_budget_guard(&mut request, 1_000, 200, 8_192)
-        .expect("small background task should fit inside budget");
+    let decision =
+        apply_background_budget_guard(&mut request, BackgroundRunBudget::total(1_000), 200, 8_192)
+            .expect("small background task should fit inside budget");
 
     assert_eq!(decision.budget_tokens, 1_000);
     assert!(decision.estimated_input_tokens > 0);
@@ -1543,8 +1560,9 @@ fn background_budget_guard_rejects_over_budget_input() {
     let mut request =
         ProviderRequest::from_input_text(vec!["word"; 1_100].join(" "), false, Vec::new(), None);
 
-    let message = apply_background_budget_guard(&mut request, 1_000, 0, 8_192)
-        .expect_err("oversized background prompt must fail before provider execution");
+    let message =
+        apply_background_budget_guard(&mut request, BackgroundRunBudget::total(1_000), 0, 8_192)
+            .expect_err("oversized background prompt must fail before provider execution");
 
     assert!(message.contains("background task token budget exhausted"));
     assert_eq!(request.max_output_tokens, None);
@@ -1569,8 +1587,9 @@ fn background_budget_guard_counts_model_visible_tool_schemas() {
         }]
     }));
 
-    let message = apply_background_budget_guard(&mut request, 1_000, 0, 8_192)
-        .expect_err("tool schema overhead must be included before provider execution");
+    let message =
+        apply_background_budget_guard(&mut request, BackgroundRunBudget::total(1_000), 0, 8_192)
+            .expect_err("tool schema overhead must be included before provider execution");
 
     assert!(message.contains("background task token budget exhausted before provider turn"));
     assert!(message.contains("estimated_input_tokens="));
@@ -1595,8 +1614,9 @@ fn background_budget_guard_excludes_compact_catalog_index_metadata() {
         "tools": []
     }));
 
-    let decision = apply_background_budget_guard(&mut request, 1_000, 0, 8_192)
-        .expect("compact catalog audit metadata must not consume provider budget");
+    let decision =
+        apply_background_budget_guard(&mut request, BackgroundRunBudget::total(1_000), 0, 8_192)
+            .expect("compact catalog audit metadata must not consume provider budget");
 
     assert!(decision.estimated_input_tokens < 1_000);
     assert!(decision.max_output_tokens > 0);
@@ -1616,8 +1636,9 @@ fn background_budget_guard_caps_implicit_output_to_provider_context() {
         "tools": []
     }));
 
-    let decision = apply_background_budget_guard(&mut request, 65_536, 0, 8_192)
-        .expect("default background output reserve should fit the provider context window");
+    let decision =
+        apply_background_budget_guard(&mut request, BackgroundRunBudget::total(65_536), 0, 8_192)
+            .expect("default background output reserve should fit the provider context window");
 
     assert_eq!(decision.max_output_tokens, 4_096);
     assert!(
@@ -1628,10 +1649,33 @@ fn background_budget_guard_caps_implicit_output_to_provider_context() {
 
 #[test]
 fn background_budget_overrun_detects_provider_usage_after_turn() {
-    assert!(background_budget_overrun_message(1_000, 1_001)
+    assert!(background_budget_overrun_message(BackgroundRunBudget::total(1_000), 1_001)
         .expect("usage above budget must be rejected")
         .contains("budget_tokens=1000"));
-    assert!(background_budget_overrun_message(1_000, 1_000).is_none());
+    assert!(background_budget_overrun_message(BackgroundRunBudget::total(1_000), 1_000).is_none());
+}
+
+#[test]
+fn recovery_budget_excludes_replayed_input_but_still_caps_output() {
+    let mut request = ProviderRequest::from_input_text(
+        vec!["replayed"; 4_500].join(" "),
+        false,
+        Vec::new(),
+        None,
+    );
+
+    let decision = apply_background_budget_guard(
+        &mut request,
+        BackgroundRunBudget::completion(4_096),
+        0,
+        16_384,
+    )
+    .expect("durable recovery input should be bounded by provider context, not output budget");
+
+    assert_eq!(decision.budget_scope, BackgroundBudgetScope::CompletionTokens);
+    assert!(decision.estimated_input_tokens > 4_096);
+    assert_eq!(decision.accounted_input_tokens, 0);
+    assert!(decision.max_output_tokens <= 4_096);
 }
 
 #[test]

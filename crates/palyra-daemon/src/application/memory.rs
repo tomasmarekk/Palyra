@@ -2203,9 +2203,9 @@ mod tests {
         assert!(lifecycle_conflict_matches(
             MemoryWriteCategory::Correction,
             replacement_terms.as_slice(),
-            "Pro E2E testy preferujeme Playwright.",
+            "We prefer Playwright for E2E tests.",
             MemoryWriteCategory::Fact,
-            "Pro E2E testy preferujeme Vitest.",
+            "We prefer Vitest for E2E tests.",
         ));
     }
 

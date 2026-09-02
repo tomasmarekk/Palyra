@@ -5574,8 +5574,9 @@ async fn sparse_ui_smoke_recall_uses_replaced_durable_preference() {
             channel: context.channel.clone(),
             session_id: None,
             source: MemorySource::Manual,
-            content_text: "TypeScript (jazyk), Playwright (test runner pro E2E testy) a strucne reporty v cestine."
-                .to_owned(),
+            content_text:
+                "For UI smoke tests, use TypeScript and Playwright with concise English reports."
+                    .to_owned(),
             tags: vec!["preference".to_owned(), "e2e".to_owned()],
             confidence: Some(0.95),
             ttl_unix_ms: None,
@@ -5583,7 +5584,7 @@ async fn sparse_ui_smoke_recall_uses_replaced_durable_preference() {
         .await
         .expect("manual durable memory should be ingested");
 
-    let sparse_prompt = "Priprav smoke test pro UI.";
+    let sparse_prompt = "Prepare a UI smoke test.";
     let mut tape_seq = 1_i64;
     let prepared = prepare_model_provider_input(
         &state,
@@ -12645,6 +12646,41 @@ fn process_list_entry_reports_runtime_status_details() {
 }
 
 #[test]
+fn process_list_excludes_completed_history_after_cleanup_lease_is_released() {
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.process_runner.enabled = true;
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let run_id = Ulid::generate().to_string();
+    let pid = 4_200_000_u32.saturating_add(std::process::id());
+    explicit_stop_test_process(&state, run_id.as_str(), pid, "list-completed");
+    state.forget_run_background_process(run_id.as_str(), pid);
+    assert!(
+        state.run_background_process_history(run_id.as_str(), pid).is_some(),
+        "exact-PID status history should remain available"
+    );
+
+    let outcome = super::execute_process_list_tool(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-process-list",
+            run_id: run_id.as_str(),
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-process-list",
+        b"{}",
+    );
+    let output = parse_tool_output_json(&outcome);
+
+    assert!(outcome.success);
+    assert_eq!(output.get("count").and_then(Value::as_u64), Some(0));
+    assert_eq!(output.get("processes").and_then(Value::as_array).map(Vec::len), Some(0));
+}
+
+#[test]
 fn closed_browser_session_registry_marks_and_clears_handles() {
     let state = build_test_runtime_state(false);
     let run_id = Ulid::generate().to_string();
@@ -17807,7 +17843,7 @@ async fn memory_replace_tool_accepts_zero_ttl_defaults_for_workspace_document_re
             session_id: Some(context.session_id.to_owned()),
             path: path.to_owned(),
             title: Some("Project memory".to_owned()),
-            content_text: format!("pro tento projekt pouzivej npm {marker}"),
+            content_text: format!("use npm for this project {marker}"),
             template_id: None,
             template_version: None,
             template_content_hash: None,
@@ -17834,7 +17870,7 @@ async fn memory_replace_tool_accepts_zero_ttl_defaults_for_workspace_document_re
 
     let input_json = serde_json::to_vec(&json!({
         "memory_id": document_id,
-        "content_text": format!("pro tento projekt pouzivej pnpm {marker}"),
+        "content_text": format!("use pnpm for this project {marker}"),
         "tags": [marker, "package-manager", "pnpm"],
         "confidence": 1.0,
         "ttl_ms": 0,
@@ -17872,11 +17908,11 @@ async fn memory_replace_tool_accepts_zero_ttl_defaults_for_workspace_document_re
         .expect("workspace document lookup should succeed")
         .expect("workspace document should exist after replace");
     assert!(
-        replaced_document.content_text.contains("pouzivej pnpm"),
+        replaced_document.content_text.contains("use pnpm"),
         "workspace document should contain corrected package-manager preference"
     );
     assert!(
-        !replaced_document.content_text.contains("pouzivej npm"),
+        !replaced_document.content_text.contains("use npm"),
         "workspace document should not retain obsolete package-manager preference"
     );
 }
@@ -18463,7 +18499,7 @@ async fn memory_retain_tool_correction_replaces_legacy_untagged_fact() {
             channel: None,
             session_id: None,
             source: MemorySource::Manual,
-            content_text: "Pro E2E testy preferujeme Vitest.".to_owned(),
+            content_text: "We prefer Vitest for E2E tests.".to_owned(),
             tags: Vec::new(),
             confidence: Some(0.9),
             ttl_unix_ms: None,
@@ -18471,7 +18507,7 @@ async fn memory_retain_tool_correction_replaces_legacy_untagged_fact() {
         .await
         .expect("legacy untagged memory should ingest");
 
-    let correction = br#"{"content_text":"Pro E2E testy preferujeme Playwright.","category":"correction","replaces_terms":["Vitest"],"scope":"principal","confidence":0.9}"#;
+    let correction = br#"{"content_text":"We prefer Playwright for E2E tests.","category":"correction","replaces_terms":["Vitest"],"scope":"principal","confidence":0.9}"#;
     let updated =
         execute_memory_retain_tool(&state, context, "01ARZ3NDEKTSV4RRFFQ69G5FB9", correction).await;
     assert!(updated.success, "correction retain should succeed: {}", updated.error);
@@ -18492,7 +18528,7 @@ async fn memory_retain_tool_correction_replaces_legacy_untagged_fact() {
         .await
         .expect("principal memories should list");
     assert_eq!(items.len(), 1, "correction should replace the legacy fact in place");
-    assert_eq!(items[0].content_text, "Pro E2E testy preferujeme Playwright.");
+    assert_eq!(items[0].content_text, "We prefer Playwright for E2E tests.");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -18907,9 +18943,9 @@ async fn memory_reflect_tool_returns_candidates_without_durable_write() {
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_reflect_tool_preserves_boundaries_and_classifies_candidates() {
     let content_text = [
-        "Rozhodnuti: pro projekt pouzivej pnpm S050-DECISION-20260623.",
-        "Riziko: variable_symbol muze byt nejednoznacny S050-RISK-20260623.",
-        "Docasny stav: staging token plati jen dnes S050-TEMP-20260623.",
+        "Decision: use pnpm for this project S050-DECISION-20260623.",
+        "Risk: variable_symbol may be ambiguous S050-RISK-20260623.",
+        "Temporary state: the staging token is valid only today S050-TEMP-20260623.",
     ]
     .join("\n");
     let input_json = serde_json::to_vec(&json!({
@@ -18940,15 +18976,15 @@ async fn memory_reflect_tool_preserves_boundaries_and_classifies_candidates() {
     assert_eq!(categories, vec![Some("facts"), Some("risks"), Some("temporary_state")]);
     assert_eq!(
         candidates[0].get("content_text").and_then(Value::as_str),
-        Some("Rozhodnuti: pro projekt pouzivej pnpm S050-DECISION-20260623.")
+        Some("Decision: use pnpm for this project S050-DECISION-20260623.")
     );
     assert_eq!(
         candidates[1].get("content_text").and_then(Value::as_str),
-        Some("Riziko: variable_symbol muze byt nejednoznacny S050-RISK-20260623.")
+        Some("Risk: variable_symbol may be ambiguous S050-RISK-20260623.")
     );
     assert_eq!(
         candidates[2].get("content_text").and_then(Value::as_str),
-        Some("Docasny stav: staging token plati jen dnes S050-TEMP-20260623.")
+        Some("Temporary state: the staging token is valid only today S050-TEMP-20260623.")
     );
     assert_eq!(
         candidates[2].pointer("/retain_input/category").and_then(Value::as_str),

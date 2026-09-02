@@ -1901,7 +1901,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.process.status",
-            "Check whether a background process PID returned from palyra.process.run is still alive.",
+            "Check whether a background process PID returned from palyra.process.run is still alive and return bounded, redacted stdout/stderr tails captured so far.",
             object_schema(
                 &["pid"],
                 vec![(
@@ -3034,6 +3034,7 @@ mod tests {
             status.input_schema.pointer("/required/0").and_then(serde_json::Value::as_str),
             Some("pid")
         );
+        assert!(status.description.contains("stdout/stderr tails"));
         let list = registry_entry("palyra.process.list").expect("process list entry exists");
         assert!(list.description.contains("tracked for cleanup"));
     }

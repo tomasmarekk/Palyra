@@ -4554,11 +4554,7 @@ fn builtin_process_status_success(
     let completion_reason = terminal.as_ref().map(|state| state.completion_reason);
     let process_exit_code = terminal.as_ref().and_then(|state| state.exit_code);
     let completed_at_unix_ms = terminal.as_ref().map(|state| state.completed_at_unix_ms);
-    let terminal_frame = if alive {
-        Value::Null
-    } else {
-        background_terminal_frame_snapshot(registration.output_monitor.as_ref())
-    };
+    let terminal_frame = background_terminal_frame_snapshot(registration.output_monitor.as_ref());
     let output_json = serde_json::to_vec(&json!({
         "exit_code": 0,
         "stdout": format!(
@@ -5637,6 +5633,56 @@ fn process_runner_policy_for_input(
     let mut effective = policy.clone();
     effective.path_access_mode = requested;
     Ok(effective)
+}
+
+/// Returns whether a process proposal contains a recognized destructive filesystem operation.
+///
+/// This is a side-effect-free approval preflight. It deliberately resolves the workspace and
+/// working directory through the same policy helpers used by execution so interpreter scripts
+/// cannot receive a weaker classification merely because their risk was checked before spawn.
+pub(crate) fn process_run_requires_destructive_approval(
+    policy: &SandboxProcessRunnerPolicy,
+    input_json: &[u8],
+) -> bool {
+    let Ok(input) = parse_process_runner_input(input_json) else {
+        return false;
+    };
+    let Ok(effective_policy) = process_runner_policy_for_input(policy, &input) else {
+        return false;
+    };
+    let Ok(workspace_root) = canonical_workspace_root(effective_policy.workspace_root.as_path())
+    else {
+        return false;
+    };
+    let path_access_mode = process_runner_effective_path_access_mode(&effective_policy);
+    let working_directory = match path_access_mode {
+        PathAccessMode::ApprovedRoots => {
+            let roots = host_access_roots();
+            let path_env = host_access_path_env_for_input(&input);
+            resolve_host_working_directory_with_roots(
+                workspace_root.as_path(),
+                input.cwd.as_deref(),
+                roots.as_slice(),
+                &path_env,
+            )
+        }
+        PathAccessMode::WorkspaceOnly => {
+            resolve_working_directory(workspace_root.as_path(), input.cwd.as_deref())
+        }
+    };
+    let Ok(working_directory) = working_directory else {
+        return false;
+    };
+    classify_process_run(
+        &input,
+        ProcessRiskContext {
+            workspace_root: Some(workspace_root.as_path()),
+            resolved_cwd: Some(working_directory.as_path()),
+        },
+    )
+    .findings
+    .iter()
+    .any(|finding| finding.risk_class == ProcessRiskClass::DestructiveFilesystemOperation)
 }
 
 fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcessRunError> {
@@ -13442,15 +13488,16 @@ mod tests {
         host_access_roots, is_host_allowlisted, maybe_emit_process_progress,
         process_completion_notification_projection, process_failure_message,
         process_failure_output_json, process_output_diagnostic_summary, process_progress_tail,
-        process_runner_command_with_args_message, process_runner_policy_for_input,
-        process_runtime_request_projection, process_success_output_json,
-        process_watch_events_projection, redacted_process_output_preview,
-        redacted_process_output_text, resolve_host_executable_path_with_roots,
-        resolve_host_working_directory, resolve_host_working_directory_with_roots,
-        resolve_scoped_path, resolve_working_directory, rewrite_arguments_to_scoped_paths,
-        rewrite_host_access_process_args, rewrite_host_virtual_workspace_args,
-        run_constrained_process, run_constrained_process_with_fault_injection,
-        same_path_case_aware, tier_c_plan_inner_path_index, validate_allowed_executable,
+        process_run_requires_destructive_approval, process_runner_command_with_args_message,
+        process_runner_policy_for_input, process_runtime_request_projection,
+        process_success_output_json, process_watch_events_projection,
+        redacted_process_output_preview, redacted_process_output_text,
+        resolve_host_executable_path_with_roots, resolve_host_working_directory,
+        resolve_host_working_directory_with_roots, resolve_scoped_path, resolve_working_directory,
+        rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
+        rewrite_host_virtual_workspace_args, run_constrained_process,
+        run_constrained_process_with_fault_injection, same_path_case_aware,
+        tier_c_plan_inner_path_index, validate_allowed_executable,
         validate_argument_workspace_scope, validate_cmd_invocation_shape,
         validate_host_argument_scope, validate_host_argument_scope_with_roots,
         validate_host_interpreter_argument_guardrails,
@@ -17345,6 +17392,31 @@ mod tests {
     }
 
     #[test]
+    fn destructive_script_requires_approval_before_process_spawn() {
+        let workspace = tempfile::tempdir().expect("temp workspace should be created");
+        fs::write(
+            workspace.path().join("cleanup.py"),
+            b"import shutil\nshutil.rmtree('generated')\n",
+        )
+        .expect("cleanup script should be written");
+        fs::write(workspace.path().join("verify.py"), b"print('ok')\n")
+            .expect("verification script should be written");
+        let policy = sandbox_policy_with_allowed_executables(
+            workspace.path().to_path_buf(),
+            vec!["python".to_owned()],
+        );
+
+        assert!(process_run_requires_destructive_approval(
+            &policy,
+            br#"{"command":"python","args":["cleanup.py"]}"#,
+        ));
+        assert!(!process_run_requires_destructive_approval(
+            &policy,
+            br#"{"command":"python","args":["verify.py"]}"#,
+        ));
+    }
+
+    #[test]
     fn run_constrained_process_executes_portable_directory_listing_builtin() {
         let workspace = unique_temp_dir("workspace-list-builtin");
         let nested = workspace.join("src");
@@ -19326,6 +19398,11 @@ mod tests {
         let status_output: serde_json::Value =
             serde_json::from_slice(&status.output_json).expect("status output should parse");
         assert_eq!(status_output.get("alive").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            status_output.pointer("/terminal_frame/available").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "live process status should expose the bounded output snapshot"
+        );
 
         let stop_input = serde_json::to_vec(&serde_json::json!({
             "command": "palyra.process.stop",

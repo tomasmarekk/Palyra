@@ -5709,33 +5709,6 @@ impl GatewayRuntimeState {
             .or_else(|| self.run_background_process(run_id, pid))
     }
 
-    /// Lists active and completed PIDs retained for model-visible diagnostics in this run.
-    pub(crate) fn list_run_background_process_history(
-        &self,
-        run_id: &str,
-    ) -> Vec<RunOwnedBackgroundProcess> {
-        let run_id = run_id.trim();
-        if run_id.is_empty() {
-            return Vec::new();
-        }
-        let mut history = self
-            .run_process_history
-            .lock()
-            .ok()
-            .and_then(|history_by_run| history_by_run.get(run_id).cloned())
-            .map(|history| history.processes.into_iter().collect::<Vec<_>>())
-            .unwrap_or_default();
-        for process in self.list_run_background_processes(run_id) {
-            if !history
-                .iter()
-                .any(|existing| existing.ownership_root_pid() == process.ownership_root_pid())
-            {
-                history.push(process);
-            }
-        }
-        history
-    }
-
     /// Drops terminal diagnostics once no further tool turn can belong to the owning run.
     pub(crate) fn clear_run_background_process_history(&self, run_id: &str) {
         let run_id = run_id.trim();
@@ -17230,6 +17203,26 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.cron_job_blocking(job_id.as_str()))
             .await
             .map_err(|_| Status::internal("cron read worker panicked"))?
+    }
+
+    /// Loads a cron job for run-history authorization, including a deleted tombstone.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn cron_job_for_history(
+        self: &Arc<Self>,
+        job_id: String,
+    ) -> Result<Option<CronJobRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .cron_job_for_history(job_id.as_str())
+                .map_err(|error| map_cron_store_error("load cron job history owner", error))
+        })
+        .await
+        .map_err(|_| Status::internal("cron history read worker panicked"))?
     }
 
     /// Atomically admits or rejects one scheduler-owned autonomous wake.

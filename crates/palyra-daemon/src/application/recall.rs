@@ -2941,9 +2941,9 @@ mod tests {
 
     #[test]
     fn query_variants_expand_sparse_ui_smoke_prompts_to_test_runner_terms() {
-        let variants = build_query_variants("Priprav smoke test pro UI.");
+        let variants = build_query_variants("Prepare a smoke test for the UI.");
 
-        assert_eq!(variants[0], "Priprav smoke test pro UI.");
+        assert_eq!(variants[0], "Prepare a smoke test for the UI.");
         assert!(
             variants.iter().any(|variant| variant.contains("e2e")
                 && variant.contains("test-runner")

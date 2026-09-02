@@ -349,7 +349,7 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
         )?;
         let job = self
             .state
-            .cron_job(job_id.clone())
+            .cron_job_for_history(job_id.clone())
             .await?
             .ok_or_else(|| Status::not_found(format!("cron job not found: {job_id}")))?;
         enforce_cron_job_owner(context.principal.as_str(), job.owner_principal.as_str())?;
@@ -388,7 +388,7 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             .ok_or_else(|| Status::not_found(format!("cron run not found: {run_id}")))?;
         let job = self
             .state
-            .cron_job(run.job_id.clone())
+            .cron_job_for_history(run.job_id.clone())
             .await?
             .ok_or_else(|| Status::internal("cron job for run not found"))?;
         enforce_cron_job_owner(context.principal.as_str(), job.owner_principal.as_str())?;

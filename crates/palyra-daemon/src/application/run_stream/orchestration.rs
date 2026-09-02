@@ -182,11 +182,12 @@ use crate::{
 use super::{
     admission_ingress::{admission_environment, RunStreamAdmissionIngress},
     agent_loop::{
-        AgentLoopTerminationReason, AgentRunLoopState, FinalizationVerificationReport,
-        FinalizationVerificationStatus, RunProgressAttempt, RunProgressController,
-        RunProgressIntervention, RunProgressOutcomeClass, DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS,
-        TOOL_LOOP_GUIDANCE_INJECTED_EVENT, TOOL_LOOP_WARNING_EVENT,
-        VERIFICATION_FINALIZER_NUDGE_EVENT, VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT,
+        AgentLoopTerminationReason, AgentLoopUsageSnapshot, AgentRunLoopState,
+        FinalizationVerificationReport, FinalizationVerificationStatus, RunProgressAttempt,
+        RunProgressController, RunProgressIntervention, RunProgressOutcomeClass,
+        DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS, TOOL_LOOP_GUIDANCE_INJECTED_EVENT,
+        TOOL_LOOP_WARNING_EVENT, VERIFICATION_FINALIZER_NUDGE_EVENT,
+        VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT,
     },
     cancellation::{
         record_run_interrupt_observation, request_persisted_run_interrupt,
@@ -240,10 +241,50 @@ const MAX_FOLLOWUP_TIMEOUT_RECOVERY_ATTEMPTS: u8 = 1;
 const MAX_LENGTH_RECOVERY_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundBudgetScope {
+    TotalTokens,
+    CompletionTokens,
+}
+
+impl BackgroundBudgetScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TotalTokens => "total_tokens",
+            Self::CompletionTokens => "completion_tokens",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackgroundRunBudget {
+    tokens: u64,
+    scope: BackgroundBudgetScope,
+}
+
+impl BackgroundRunBudget {
+    const fn total(tokens: u64) -> Self {
+        Self { tokens, scope: BackgroundBudgetScope::TotalTokens }
+    }
+
+    const fn completion(tokens: u64) -> Self {
+        Self { tokens, scope: BackgroundBudgetScope::CompletionTokens }
+    }
+
+    fn consumed_tokens(self, usage: &AgentLoopUsageSnapshot) -> u64 {
+        match self.scope {
+            BackgroundBudgetScope::TotalTokens => usage.total_tokens,
+            BackgroundBudgetScope::CompletionTokens => usage.completion_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackgroundBudgetGuardDecision {
     budget_tokens: u64,
+    budget_scope: BackgroundBudgetScope,
     consumed_tokens: u64,
     estimated_input_tokens: u64,
+    accounted_input_tokens: u64,
     max_output_tokens: u64,
 }
 
@@ -254,8 +295,10 @@ impl BackgroundBudgetGuardDecision {
             "event": "agent_loop.background_budget_guard",
             "status": "applied",
             "budget_tokens": self.budget_tokens,
+            "budget_scope": self.budget_scope.as_str(),
             "consumed_tokens": self.consumed_tokens,
             "estimated_input_tokens": self.estimated_input_tokens,
+            "accounted_input_tokens": self.accounted_input_tokens,
             "max_output_tokens": self.max_output_tokens,
         })
         .to_string()
@@ -806,12 +849,20 @@ fn provider_model_override_for_routing(
         .then(|| actual_model_id.to_owned())
 }
 
-fn background_run_budget_tokens(parameter_delta_json: Option<&str>) -> Option<u64> {
+fn background_run_budget_tokens(parameter_delta_json: Option<&str>) -> Option<BackgroundRunBudget> {
     let parsed = serde_json::from_str::<Value>(parameter_delta_json?).ok()?;
-    parsed
+    let tokens = parsed
         .pointer("/background_task/budget_tokens")
         .and_then(Value::as_u64)
-        .filter(|value| *value > 0)
+        .filter(|value| *value > 0)?;
+    let scope = match parsed.pointer("/background_task/budget_scope").and_then(Value::as_str) {
+        Some("completion_tokens") => BackgroundBudgetScope::CompletionTokens,
+        Some("total_tokens") | Some(_) | None => BackgroundBudgetScope::TotalTokens,
+    };
+    Some(match scope {
+        BackgroundBudgetScope::TotalTokens => BackgroundRunBudget::total(tokens),
+        BackgroundBudgetScope::CompletionTokens => BackgroundRunBudget::completion(tokens),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -901,18 +952,24 @@ fn delegated_run_admission(
 
 fn apply_background_budget_guard(
     request: &mut ProviderRequest,
-    budget_tokens: u64,
+    budget: BackgroundRunBudget,
     consumed_tokens: u64,
     provider_context_limit_tokens: u64,
 ) -> Result<BackgroundBudgetGuardDecision, String> {
     let estimated_input_tokens = runtime_kernel_provider_request_input_tokens(request);
-    let committed_tokens = consumed_tokens.saturating_add(estimated_input_tokens);
-    if committed_tokens >= budget_tokens {
+    let accounted_input_tokens = match budget.scope {
+        BackgroundBudgetScope::TotalTokens => estimated_input_tokens,
+        BackgroundBudgetScope::CompletionTokens => 0,
+    };
+    let committed_tokens = consumed_tokens.saturating_add(accounted_input_tokens);
+    if committed_tokens >= budget.tokens {
         return Err(format!(
-            "background task token budget exhausted before provider turn: budget_tokens={budget_tokens} consumed_tokens={consumed_tokens} estimated_input_tokens={estimated_input_tokens}"
+            "background task token budget exhausted before provider turn: budget_tokens={} budget_scope={} consumed_tokens={consumed_tokens} estimated_input_tokens={estimated_input_tokens} accounted_input_tokens={accounted_input_tokens}",
+            budget.tokens,
+            budget.scope.as_str(),
         ));
     }
-    let available_output_tokens = budget_tokens.saturating_sub(committed_tokens).max(1);
+    let available_output_tokens = budget.tokens.saturating_sub(committed_tokens).max(1);
     let available_provider_output_tokens =
         provider_context_limit_tokens.saturating_sub(estimated_input_tokens).max(1);
     // A task budget is a cumulative ceiling, not a request for one provider turn to consume every
@@ -927,17 +984,24 @@ fn apply_background_budget_guard(
         .max(1);
     request.max_output_tokens = Some(max_output_tokens);
     Ok(BackgroundBudgetGuardDecision {
-        budget_tokens,
+        budget_tokens: budget.tokens,
+        budget_scope: budget.scope,
         consumed_tokens,
         estimated_input_tokens,
+        accounted_input_tokens,
         max_output_tokens,
     })
 }
 
-fn background_budget_overrun_message(budget_tokens: u64, consumed_tokens: u64) -> Option<String> {
-    (consumed_tokens > budget_tokens).then(|| {
+fn background_budget_overrun_message(
+    budget: BackgroundRunBudget,
+    consumed_tokens: u64,
+) -> Option<String> {
+    (consumed_tokens > budget.tokens).then(|| {
         format!(
-            "background task token budget exhausted after provider turn: budget_tokens={budget_tokens} consumed_tokens={consumed_tokens}"
+            "background task token budget exhausted after provider turn: budget_tokens={} budget_scope={} consumed_tokens={consumed_tokens}",
+            budget.tokens,
+            budget.scope.as_str(),
         )
     })
 }
@@ -4009,7 +4073,7 @@ pub(crate) async fn process_run_stream_message(
     in_progress_emitted: &mut bool,
     remaining_tool_budget: &mut u32,
     previous_session_run_id: &mut Option<String>,
-    active_background_budget_tokens: &mut Option<u64>,
+    active_background_budget_tokens: &mut Option<BackgroundRunBudget>,
     active_approval_cache_generation: &mut Option<u64>,
     active_flow_control: &mut Option<RunStreamFlowControl>,
     active_attempt_owner: &mut Option<String>,
@@ -4157,7 +4221,7 @@ async fn process_run_stream_message_inner(
     in_progress_emitted: &mut bool,
     remaining_tool_budget: &mut u32,
     previous_session_run_id: &mut Option<String>,
-    active_background_budget_tokens: &mut Option<u64>,
+    active_background_budget_tokens: &mut Option<BackgroundRunBudget>,
     active_approval_cache_generation: &mut Option<u64>,
     active_flow_control: &mut Option<RunStreamFlowControl>,
     harness_lifecycle: &mut Option<RunStreamHarnessLifecycle>,
@@ -4201,10 +4265,10 @@ async fn process_run_stream_message_inner(
         message.origin_run_id.as_ref().map(|value| value.ulid.as_str()),
         parameter_delta_json.as_deref(),
     )?;
-    if let Some(budget_tokens) = background_run_budget_tokens(parameter_delta_json.as_deref()) {
-        *active_background_budget_tokens = Some(budget_tokens);
+    if let Some(budget) = background_run_budget_tokens(parameter_delta_json.as_deref()) {
+        *active_background_budget_tokens = Some(budget);
     }
-    let background_budget_tokens = *active_background_budget_tokens;
+    let background_budget = *active_background_budget_tokens;
     if active_run_id.is_none() {
         if message.reset_session {
             // Reset authorization must complete before the journal mutates the
@@ -5348,8 +5412,9 @@ async fn process_run_stream_message_inner(
             .model_override
             .clone()
             .unwrap_or_else(|| routing_decision.actual_model_id.clone());
-        if let Some(budget_tokens) = background_budget_tokens {
-            let consumed_tokens = loop_state.snapshot(run_id.as_str(), None).usage.total_tokens;
+        if let Some(budget) = background_budget {
+            let usage = loop_state.snapshot(run_id.as_str(), None).usage;
+            let consumed_tokens = budget.consumed_tokens(&usage);
             let provider_context_limit_tokens = provider_context_limit_tokens_for_route(
                 &provider_snapshot,
                 lease_provider_id.as_str(),
@@ -5357,7 +5422,7 @@ async fn process_run_stream_message_inner(
             );
             match apply_background_budget_guard(
                 &mut provider_request,
-                budget_tokens,
+                budget,
                 consumed_tokens,
                 provider_context_limit_tokens,
             ) {
@@ -5991,10 +6056,10 @@ async fn process_run_stream_message_inner(
         )
         .await?;
         loop_state.record_provider_response(&provider_response);
-        if let Some(budget_tokens) = background_budget_tokens {
-            let consumed_tokens = loop_state.snapshot(run_id.as_str(), None).usage.total_tokens;
-            if let Some(message) = background_budget_overrun_message(budget_tokens, consumed_tokens)
-            {
+        if let Some(budget) = background_budget {
+            let usage = loop_state.snapshot(run_id.as_str(), None).usage;
+            let consumed_tokens = budget.consumed_tokens(&usage);
+            if let Some(message) = background_budget_overrun_message(budget, consumed_tokens) {
                 record_run_stream_provider_usage(
                     runtime_state,
                     run_id.as_str(),
@@ -8087,11 +8152,6 @@ fn user_message_requests_closeout_summary(normalized: &str) -> bool {
     const CLOSEOUT_SUMMARY_MARKERS: &[&str] = &[
         "closeout",
         "final summary",
-        "finalni summary",
-        "finalni shrnuti",
-        "shrnut",
-        "shrnuti",
-        "stav",
         "status",
         "stop summary",
         "summarise",
@@ -8104,17 +8164,11 @@ fn user_message_requests_closeout_summary(normalized: &str) -> bool {
 
 fn user_message_blocks_more_tool_work(normalized: &str) -> bool {
     const NO_MORE_TOOL_MARKERS: &[&str] = &[
-        "bez dalsich tool",
-        "bez dalsich toolu",
-        "bez tool callu",
-        "bez toolu",
         "final-only",
-        "jen final",
         "no further tool",
         "no more tool",
         "no tool calls",
         "no tools",
-        "pouze final",
         "without further tool",
         "without running any more tool",
         "without tool",
@@ -8126,9 +8180,6 @@ fn user_message_blocks_more_tool_work(normalized: &str) -> bool {
         "interrupt active run",
         "stop active run",
         "stop the active run",
-        "zastav",
-        "zrus aktivni run",
-        "zrusit aktivni run",
     ];
 
     NO_MORE_TOOL_MARKERS.iter().any(|marker| normalized.contains(marker))

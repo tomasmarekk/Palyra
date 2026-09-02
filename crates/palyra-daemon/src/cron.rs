@@ -4408,26 +4408,17 @@ async fn execute_single_job_attempt(
         .await?
         .unwrap_or_else(|| fallback_usage_snapshot(&orchestrator_run_id, &session_id, job));
 
-    let requires_completion_tool = cron_job_requires_completion_tool(job);
     let terminal_status = cron_terminal_status_from_stream(
         saw_done,
         saw_failed,
         tool_denies,
         successful_completion_tools,
-        requires_completion_tool,
     );
-    let missing_required_completion_tool = saw_done
-        && terminal_status == CronRunStatus::Failed
-        && requires_completion_tool
-        && successful_completion_tools == 0
-        && tool_denies == 0;
 
     let error_kind = if terminal_status == CronRunStatus::Succeeded {
         None
     } else if terminal_status == CronRunStatus::Denied {
         Some("policy_denied".to_owned())
-    } else if missing_required_completion_tool {
-        Some("completion_tool_missing".to_owned())
     } else {
         Some("run_failed".to_owned())
     };
@@ -4435,9 +4426,6 @@ async fn execute_single_job_attempt(
         CronRunStatus::Succeeded => None,
         CronRunStatus::Denied if saw_done && tool_denies > 0 => Some(format!(
             "cron attempt {attempt} completed after {tool_denies} denied tool calls without a successful completion tool result"
-        )),
-        CronRunStatus::Failed if missing_required_completion_tool => Some(format!(
-            "cron attempt {attempt} completed without a successful completion tool result required by the routine file/workspace side-effect prompt"
         )),
         _ => Some(format!("cron attempt {attempt} failed")),
     };
@@ -4463,21 +4451,18 @@ async fn execute_single_job_attempt(
 /// Derives the terminal run status from observed stream signals.
 ///
 /// Denied takes precedence over success when tools were denied and no
-/// completion tool succeeded, so model text cannot spoof a clean completion.
-/// Side-effect routines additionally fail without completion-tool evidence.
+/// completion tool succeeded, so model text cannot spoof a policy denial.
+/// Otherwise the canonical run-stream finalizer owns completion validation;
+/// the scheduler must not reinterpret arbitrary natural-language prompts.
 fn cron_terminal_status_from_stream(
     saw_done: bool,
     saw_failed: bool,
     tool_denies: u64,
     successful_completion_tools: u64,
-    requires_completion_tool: bool,
 ) -> CronRunStatus {
     if saw_done {
         if tool_denies > 0 && successful_completion_tools == 0 {
             return CronRunStatus::Denied;
-        }
-        if requires_completion_tool && successful_completion_tools == 0 {
-            return CronRunStatus::Failed;
         }
         return CronRunStatus::Succeeded;
     }
@@ -4485,36 +4470,6 @@ fn cron_terminal_status_from_stream(
         return CronRunStatus::Denied;
     }
     CronRunStatus::Failed
-}
-
-/// Heuristic: prompts that promise file/workspace side effects must show a
-/// successful mutation tool before the run may count as succeeded.
-fn cron_job_requires_completion_tool(job: &CronJobRecord) -> bool {
-    let prompt = format!("{} {}", job.name, job.prompt).to_ascii_lowercase();
-    cron_prompt_mentions_side_effect(prompt.as_str())
-        && cron_prompt_mentions_file_or_workspace_target(prompt.as_str())
-}
-
-fn cron_prompt_mentions_side_effect(prompt: &str) -> bool {
-    // Mutation verbs cover the multilingual routine prompt corpus.
-    [
-        "append", "write", "create", "update", "edit", "save", "delete", "remove", "modify",
-        "backup", "generate", "touch", "pridej", "vytvor", "zapis", "uprav", "smaz", "uloz",
-    ]
-    .iter()
-    .any(|needle| prompt.contains(needle))
-}
-
-fn cron_prompt_mentions_file_or_workspace_target(prompt: &str) -> bool {
-    if prompt.contains('\\')
-        || prompt.contains("/workspace")
-        || prompt.contains("workspace/")
-        || prompt.contains(" file")
-        || prompt.contains(" soubor")
-    {
-        return true;
-    }
-    CRON_FILE_TARGET_SUFFIXES.iter().any(|needle| prompt.contains(needle))
 }
 
 const CRON_FILE_TARGET_SUFFIXES: &[&str] = &[
@@ -5004,19 +4959,19 @@ mod tests {
         budgeted_objective_run_count, build_cron_prompt, build_scheduler_health_snapshot,
         compute_misfire_recovery_plan, compute_next_run_after,
         cron_completion_candidate_for_tool_proposal, cron_completion_target_hints,
-        cron_job_requires_completion_tool, cron_misfire_audit_payload,
-        cron_reconciliation_projection, cron_terminal_status_from_stream,
-        decide_concurrency_policy, deferred_one_shot_should_be_disabled,
-        effective_cron_session_key, effective_cron_session_label,
-        host_only_routine_terminal_projection, load_periodic_reaudit_skills_index,
-        max_runs_for_job, merged_parameter_delta_json, next_run_at_for_enabled_state,
-        normalize_schedule, now_unix_ms_or_fallback, panicked_cron_run_finalize_request,
-        parse_skill_reaudit_interval, periodic_reaudit_targets, reserved_cron_run_slot_count,
-        routine_approval_granted_rearm_patch, routine_approval_pending_pause_patch,
-        routine_approval_subject_id, routine_gate_error_kind, routine_parameter_delta_json,
-        routines_automation_enabled, scheduled_routine_approval_matches,
-        scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
-        scheduler_attempt_failure, scheduler_retry_backoff_delay_ms, scheduler_sleep_duration,
+        cron_misfire_audit_payload, cron_reconciliation_projection,
+        cron_terminal_status_from_stream, decide_concurrency_policy,
+        deferred_one_shot_should_be_disabled, effective_cron_session_key,
+        effective_cron_session_label, host_only_routine_terminal_projection,
+        load_periodic_reaudit_skills_index, max_runs_for_job, merged_parameter_delta_json,
+        next_run_at_for_enabled_state, normalize_schedule, now_unix_ms_or_fallback,
+        panicked_cron_run_finalize_request, parse_skill_reaudit_interval, periodic_reaudit_targets,
+        reserved_cron_run_slot_count, routine_approval_granted_rearm_patch,
+        routine_approval_pending_pause_patch, routine_approval_subject_id, routine_gate_error_kind,
+        routine_parameter_delta_json, routines_automation_enabled,
+        scheduled_routine_approval_matches, scheduled_routine_requires_first_run_approval,
+        scheduled_routine_run_metadata_upsert, scheduler_attempt_failure,
+        scheduler_retry_backoff_delay_ms, scheduler_sleep_duration,
         should_disable_exhausted_scheduled_one_shot,
         should_pause_recurring_cron_after_policy_denied, should_repair_stale_cron_run,
         visible_cron_job_enabled, ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction,
@@ -5891,60 +5846,25 @@ mod tests {
 
     #[test]
     fn cron_terminal_status_uses_structured_completion_tools_for_done_runs() {
+        assert_eq!(cron_terminal_status_from_stream(true, false, 1, 0), CronRunStatus::Denied,);
         assert_eq!(
-            cron_terminal_status_from_stream(true, false, 1, 0, false),
-            CronRunStatus::Denied,
-        );
-        assert_eq!(
-            cron_terminal_status_from_stream(true, false, 1, 1, true),
+            cron_terminal_status_from_stream(true, false, 1, 1),
             CronRunStatus::Succeeded,
             "model text must not spoof policy denial after a structured completion tool succeeds",
         );
-        assert_eq!(
-            cron_terminal_status_from_stream(true, false, 0, 0, false),
-            CronRunStatus::Succeeded,
-        );
-        assert_eq!(
-            cron_terminal_status_from_stream(true, false, 0, 0, true),
-            CronRunStatus::Failed,
-            "file/workspace side-effect routines must not succeed without a completion tool",
-        );
+        assert_eq!(cron_terminal_status_from_stream(true, false, 0, 0), CronRunStatus::Succeeded,);
     }
 
     #[test]
-    fn file_side_effect_routine_prompts_require_completion_tools() {
+    fn routine_completion_target_hints_remain_available_for_policy_denial_resolution() {
         let mut file_job =
             sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAV", Some(1_000), CronMisfirePolicy::Skip);
         file_job.prompt =
             r"Append the current timestamp to reports\heartbeat-cron.log every run.".to_owned();
-        assert!(
-            cron_job_requires_completion_tool(&file_job),
-            "append-to-file routines require structured completion evidence"
-        );
         assert_eq!(
             cron_completion_target_hints(&file_job),
             vec!["reports/heartbeat-cron.log".to_owned()],
             "explicit file targets must bind the accepted mutation result"
-        );
-
-        let mut text_job =
-            sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAW", Some(1_000), CronMisfirePolicy::Skip);
-        text_job.prompt = "Summarize current heartbeat status in one short paragraph.".to_owned();
-        assert!(
-            !cron_job_requires_completion_tool(&text_job),
-            "text-only routines should still be able to succeed from a final response"
-        );
-
-        let mut dedupe_job =
-            sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAX", Some(1_000), CronMisfirePolicy::Skip);
-        dedupe_job.prompt = concat!(
-            "Read feed/items.json and append only new ids to reports/feed.md. ",
-            "If there are no new ids, skip already-known ids without modifying the file."
-        )
-        .to_owned();
-        assert!(
-            cron_job_requires_completion_tool(&dedupe_job),
-            "dedupe routines still require mutation evidence when they change files"
         );
     }
 
@@ -6155,7 +6075,7 @@ mod tests {
     fn model_induced_tool_denials_do_not_pause_recurring_jobs() {
         let every_job =
             sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAV", Some(1_000), CronMisfirePolicy::Skip);
-        let terminal_status = cron_terminal_status_from_stream(true, false, 1, 0, false);
+        let terminal_status = cron_terminal_status_from_stream(true, false, 1, 0);
 
         assert_eq!(terminal_status, CronRunStatus::Denied);
         assert!(!should_pause_recurring_cron_after_policy_denied(

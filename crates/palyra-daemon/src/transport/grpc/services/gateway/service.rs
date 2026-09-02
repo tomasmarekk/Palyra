@@ -2279,7 +2279,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             let mut in_progress_emitted = false;
             let mut remaining_tool_budget = 0_u32;
             let mut previous_session_run_id = None::<String>;
-            let mut background_budget_tokens = None::<u64>;
+            let mut background_budget_tokens = None;
             let mut active_approval_cache_generation = None::<u64>;
             let mut active_flow_control = None;
             let mut active_attempt_owner = None::<String>;
