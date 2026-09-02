@@ -735,6 +735,9 @@ fn generate_admin_token() -> String {
 
 const DEFAULT_ADMIN_BOUND_PRINCIPAL: &str = "admin:local";
 const LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS: i64 = 10 * 60_000;
+// Admin status aggregates several runtime subsystems and can legitimately take
+// longer than the fast health-probe budget on a cold or resource-constrained host.
+const ADMIN_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 // Local init exposes HTTP fetch but never provisions credential recipients.
 const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.echo",
@@ -9301,6 +9304,7 @@ fn fetch_admin_status_payload_raw(
             device_id,
             channel,
             trace_id,
+            timeout: Some(ADMIN_STATUS_REQUEST_TIMEOUT),
         },
     )
 }
@@ -9313,6 +9317,7 @@ struct AdminJsonFetchRequest<'a> {
     device_id: String,
     channel: Option<String>,
     trace_id: Option<String>,
+    timeout: Option<Duration>,
 }
 
 fn fetch_admin_json_payload_raw(
@@ -9328,6 +9333,9 @@ fn fetch_admin_json_payload_raw(
         .get(endpoint_url)
         .header("x-palyra-principal", fetch_request.principal)
         .header("x-palyra-device-id", fetch_request.device_id);
+    if let Some(timeout) = fetch_request.timeout {
+        http_request = http_request.timeout(timeout);
+    }
     if let Some(token) = fetch_request.token {
         http_request = http_request.header("Authorization", format!("Bearer {token}"));
     }
@@ -14247,7 +14255,8 @@ mod cli_v1_tests {
     use super::{
         build_doctor_checks, build_doctor_report_offline, build_journal_checkpoint_attestation,
         build_support_bundle_diagnostics_snapshot, build_windows_browser_open_commands,
-        compare_semver_versions, ensure_remote_registry_same_origin, fetch_limited_bytes,
+        compare_semver_versions, ensure_remote_registry_same_origin,
+        fetch_admin_status_payload_raw, fetch_limited_bytes,
         fetch_remote_registry_entries_with_fetcher, is_retryable_grpc_error,
         memory_embeddings_model_configured, normalize_browser_open_url, normalize_client_socket,
         normalize_installed_skills_index, normalize_prompt_secret_value,
@@ -14303,6 +14312,29 @@ mod cli_v1_tests {
             let _ = stream.flush();
         });
         (format!("http://{address}/registry/index.json"), handle)
+    }
+
+    fn spawn_delayed_one_shot_http_server(
+        body: Vec<u8>,
+        delay: Duration,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test TCP listener should bind");
+        let address = listener.local_addr().expect("listener should report local address");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test server should accept one client");
+            let mut request_buffer = [0_u8; 512];
+            let _ = stream.read(&mut request_buffer);
+            thread::sleep(delay);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(headers.as_bytes()).is_ok() {
+                let _ = stream.write_all(body.as_slice());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{address}"), handle)
     }
 
     fn trust_store_with_registry_key(publisher: &str, signing_key: &SigningKey) -> SkillTrustStore {
@@ -15154,6 +15186,32 @@ pinned_gateway_ca_fingerprint_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         let payload =
             fetch_limited_bytes(&client, url.as_str(), expected.len()).expect("fetch should pass");
         assert_eq!(payload, expected);
+        server.join().expect("server thread should exit");
+    }
+
+    #[test]
+    fn admin_status_request_overrides_fast_probe_client_timeout() {
+        let (url, server) = spawn_delayed_one_shot_http_server(
+            br#"{"status":"ok"}"#.to_vec(),
+            Duration::from_millis(100),
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(10))
+            .build()
+            .expect("HTTP client should build");
+
+        let payload = fetch_admin_status_payload_raw(
+            &client,
+            url.as_str(),
+            None,
+            "admin:local".to_owned(),
+            "test-device".to_owned(),
+            None,
+            None,
+        )
+        .expect("admin status should use its dedicated request timeout");
+
+        assert_eq!(payload.get("status").and_then(Value::as_str), Some("ok"));
         server.join().expect("server thread should exit");
     }
 

@@ -129,6 +129,7 @@ fn load_runtime_method_registry_snapshot() -> Result<Value> {
             device_id: connection.device_id,
             channel: Some(connection.channel),
             trace_id: Some(connection.trace_id),
+            timeout: None,
         },
     )?;
     redact_json_value_tree(&mut payload, None);

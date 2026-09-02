@@ -19,8 +19,8 @@ const LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES: usize = 1024;
 /// Runs a `palyra run` subcommand.
 ///
 /// # Errors
-/// Returns an error when the journal cannot be read, the replay bundle fails
-/// deterministic validation, or the requested artifact cannot be written.
+/// Returns an error when the journal cannot be read, bundle integrity cannot
+/// be established, or the requested artifact cannot be written.
 pub(crate) fn run_run(command: RunCommand) -> Result<()> {
     match command {
         RunCommand::Wait { run_id, timeout_ms, return_on_waiting, json } => {
@@ -336,20 +336,39 @@ fn build_run_trajectory_jsonl(
     redacted: bool,
 ) -> Result<(Vec<u8>, String)> {
     let export_manifest = build_run_export_manifest(bundle, format, redacted)?;
-    let mut artifact_index = bundle
-        .artifact_refs
-        .iter()
-        .map(|artifact| {
-            json!({
-                "artifact_id": artifact.artifact_id,
-                "kind": artifact.kind,
-                "reference": artifact.reference,
-                "sha256": artifact.sha256,
-                "size_bytes": artifact.size_bytes,
+    let replay_report = replay_bundle_offline(bundle);
+    let quarantined = !replay_report.validation.valid;
+    let mut artifact_index = if quarantined {
+        Vec::new()
+    } else {
+        bundle
+            .artifact_refs
+            .iter()
+            .map(|artifact| {
+                json!({
+                    "artifact_id": artifact.artifact_id,
+                    "kind": artifact.kind,
+                    "reference": artifact.reference,
+                    "sha256": artifact.sha256,
+                    "size_bytes": artifact.size_bytes,
+                })
             })
-        })
-        .collect::<Vec<_>>();
-    let events = build_run_trajectory_events(bundle, &mut artifact_index)?;
+            .collect::<Vec<_>>()
+    };
+    let events = if quarantined {
+        let mut rows = Vec::new();
+        let mut seq = 0_i64;
+        push_trajectory_row(
+            &mut rows,
+            &mut seq,
+            "replay_verification_failure",
+            "replay_verification",
+            safe_replay_audit_summary(bundle, &replay_report),
+        );
+        rows
+    } else {
+        build_run_trajectory_events(bundle, &mut artifact_index)?
+    };
     let events_sha256 = sha256_trajectory_events(events.as_slice())?;
     let mut manifest_line = json!({
         "schema_version": RUN_TRAJECTORY_JSONL_SCHEMA_VERSION,
@@ -357,6 +376,7 @@ fn build_run_trajectory_jsonl(
         "format": RUN_TRAJECTORY_JSONL_FORMAT,
         "requested_format": format.as_str(),
         "redacted": redacted,
+        "quarantined": quarantined,
         "run_id": bundle.source.run_id,
         "session_id": bundle.source.session_id,
         "manifest": export_manifest,
@@ -383,7 +403,8 @@ fn build_run_trajectory_jsonl(
             "verification_summary",
             "final_answer",
             "usage",
-            "artifact"
+            "artifact",
+            "replay_verification"
         ],
     });
     let manifest_hash = sha256_json_value(&manifest_line)?;
@@ -1806,6 +1827,17 @@ fn build_run_export_payload(
     redacted: bool,
 ) -> Result<Value> {
     let manifest = build_run_export_manifest(bundle, format, redacted)?;
+    let replay_report = replay_bundle_offline(bundle);
+    if !replay_report.validation.valid {
+        return Ok(json!({
+            "schema_version": 1,
+            "format": format.as_str(),
+            "redacted": redacted,
+            "quarantined": true,
+            "manifest": manifest,
+            "audit": safe_replay_audit_summary(bundle, &replay_report),
+        }));
+    }
     let verification_summary = build_run_verification_summary(bundle);
     let payload = match format {
         RunExportFormatArg::PalyraAttested => json!({
@@ -1912,13 +1944,10 @@ fn build_run_export_manifest(
         anyhow::bail!("replay bundle canonical digest verification failed");
     }
     let replay_report = replay_bundle_offline(bundle);
-    if replay_report.status != ReplayRunStatus::Passed {
-        anyhow::bail!(
-            "replay bundle offline verification failed with {} diffs and {} validation issues",
-            replay_report.diffs.len(),
-            replay_report.validation.issues.len()
-        );
-    }
+    let replay_status = match replay_report.status {
+        ReplayRunStatus::Passed => "passed",
+        ReplayRunStatus::Failed => "failed",
+    };
     let instruction_hash = bundle
         .run
         .normalized_user_input
@@ -1932,7 +1961,13 @@ fn build_run_export_manifest(
         "replay_bundle_contract_version": bundle.contract_version,
         "replay_bundle_sha256": canonical_sha256,
         "digest_verified": true,
-        "offline_replay_status": "passed",
+        "offline_replay_status": replay_status,
+        "offline_replay_verification": {
+            "checked_categories": replay_report.checked_categories,
+            "diff_categories": replay_report.diff_categories,
+            "diffs": replay_report.diffs,
+            "validation": replay_report.validation,
+        },
         "instruction_hash_sha256": instruction_hash,
         "includes": {
             "user_input": bundle.run.normalized_user_input.is_some(),
@@ -1965,6 +2000,33 @@ fn build_run_export_manifest(
         ],
         "redaction": bundle.redaction,
     }))
+}
+
+fn safe_replay_audit_summary(
+    bundle: &ReplayBundle,
+    replay_report: &palyra_common::replay_bundle::ReplayRunReport,
+) -> Value {
+    json!({
+        "bundle_id": bundle.bundle_id,
+        "source": bundle.source,
+        "run_state": bundle.run.state,
+        "capture": {
+            "mode": bundle.capture.capture_mode,
+            "truncated": bundle.capture.truncated,
+            "warnings": bundle.capture.warnings,
+        },
+        "counts": {
+            "tape_events": bundle.tape_events.len(),
+            "model_exchanges": bundle.model_exchanges.len(),
+            "tool_exchanges": bundle.tool_exchanges.len(),
+            "http_exchanges": bundle.http_exchanges.len(),
+            "approvals": bundle.approvals.len(),
+            "artifacts": bundle.artifact_refs.len(),
+        },
+        "integrity": bundle.integrity,
+        "redaction": bundle.redaction,
+        "verification": replay_report,
+    })
 }
 
 fn build_tool_attestation_index(bundle: &ReplayBundle) -> Vec<Value> {
@@ -2017,6 +2079,53 @@ mod tests {
             Some(true)
         );
         assert!(!payload.to_string().contains("secret-token"));
+    }
+
+    #[test]
+    fn invalid_replay_bundle_exports_actionable_quarantine_audit() {
+        let mut bundle = fixture_bundle();
+        bundle.schema_version = u32::MAX;
+        palyra_common::replay_bundle::finalize_replay_bundle(&mut bundle)
+            .expect("modified fixture integrity should be refreshed");
+
+        let payload = build_run_export_payload(&bundle, RunExportFormatArg::PalyraAttested, true)
+            .expect("invalid replay content should still produce a safe audit export");
+
+        assert_eq!(payload.get("quarantined").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            payload.pointer("/manifest/offline_replay_status").and_then(Value::as_str),
+            Some("failed")
+        );
+        assert!(payload
+            .pointer("/audit/verification/validation/issues")
+            .and_then(Value::as_array)
+            .is_some_and(|issues| {
+                issues.iter().any(|issue| {
+                    issue.get("path").and_then(Value::as_str) == Some("$.schema_version")
+                })
+            }));
+        assert!(payload.get("replay_bundle").is_none());
+    }
+
+    #[test]
+    fn deterministic_replay_diff_is_exported_instead_of_blocking_audit() {
+        let mut bundle = fixture_bundle();
+        bundle.expected.tape_event_count = bundle.expected.tape_event_count.saturating_add(1);
+        palyra_common::replay_bundle::finalize_replay_bundle(&mut bundle)
+            .expect("modified fixture integrity should be refreshed");
+
+        let payload = build_run_export_payload(&bundle, RunExportFormatArg::PalyraAttested, true)
+            .expect("a safe replay diff should remain exportable");
+
+        assert_ne!(payload.get("quarantined").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            payload.pointer("/manifest/offline_replay_status").and_then(Value::as_str),
+            Some("failed")
+        );
+        assert!(payload
+            .pointer("/manifest/offline_replay_verification/diffs")
+            .and_then(Value::as_array)
+            .is_some_and(|diffs| !diffs.is_empty()));
     }
 
     #[test]
