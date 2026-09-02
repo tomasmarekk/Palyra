@@ -52,7 +52,7 @@ hkdf = "0.13.0"
 lopdf = { version = "0.44.0", default-features = false, features = ["chrono", "jiff", "rayon"] }
 notify = "8.2.0"
 portable-pty = "0.9.0"
-quick-xml = "0.41.0"
+quick-xml = "0.42.0"
 ring = "0.17.14"
 proptest = "1.11.0"
 libc = "0.2.186"
@@ -83,7 +83,7 @@ toml = "1.1.2"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 ulid = "3.0.0"
-wasmtime = { version = "47.0.4", default-features = false, features = ["cranelift", "runtime", "wat"] }
+wasmtime = { version = "48.0.1", default-features = false, features = ["cranelift", "runtime", "wat"] }
 webbrowser = "1.2.1"
 windows-sys = "0.61.2"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
