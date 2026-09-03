@@ -9256,6 +9256,9 @@ fn serve_download_fixture_connection(
     page_seen: Arc<std::sync::atomic::AtomicBool>,
     file_seen: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    // Accepted sockets can inherit the listener's nonblocking mode on some platforms.
+    // Force blocking reads so an early WouldBlock cannot reset a valid client connection.
+    stream.set_nonblocking(false).expect("accepted stream should become blocking");
     let request = read_http_request_with_timeout(&mut stream, Duration::from_secs(5));
     if request.trim().is_empty() {
         return;
