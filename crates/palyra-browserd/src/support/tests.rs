@@ -9180,23 +9180,41 @@ fn spawn_download_fixture_http_server(
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     listener.set_nonblocking(true).expect("download fixture listener should become nonblocking");
     let address = listener.local_addr().expect("listener local address should resolve");
-    let file_path = file_path.to_owned();
-    let file_content_type = file_content_type.to_owned();
-    let file_body = file_body.to_vec();
+    let file_path: Arc<str> = Arc::from(file_path);
+    let file_content_type: Arc<str> = Arc::from(file_content_type);
+    let file_body: Arc<[u8]> = Arc::from(file_body);
     let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let server_request_count = Arc::clone(&request_count);
     let handle = thread::spawn(move || {
-        // Chromium startup alone may use 20 seconds on a loaded CI host. A nonblocking listener
-        // makes this deadline effective while still leaving time for navigation and the click.
+        // Chromium may leave idle preconnect sockets open. Per-connection workers prevent one
+        // such socket from delaying the page request that the navigation is waiting for.
         let deadline = std::time::Instant::now() + Duration::from_secs(45);
-        let mut page_seen = false;
-        let mut file_seen = false;
-        while !page_seen || !file_seen {
+        let page_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let file_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut connection_workers: Vec<thread::JoinHandle<()>> = Vec::new();
+        while !page_seen.load(std::sync::atomic::Ordering::SeqCst)
+            || !file_seen.load(std::sync::atomic::Ordering::SeqCst)
+        {
             assert!(
                 std::time::Instant::now() < deadline,
                 "download fixture should receive the page and file requests"
             );
-            let (mut stream, _) = match listener.accept() {
+            let mut worker_index = 0;
+            while worker_index < connection_workers.len() {
+                if connection_workers[worker_index].is_finished() {
+                    connection_workers
+                        .swap_remove(worker_index)
+                        .join()
+                        .expect("download fixture connection worker should exit");
+                } else {
+                    worker_index += 1;
+                }
+            }
+            assert!(
+                connection_workers.len() < 32,
+                "download fixture should not accumulate idle Chromium connections"
+            );
+            let (stream, _) = match listener.accept() {
                 Ok(accepted) => accepted,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -9204,56 +9222,79 @@ fn spawn_download_fixture_http_server(
                 }
                 Err(error) => panic!("download fixture listener should accept request: {error}"),
             };
-            let request = read_http_request(&mut stream);
-            if request.trim().is_empty() {
-                continue;
-            }
-            let path = http_request_path(request.as_str());
-            if path == "/" {
-                if !page_seen {
-                    page_seen = true;
-                    server_request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                let body = format!(
-                        "<!doctype html><html><body><a id=\"download-link\" href=\"{file_path}\" download>Download</a></body></html>"
-                    );
-                let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                stream.write_all(response.as_bytes()).expect("server should write HTML response");
-                stream.flush().expect("server should flush HTML response");
-                continue;
-            }
-            if path == file_path {
-                if !file_seen {
-                    file_seen = true;
-                    server_request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                let file_name = file_path
-                    .rsplit('/')
-                    .next()
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("download.bin");
-                let headers = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: {file_content_type}\r\nContent-Disposition: attachment; filename=\"{file_name}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        file_body.len(),
-                    );
-                stream
-                    .write_all(headers.as_bytes())
-                    .expect("server should write file response headers");
-                stream
-                    .write_all(file_body.as_slice())
-                    .expect("server should write file response body");
-                stream.flush().expect("server should flush file response");
-                continue;
-            }
-            let fallback = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found";
-            stream.write_all(fallback.as_bytes()).expect("server should write fallback response");
-            stream.flush().expect("server should flush fallback response");
+            let worker_file_path = Arc::clone(&file_path);
+            let worker_file_content_type = Arc::clone(&file_content_type);
+            let worker_file_body = Arc::clone(&file_body);
+            let worker_request_count = Arc::clone(&server_request_count);
+            let worker_page_seen = Arc::clone(&page_seen);
+            let worker_file_seen = Arc::clone(&file_seen);
+            connection_workers.push(thread::spawn(move || {
+                serve_download_fixture_connection(
+                    stream,
+                    worker_file_path,
+                    worker_file_content_type,
+                    worker_file_body,
+                    worker_request_count,
+                    worker_page_seen,
+                    worker_file_seen,
+                );
+            }));
+        }
+        for worker in connection_workers {
+            worker.join().expect("download fixture connection worker should exit");
         }
     });
     (format!("http://{address}/"), handle, request_count)
+}
+
+fn serve_download_fixture_connection(
+    mut stream: TcpStream,
+    file_path: Arc<str>,
+    file_content_type: Arc<str>,
+    file_body: Arc<[u8]>,
+    request_count: Arc<std::sync::atomic::AtomicUsize>,
+    page_seen: Arc<std::sync::atomic::AtomicBool>,
+    file_seen: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let request = read_http_request_with_timeout(&mut stream, Duration::from_secs(5));
+    if request.trim().is_empty() {
+        return;
+    }
+    let path = http_request_path(request.as_str());
+    if path == "/" {
+        let body = format!(
+            "<!doctype html><html><body><a id=\"download-link\" href=\"{file_path}\" download>Download</a></body></html>"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).expect("server should write HTML response");
+        stream.flush().expect("server should flush HTML response");
+        request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        page_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    if path == file_path.as_ref() {
+        let file_name = file_path
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("download.bin");
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {file_content_type}\r\nContent-Disposition: attachment; filename=\"{file_name}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            file_body.len(),
+        );
+        stream.write_all(headers.as_bytes()).expect("server should write file response headers");
+        stream.write_all(file_body.as_ref()).expect("server should write file response body");
+        stream.flush().expect("server should flush file response");
+        request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        file_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    let fallback = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found";
+    stream.write_all(fallback.as_bytes()).expect("server should write fallback response");
+    stream.flush().expect("server should flush fallback response");
 }
 
 fn spawn_attachment_fixture_http_server(
@@ -9354,10 +9395,14 @@ fn http_request_path(request: &str) -> String {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {
+    read_http_request_with_timeout(stream, Duration::from_millis(250))
+}
+
+fn read_http_request_with_timeout(stream: &mut TcpStream, timeout: Duration) -> String {
     stream
         // Chromium can open idle preconnect sockets before sending a request; keep fixture
         // servers from blocking long enough to starve the real request behind that socket.
-        .set_read_timeout(Some(Duration::from_millis(250)))
+        .set_read_timeout(Some(timeout))
         .expect("read timeout should be configured");
     let mut output = Vec::new();
     let mut buffer = [0_u8; 1024];
