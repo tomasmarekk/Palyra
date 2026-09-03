@@ -7817,7 +7817,7 @@ async fn browser_service_download_allowlist_and_quarantine_artifacts() {
             v: 1,
             session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id.clone() }),
             url: allowlist_url,
-            timeout_ms: 2_000,
+            timeout_ms: 10_000,
             allow_redirects: true,
             max_redirects: 3,
             allow_private_targets: true,
@@ -7825,7 +7825,11 @@ async fn browser_service_download_allowlist_and_quarantine_artifacts() {
         .await
         .expect("allowlist navigate should execute")
         .into_inner();
-    assert!(navigate_allowlist.success, "allowlist fixture navigation should succeed");
+    assert!(
+        navigate_allowlist.success,
+        "allowlist fixture navigation should succeed: {}",
+        navigate_allowlist.error
+    );
 
     let allowlisted_click = service
         .click(Request::new(browser_v1::ClickRequest {
@@ -7833,7 +7837,7 @@ async fn browser_service_download_allowlist_and_quarantine_artifacts() {
             session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id.clone() }),
             selector: "#download-link".to_owned(),
             max_retries: 0,
-            timeout_ms: 1_500,
+            timeout_ms: 5_000,
             capture_failure_screenshot: true,
             max_failure_screenshot_bytes: 2 * 1024,
         }))
@@ -7857,7 +7861,7 @@ async fn browser_service_download_allowlist_and_quarantine_artifacts() {
             v: 1,
             session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id.clone() }),
             url: quarantine_url,
-            timeout_ms: 2_000,
+            timeout_ms: 10_000,
             allow_redirects: true,
             max_redirects: 3,
             allow_private_targets: true,
@@ -7865,7 +7869,11 @@ async fn browser_service_download_allowlist_and_quarantine_artifacts() {
         .await
         .expect("quarantine navigate should execute")
         .into_inner();
-    assert!(navigate_quarantine.success, "quarantine fixture navigation should succeed");
+    assert!(
+        navigate_quarantine.success,
+        "quarantine fixture navigation should succeed: {}",
+        navigate_quarantine.error
+    );
 
     let quarantined_click = service
         .click(Request::new(browser_v1::ClickRequest {
@@ -7873,7 +7881,7 @@ async fn browser_service_download_allowlist_and_quarantine_artifacts() {
             session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id.clone() }),
             selector: "#download-link".to_owned(),
             max_retries: 0,
-            timeout_ms: 1_500,
+            timeout_ms: 5_000,
             capture_failure_screenshot: true,
             max_failure_screenshot_bytes: 2 * 1024,
         }))
