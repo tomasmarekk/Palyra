@@ -9170,6 +9170,7 @@ fn spawn_download_fixture_http_server(
     file_body: &[u8],
 ) -> (String, thread::JoinHandle<()>, Arc<std::sync::atomic::AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    listener.set_nonblocking(true).expect("download fixture listener should become nonblocking");
     let address = listener.local_addr().expect("listener local address should resolve");
     let file_path = file_path.to_owned();
     let file_content_type = file_content_type.to_owned();
@@ -9177,7 +9178,9 @@ fn spawn_download_fixture_http_server(
     let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let server_request_count = Arc::clone(&request_count);
     let handle = thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // Chromium startup alone may use 20 seconds on a loaded CI host. A nonblocking listener
+        // makes this deadline effective while still leaving time for navigation and the click.
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
         let mut page_seen = false;
         let mut file_seen = false;
         while !page_seen || !file_seen {
@@ -9185,7 +9188,14 @@ fn spawn_download_fixture_http_server(
                 std::time::Instant::now() < deadline,
                 "download fixture should receive the page and file requests"
             );
-            let (mut stream, _) = listener.accept().expect("listener should accept request");
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("download fixture listener should accept request: {error}"),
+            };
             let request = read_http_request(&mut stream);
             if request.trim().is_empty() {
                 continue;
